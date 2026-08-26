@@ -53,6 +53,10 @@
   .stat b{display:block;font-size:1.8rem;line-height:1.2}
   .stat span{color:var(--muted);font-size:.85rem}
   code,.mono{font-family:ui-monospace,"SF Mono",Menlo,monospace}
+  .badge{padding:.2rem .6rem;border-radius:6px;font-size:.8rem;font-weight:600;display:inline-block}
+  .badge.ok{background:var(--ok-bg);color:var(--ok)}
+  .badge.warn{background:var(--warn-bg);color:var(--warn)}
+  .badge.err{background:var(--err-bg);color:var(--err)}
   .cred{font-family:ui-monospace,monospace;font-size:2rem;letter-spacing:.12em;
         background:var(--bg);border:2px dashed var(--accent);border-radius:8px;
         padding:.8rem 1rem;text-align:center;margin:.5rem 0}
@@ -68,6 +72,7 @@
     <a href="{{ url_for('dashboard') }}">แดชบอร์ด</a>
     <a href="{{ url_for('issue') }}">ออกรหัสให้ลูกค้า</a>
     <a href="{{ url_for('customers') }}">ลูกค้า</a>
+    <a href="{{ url_for('status_page') }}">สถานะระบบ</a>
     <span class="hint">{{ current_user }} ({{ current_role }})</span>
     <form method="post" action="{{ url_for('logout') }}" style="display:inline">
       <button class="ghost" type="submit">ออกจากระบบ</button>

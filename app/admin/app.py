@@ -137,6 +137,18 @@ def health():
     return {"status": "ok", "setup_done": setup_done()}
 
 
+# N5 (CODING_BRIEF.md): /health เดิมด้านบนคืนแค่ JSON ไว้ให้ monitoring ภายนอก/เทสต์เดิม
+# อ้างอิงต่อไป -- ไม่แตะ -- หน้านี้คือหน้าเว็บจริงแยกต่างหากที่ /status ตามที่สั่ง แสดง disk %,
+# chrony offset (T13), service ขึ้น/ลง, session active, log rows วันนี้, seal ล่าสุด, alert ล่าสุด
+# (N1) ตรรกะทั้งหมดอยู่ใน common/health.py (แยกจาก route เพื่อให้ทดสอบได้บน Windows)
+@app.get("/status")
+@login_required
+def status_page():
+    from common.health import build_status
+    data = build_status(str(LOG_DIR))
+    return render_template("status.html", **data)
+
+
 # ---------------------------------------------------------------- setup wizard
 @app.route("/setup", methods=["GET", "POST"])
 def setup():

@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{% block title %}สถานะระบบ{% endblock %}
+{% block body %}
+<h1>สถานะระบบ (System Health)</h1>
+<p class="hint">อัปเดตล่าสุด {{ generated_at.strftime('%d/%m/%Y %H:%M:%S') }} — หน้านี้คำนวณสดทุกครั้งที่โหลด ไม่แคช</p>
+
+<div class="card">
+  <h2>พื้นที่ดิสก์</h2>
+  <table>
+    <tr><th>ไดเรกทอรี</th><th>ใช้ไป</th><th>เหลือ</th><th>สถานะ</th></tr>
+    {% for d in disks %}
+    <tr>
+      <td class="mono">{{ d.path }}</td>
+      <td>{{ "%.1f"|format(d.percent_used) }}%</td>
+      <td>{{ "%.0f"|format(d.free / (1024*1024)) }} MB</td>
+      <td>
+        {% if d.level == 'crit' %}<span class="badge err">วิกฤต</span>
+        {% elif d.level == 'warn' %}<span class="badge warn">เตือน</span>
+        {% else %}<span class="badge ok">ปกติ</span>{% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+
+<div class="card">
+  <h2>ความแม่นยำของนาฬิกา (chrony) — T13</h2>
+  {% if not chrony.available %}
+  <p class="hint">ยังไม่พบ time-accuracy.log — check_time.sh ยังไม่เคยรัน (ปกติถ้าเพิ่งติดตั้งใหม่ ยังไม่ถึงรอบ cafe-maintenance.timer แรก)</p>
+  {% elif chrony.offset_ms is none %}
+  <p><span class="badge warn">อ่านค่าไม่ได้</span></p>
+  <p class="hint">ครั้งล่าสุด {{ chrony.checked_at }} — ตรวจว่า chronyd ทำงานอยู่ (chronyc tracking)</p>
+  {% else %}
+  <p>
+    {% if chrony.ok %}<span class="badge ok">ปกติ</span>{% else %}<span class="badge err">เกินเกณฑ์</span>{% endif %}
+    คลาดเคลื่อน {{ "%.3f"|format(chrony.offset_ms) }} ms
+    ({{ 'อยู่ในเกณฑ์ < 10ms ตาม ม.26' if chrony.ok else 'เกินเกณฑ์ 10ms ที่กฎหมายกำหนด' }})
+  </p>
+  <p class="hint">ตรวจล่าสุด {{ chrony.checked_at }} · ค่าดิบ: {{ chrony.raw }}</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Service</h2>
+  <table>
+    <tr><th>ชื่อ</th><th>สถานะ</th></tr>
+    {% for name, state in services.items() %}
+    <tr>
+      <td class="mono">{{ name }}</td>
+      <td>
+        {% if state == 'active' %}<span class="badge ok">ทำงานอยู่</span>
+        {% elif state == 'unknown' %}<span class="hint">ไม่ทราบ (ตรวจไม่ได้)</span>
+        {% else %}<span class="badge err">{{ state }}</span>{% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+
+<div class="grid">
+  <div class="stat"><b>{{ db.active_sessions if db.active_sessions is not none else '—' }}</b><span>session ที่ active</span></div>
+  <div class="stat"><b>{{ db.log_rows_today if db.log_rows_today is not none else '—' }}</b><span>log rows วันนี้ (conn+dns)</span></div>
+  <div class="stat"><b>{{ db.last_sealed_at.strftime('%d/%m %H:%M') if db.last_sealed_at else '—' }}</b><span>seal hash chain ล่าสุด</span></div>
+</div>
+{% if db.error %}
+<div class="msg err" style="margin-top:1rem">อ่านสถิติจากฐานข้อมูลไม่สำเร็จ: {{ db.error }}</div>
+{% endif %}
+
+<div class="card" style="margin-top:1rem">
+  <h2>Alert ล่าสุด (ดิสก์ใกล้เต็ม — N1)</h2>
+  {% if latest_alert %}
+  <p class="mono">{{ latest_alert }}</p>
+  {% else %}
+  <p class="hint">ยังไม่เคยมี alert</p>
+  {% endif %}
+</div>
+{% endblock %}
