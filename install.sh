@@ -1316,6 +1316,21 @@ NGINX
 
 configure_logrotate() {
   step "ตั้งค่า log rotation (เก็บ ${LOG_RETENTION_DAYS} วัน)"
+  # N3 (CODING_BRIEF.md): §6.1 กำหนดว่า log ต้อง "แก้ไขไม่ได้" ตาม ม.26 -- เดิมมีแค่ hash
+  # chain (logger/integrity.py) ที่ "ตรวจจับ" การแก้ไขย้อนหลังได้ แต่ไม่มีอะไร "ป้องกัน" การ
+  # แก้ไขไฟล์ที่หมุนแล้วโดยตรงเลย -- เพิ่ม chattr +a (append-only) ให้ไฟล์ที่หมุนแล้วใน
+  # olddir เขียนทับ/ลบไม่ได้แม้แต่ root เอง (ต้อง chattr -a ก่อนเสมอ ซึ่งเป็นร่องรอยที่ตรวจสอบได้)
+  #
+  # หมายเหตุสำคัญ (ป้องกันปัญหาที่จะเกิดจริงถ้าไม่คิดล่วงหน้า): ไฟล์ที่เป็น append-only จะถูก
+  # logrotate เอง "ลบไม่ได้" เมื่อเกิน `rotate ${LOG_RETENTION_DAYS}` รอบ (unlink บนไฟล์ +a ทำ
+  # ไม่ได้แม้จะเป็น root ก็ตาม ต้อง chattr -a ก่อนเสมอ) -- แก้ด้วยการ chattr -a ทุกไฟล์ใน
+  # olddir ใน prerotate (ก่อน logrotate ลบไฟล์เก่าที่เกิน retention) แล้วค่อย chattr +a กลับ
+  # ทุกไฟล์อีกครั้งใน postrotate (หลังไฟล์ใหม่ถูกหมุนเข้ามาแล้ว) -- ช่วงระหว่าง prerotate ถึง
+  # postrotate (เสี้ยววินาทีตอนรัน logrotate เอง) ไฟล์จะไม่มี +a ชั่วคราว เป็นข้อแลกเปลี่ยนที่
+  # ยอมรับได้เพื่อให้ retention/disk-space ยังทำงานได้จริง ไม่ใช่ทำจนลบไฟล์เก่าไม่ได้เลยตลอดไป
+  #
+  # ต้องกันกรณี filesystem ไม่รองรับ extended attribute นี้ด้วย (เช่น FAT/overlay บางแบบ) --
+  # `|| true` ทุกจุดให้เป็นแค่ warning ไม่ใช่ error ที่ทำให้ logrotate รอบนั้นล้มทั้งหมด
   write_file "/etc/logrotate.d/${APP_NAME}" 0644 <<ROT
 # managed by ${APP_NAME} installer
 ${LOG_DIR}/*.log {
@@ -1330,9 +1345,13 @@ ${LOG_DIR}/*.log {
     create 0640 ${APP_USER} ${APP_USER}
     olddir ${LOG_DIR}/archive
     sharedscripts
+    prerotate
+        chattr -a ${LOG_DIR}/archive/*.log-* 2>/dev/null || true
+    endscript
     postrotate
         systemctl reload nginx    >/dev/null 2>&1 || true
         systemctl restart dnsmasq >/dev/null 2>&1 || true
+        chattr +a ${LOG_DIR}/archive/*.log-* 2>/dev/null || echo "warning: chattr +a ไม่สำเร็จ (filesystem อาจไม่รองรับ) — log ที่หมุนแล้วจะไม่ใช่ append-only" >&2
     endscript
     # หมายเหตุ (แก้บั๊ก M5): เดิมเรียก logger.integrity ตรงนี้ด้วย แต่ไม่มี PYTHONPATH/
     # EnvironmentFile ให้เลย (logrotate รันเอง ไม่ผ่าน systemd unit) ทำให้ import โมดูล
@@ -1340,7 +1359,7 @@ ${LOG_DIR}/*.log {
     # (03:30 ทุกคืน) เรียก logger.integrity พร้อม env ที่ครบอยู่แล้ว ไม่ต้องเรียกซ้ำที่นี่
 }
 ROT
-  ok "logrotate พร้อม (archive ที่ ${LOG_DIR}/archive)"
+  ok "logrotate พร้อม (archive ที่ ${LOG_DIR}/archive, ไฟล์ที่หมุนแล้วเป็น append-only)"
 }
 
 start_services() {
