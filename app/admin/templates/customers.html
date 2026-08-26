@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}ลูกค้า{% endblock %}
+{% block body %}
+<div class="card">
+  <h1>ลูกค้า</h1>
+  <form method="get">
+    <label for="q">ค้นหาด้วยเลขประจำตัวประชาชน</label>
+    <input type="text" id="q" name="q" class="mono" value="{{ q }}" placeholder="1234567890123">
+    <div class="hint">ระบบค้นด้วยค่า hash — ไม่ได้เก็บเลขบัตรแบบอ่านได้ในฐานข้อมูล</div>
+    <p><button type="submit">ค้นหา</button></p>
+  </form>
+
+  <table>
+    <tr><th>ลูกค้า</th><th>ครั้งแรก</th><th>ล่าสุด</th><th>จำนวนครั้ง</th><th></th></tr>
+    {% for r in rows %}
+    <tr>
+      <td class="mono">{{ r.natid_masked }}{% if r.is_blocked %} <span class="msg err" style="display:inline;padding:.1rem .4rem">ระงับ</span>{% endif %}</td>
+      <td>{{ r.first_seen.strftime('%d/%m/%y') }}</td>
+      <td>{{ r.last_seen.strftime('%d/%m/%y %H:%M') if r.last_seen else '-' }}</td>
+      <td>{{ r.visit_count }}</td>
+      <td>
+        {% if current_role == 'admin' %}
+        <form method="post" action="{{ url_for('reveal', cid=r.id) }}">
+          <input type="text" name="reason" placeholder="เหตุผลที่ต้องเปิดเผย (บันทึกไว้)"
+                 required minlength="10" style="width:auto;display:inline-block">
+          <button class="ghost" type="submit">เปิดเผยเลขเต็ม</button>
+        </form>
+        <form method="post" action="{{ url_for('toggle_block_customer', cid=r.id) }}"
+              style="margin-top:.4rem"
+              onsubmit="return confirm('{{ 'ยกเลิกระงับ' if r.is_blocked else 'ระงับ' }}ลูกค้ารายนี้ใช่ไหม?')">
+          <button class="ghost" type="submit">{{ 'ยกเลิกระงับ' if r.is_blocked else 'ระงับ' }}</button>
+        </form>
+        {% else %}<span class="hint">เฉพาะ admin</span>{% endif %}
+      </td>
+    </tr>
+    {% else %}
+    <tr><td colspan="5" class="hint">ไม่พบข้อมูล</td></tr>
+    {% endfor %}
+  </table>
+</div>
+{% endblock %}

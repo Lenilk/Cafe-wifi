@@ -1,0 +1,448 @@
+"""
+admin/app.py — Admin Panel สำหรับพนักงาน
+
+จุดสำคัญ: First-run Setup Wizard
+  - ตอนติดตั้ง install.sh สร้าง /etc/cafe-wifi/setup.token ไว้ (สุ่ม 24 ไบต์)
+  - ตราบใดที่ตาราง staff ยังว่าง ทุก request จะถูกบังคับไปที่ /setup
+  - /setup ต้องกรอก token ให้ตรง จึงจะสร้างบัญชีผู้ดูแลระบบหลักได้
+  - สร้างสำเร็จ -> ลบไฟล์ token ทิ้ง -> /setup ปิดตัวเองถาวร
+"""
+from __future__ import annotations
+
+import ipaddress
+import os
+import time
+from datetime import datetime, timedelta
+from functools import wraps
+from pathlib import Path
+
+from flask import (Flask, abort, flash, g, redirect, render_template,
+                   request, session, url_for)
+
+from common import audit, crypto
+from common.db import execute, get_conn, query_all, query_one
+
+ETC_DIR = Path(os.environ.get("ETC_DIR", "/etc/cafe-wifi"))
+SETUP_TOKEN_FILE = ETC_DIR / "setup.token"
+
+app = Flask(__name__)
+app.config.update(
+    SECRET_KEY=os.environ.get("SECRET_KEY", os.urandom(32).hex()),
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=True,          # ผ่าน nginx TLS เท่านั้น
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=8),
+    MAX_CONTENT_LENGTH=1 * 1024 * 1024,
+)
+if not os.environ.get("SECRET_KEY"):
+    # แก้บั๊ก (พบตอนตรวจทานรอบ 2): เดิม fallback เป็นค่าสุ่มเงียบ ๆ ไม่มี log อะไรเลย --
+    # ตรงข้ามกับ FAS_KEY ที่ตั้งใจ fail ดัง ๆ (503) ถ้าไม่มีค่า สองไฟล์นี้ทำคนละมาตรฐาน
+    # ค่าสุ่มที่สร้างตอน import จะเปลี่ยนทุกครั้งที่ service restart -- session/cookie เดิม
+    # ของพนักงานทุกคนจะใช้ไม่ได้ทันที (ต้อง login ใหม่หมด) โดยไม่มีสัญญาณเตือนอะไรเลยว่า
+    # secrets.env โหลดไม่สำเร็จ -- อย่างน้อยต้อง log ให้เห็นชัดเจนใน journal/error log
+    app.logger.error(
+        "ไม่พบ SECRET_KEY ใน environment — ใช้ค่าสุ่มชั่วคราวแทน (จะเปลี่ยนทุกครั้งที่ "
+        "restart service ทำให้ทุกคน login ค้างอยู่หลุดหมด) ตรวจสอบว่า EnvironmentFile "
+        "โหลด /etc/cafe-wifi/secrets.env สำเร็จหรือไม่"
+    )
+
+# rate limit แบบง่ายในหน่วยความจำ (พอสำหรับ 1 เครื่อง; ถ้าขยายหลาย worker ให้ย้ายไป DB)
+_attempts: dict[str, list[float]] = {}
+MAX_ATTEMPTS = 5
+WINDOW_SEC = 600
+
+
+# ---------------------------------------------------------------- helpers
+def client_ip() -> str:
+    # แก้บั๊ก C3: เดิมหยิบ X-Forwarded-For ตัวแรกซึ่งไคลเอนต์ปลอมได้ตรง ๆ (nginx เดิมต่อท้าย
+    # ค่าที่ไคลเอนต์ส่งมาด้วย $proxy_add_x_forwarded_for ไม่ได้เขียนทับ) -- ใช้ X-Real-IP
+    # ก่อนเสมอ เพราะ nginx เขียนทับ header นี้ด้วย $remote_addr ทุกครั้งไม่ว่าไคลเอนต์จะส่ง
+    # อะไรมา (ดู install.sh configure_nginx) จึงปลอมไม่ได้ -- fallback ไป X-Forwarded-For/
+    # remote_addr เฉพาะกรณี dev/ต่อตรงไม่ผ่าน nginx (เช่นรัน flask dev server ตรง ๆ)
+    real_ip = request.headers.get("X-Real-IP", "").strip()
+    if not real_ip:
+        fwd = request.headers.get("X-Forwarded-For", "")
+        real_ip = fwd.split(",")[0].strip() if fwd else (request.remote_addr or "")
+    try:
+        ipaddress.ip_address(real_ip)
+    except ValueError:
+        return ""
+    return real_ip
+
+
+def rate_limited(bucket: str) -> bool:
+    now = time.time()
+    hits = [t for t in _attempts.get(bucket, []) if now - t < WINDOW_SEC]
+    _attempts[bucket] = hits
+    return len(hits) >= MAX_ATTEMPTS
+
+
+def record_attempt(bucket: str) -> None:
+    _attempts.setdefault(bucket, []).append(time.time())
+
+
+def staff_count() -> int:
+    row = query_one("SELECT COUNT(*) AS n FROM staff")
+    return int(row["n"]) if row else 0
+
+
+def setup_done() -> bool:
+    """ติดตั้งเสร็จแล้วเมื่อ: มีบัญชีอย่างน้อย 1 และไฟล์ token ถูกลบไปแล้ว"""
+    return staff_count() > 0 and not SETUP_TOKEN_FILE.exists()
+
+
+def login_required(view):
+    @wraps(view)
+    def wrapper(*a, **kw):
+        if "staff_id" not in session:
+            return redirect(url_for("login", next=request.path))
+        return view(*a, **kw)
+    return wrapper
+
+
+def admin_required(view):
+    @wraps(view)
+    def wrapper(*a, **kw):
+        if session.get("role") != "admin":
+            abort(403, "ต้องเป็นผู้ดูแลระบบ (admin) เท่านั้น")
+        return view(*a, **kw)
+    return wrapper
+
+
+@app.before_request
+def gate():
+    g.client_ip = client_ip()
+    if request.path.startswith("/static"):
+        return None
+    # ยังไม่มีบัญชีผู้ดูแล -> บังคับไปหน้า setup
+    if staff_count() == 0 and request.endpoint not in {"setup", "health"}:
+        return redirect(url_for("setup"))
+    return None
+
+
+@app.context_processor
+def inject_globals():
+    return {
+        "gateway_name": os.environ.get("GATEWAY_NAME", "Cafe-Guest"),
+        "current_user": session.get("username"),
+        "current_role": session.get("role"),
+        "now": datetime.now(),
+    }
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "setup_done": setup_done()}
+
+
+# ---------------------------------------------------------------- setup wizard
+@app.route("/setup", methods=["GET", "POST"])
+def setup():
+    # ปิดตัวเองถาวรเมื่อมีบัญชีแล้ว
+    if staff_count() > 0:
+        return render_template("setup_closed.html"), 410
+
+    if not SETUP_TOKEN_FILE.exists():
+        return render_template(
+            "error.html",
+            title="ยังตั้งค่าไม่ได้",
+            message=f"ไม่พบไฟล์ {SETUP_TOKEN_FILE} — รัน install.sh ใหม่ "
+                    "หรือสร้างไฟล์นี้เองด้วย openssl rand -hex 24",
+        ), 503
+
+    if request.method == "GET":
+        return render_template("setup.html")
+
+    ip = g.client_ip or "unknown"
+    if rate_limited(f"setup:{ip}"):
+        return render_template(
+            "error.html", title="พยายามมากเกินไป",
+            message="กรอก Setup Token ผิดหลายครั้ง กรุณารอ 10 นาทีแล้วลองใหม่",
+        ), 429
+
+    token_in = request.form.get("token", "")
+    username = (request.form.get("username") or "").strip()
+    display = (request.form.get("display_name") or "").strip() or username
+    pw1 = request.form.get("password") or ""
+    pw2 = request.form.get("password_confirm") or ""
+
+    expected = SETUP_TOKEN_FILE.read_text(encoding="utf-8")
+    errors: list[str] = []
+
+    if not crypto.constant_time_eq(token_in, expected):
+        record_attempt(f"setup:{ip}")
+        errors.append("Setup Token ไม่ถูกต้อง")
+    if not (3 <= len(username) <= 64) or not username.replace("_", "").replace(".", "").isalnum():
+        errors.append("ชื่อผู้ใช้ต้องยาว 3-64 ตัว ใช้ได้เฉพาะ a-z A-Z 0-9 . _")
+    if pw1 != pw2:
+        errors.append("รหัสผ่านทั้งสองช่องไม่ตรงกัน")
+    errors.extend(crypto.check_admin_password(pw1))
+
+    if errors:
+        return render_template("setup.html", errors=errors,
+                               username=username, display_name=display), 400
+
+    with get_conn() as conn, conn.cursor() as cur:
+        # กันการแข่งกันสร้างพร้อมกัน 2 request
+        cur.execute("SELECT COUNT(*) AS n FROM staff FOR UPDATE")
+        if int(cur.fetchone()["n"]) > 0:
+            return redirect(url_for("login"))
+        cur.execute(
+            "INSERT INTO staff (username, password_hash, display_name, role, is_active) "
+            "VALUES (%s, %s, %s, 'admin', 1)",
+            (username, crypto.hash_password(pw1), display),
+        )
+        new_id = cur.lastrowid
+
+    # ทำลาย token ทันที -> /setup ปิดถาวร
+    try:
+        SETUP_TOKEN_FILE.unlink()
+    except OSError:
+        app.logger.error("ลบ %s ไม่สำเร็จ — ลบด้วยมือทันที", SETUP_TOKEN_FILE)
+
+    audit.log(audit.SETUP_ADMIN, staff_id=new_id, target=username,
+              client_ip=ip, detail="สร้างบัญชีผู้ดูแลระบบหลักผ่านหน้า /setup")
+
+    flash(f"สร้างบัญชีผู้ดูแลระบบ '{username}' เรียบร้อย — เข้าสู่ระบบได้เลย", "success")
+    return redirect(url_for("login"))
+
+
+# ---------------------------------------------------------------- auth
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "GET":
+        return render_template("login.html")
+
+    ip = g.client_ip or "unknown"
+    if rate_limited(f"login:{ip}"):
+        audit.log(audit.LOGIN_FAIL, target="rate-limited", client_ip=ip)
+        return render_template("login.html",
+                               error="พยายามเข้าสู่ระบบมากเกินไป รอ 10 นาทีแล้วลองใหม่"), 429
+
+    username = (request.form.get("username") or "").strip()
+    password = request.form.get("password") or ""
+    row = query_one(
+        "SELECT id, username, password_hash, display_name, role, is_active "
+        "FROM staff WHERE username = %s", (username,))
+
+    if not row or not row["is_active"] or not crypto.verify_password(row["password_hash"], password):
+        record_attempt(f"login:{ip}")
+        audit.log(audit.LOGIN_FAIL, target=username, client_ip=ip)
+        # ข้อความเดียวกันทุกกรณี ไม่บอกใบ้ว่าชื่อผู้ใช้มีจริงไหม
+        return render_template("login.html", error="ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง"), 401
+
+    if crypto.needs_rehash(row["password_hash"]):
+        execute("UPDATE staff SET password_hash = %s WHERE id = %s",
+                (crypto.hash_password(password), row["id"]))
+
+    session.clear()
+    session.permanent = True
+    session.update(staff_id=row["id"], username=row["username"], role=row["role"])
+    audit.log(audit.LOGIN_OK, staff_id=row["id"], target=username, client_ip=ip)
+
+    nxt = request.args.get("next", "")
+    return redirect(nxt if nxt.startswith("/") else url_for("dashboard"))
+
+
+@app.post("/logout")
+@login_required
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
+# ---------------------------------------------------------------- dashboard
+@app.get("/")
+@login_required
+def dashboard():
+    stats = query_one("""
+        SELECT
+          (SELECT COUNT(*) FROM voucher WHERE status='active' AND valid_until > NOW()) AS active_vouchers,
+          (SELECT COUNT(*) FROM customer)                                              AS customers,
+          (SELECT COUNT(*) FROM voucher WHERE DATE(issued_at) = CURDATE())             AS issued_today,
+          (SELECT COUNT(*) FROM portal_session WHERE ended_at IS NULL)                 AS online_now
+    """) or {}
+    recent = query_all("""
+        SELECT v.id, v.username, v.issued_at, v.valid_until, v.status,
+               c.natid_masked, s.username AS issued_by
+        FROM voucher v
+        JOIN customer c ON c.id = v.customer_id
+        JOIN staff s    ON s.id = v.issued_by
+        ORDER BY v.issued_at DESC LIMIT 15
+    """)
+    return render_template("dashboard.html", stats=stats, recent=recent)
+
+
+# ---------------------------------------------------------------- ออก voucher
+@app.route("/issue", methods=["GET", "POST"])
+@login_required
+def issue():
+    if request.method == "GET":
+        return render_template("issue.html")
+
+    raw = request.form.get("natid", "")
+    # บั๊กเดิม: int(...) โดยไม่ดัก ValueError -- กรอกอะไรที่ไม่ใช่ตัวเลขในช่อง
+    # hours/devices จะทำให้ 500 ดิบ ๆ หลุดออกไป (ไม่มี @app.errorhandler(500) ในไฟล์นี้ด้วย)
+    try:
+        hours = max(1, min(24, int(request.form.get("hours") or 4)))
+        devices = max(1, min(5, int(request.form.get("devices") or 2)))
+    except ValueError:
+        return render_template("issue.html", error="จำนวนชั่วโมง/อุปกรณ์ต้องเป็นตัวเลข",
+                               natid=raw), 400
+    consent = request.form.get("consent") == "on"
+
+    nid = crypto.normalize_natid(raw)
+    if not consent:
+        return render_template("issue.html", error="ต้องแจ้งลูกค้าและได้รับความยินยอมก่อน",
+                               natid=raw), 400
+    if not crypto.valid_thai_id(nid):
+        return render_template("issue.html",
+                               error="เลขประจำตัวประชาชนไม่ถูกต้อง (ตรวจ checksum ไม่ผ่าน)",
+                               natid=raw), 400
+
+    nid_hash = crypto.natid_hash(nid)
+    masked = crypto.mask_natid(nid)
+    code = crypto.gen_voucher_code()
+    plain_pw = crypto.gen_voucher_password()
+    now = datetime.now()
+
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT id, is_blocked FROM customer WHERE natid_hash = %s", (nid_hash,))
+        cust = cur.fetchone()
+        if cust and cust["is_blocked"]:
+            return render_template("issue.html",
+                                   error="ลูกค้ารายนี้ถูกระงับการใช้งาน", natid=raw), 403
+        if cust:
+            cust_id = cust["id"]
+            cur.execute("UPDATE customer SET last_seen = NOW(), visit_count = visit_count + 1 "
+                        "WHERE id = %s", (cust_id,))
+        else:
+            cur.execute(
+                "INSERT INTO customer (natid_hash, natid_enc, natid_masked, last_seen, visit_count) "
+                "VALUES (%s, %s, %s, NOW(), 1)",
+                (nid_hash, crypto.natid_encrypt(nid), masked))
+            cust_id = cur.lastrowid
+
+        cur.execute(
+            "INSERT INTO voucher (customer_id, username, password_hash, issued_by, "
+            "valid_from, valid_until, max_devices, status) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, 'active')",
+            (cust_id, code, crypto.hash_password(plain_pw), session["staff_id"],
+             now, now + timedelta(hours=hours), devices))
+
+    audit.log(audit.ISSUE_VOUCHER, staff_id=session["staff_id"], target=code,
+              client_ip=g.client_ip, detail=f"customer={masked} hours={hours} devices={devices}")
+
+    # บั๊กเดิม (M6): เคย render ผลลัพธ์ตรง ๆ จาก POST -- กด F5 ที่หน้านั้นคือส่ง POST ซ้ำ
+    # ได้ voucher ใบใหม่ให้ลูกค้าคนเดิมทันทีโดยไม่ตั้งใจ -- เปลี่ยนเป็น POST-Redirect-GET
+    # เก็บรหัสผ่านไว้ใน session ชั่วคราว (เห็นได้ครั้งเดียว, pop ทิ้งทันทีที่อ่าน เหมือน flash)
+    session["just_issued"] = dict(
+        code=code, password=plain_pw, masked=masked,
+        valid_until=(now + timedelta(hours=hours)).isoformat(), devices=devices)
+    return redirect(url_for("issue_result"))
+
+
+@app.get("/issue/result")
+@login_required
+def issue_result():
+    data = session.pop("just_issued", None)
+    if not data:
+        return redirect(url_for("issue"))
+    return render_template("issue_result.html", code=data["code"], password=data["password"],
+                           masked=data["masked"],
+                           valid_until=datetime.fromisoformat(data["valid_until"]),
+                           devices=data["devices"])
+
+
+# ---------------------------------------------------------------- ลูกค้า
+@app.get("/customers")
+@login_required
+def customers():
+    q = (request.args.get("q") or "").strip()
+    if q and crypto.valid_thai_id(q):
+        rows = query_all(
+            "SELECT id, natid_masked, first_seen, last_seen, visit_count, is_blocked "
+            "FROM customer WHERE natid_hash = %s", (crypto.natid_hash(q),))
+    else:
+        rows = query_all(
+            "SELECT id, natid_masked, first_seen, last_seen, visit_count, is_blocked "
+            "FROM customer ORDER BY last_seen DESC LIMIT 100")
+    return render_template("customers.html", rows=rows, q=q)
+
+
+@app.post("/customers/<int:cid>/reveal")
+@login_required
+@admin_required
+def reveal(cid: int):
+    """
+    เปิดเผยเลขบัตรประชาชนเต็ม — เฉพาะ role admin และต้องระบุเหตุผล
+    ทุกครั้งจะถูกบันทึกลง audit_log (หลักฐานตาม PDPA)
+    """
+    reason = (request.form.get("reason") or "").strip()
+    if len(reason) < 10:
+        abort(400, "ต้องระบุเหตุผลอย่างน้อย 10 ตัวอักษร")
+
+    row = query_one("SELECT natid_enc, natid_masked FROM customer WHERE id = %s", (cid,))
+    if not row:
+        abort(404)
+
+    audit.log(audit.REVEAL_NATID, staff_id=session["staff_id"], target=f"customer:{cid}",
+              client_ip=g.client_ip, detail=reason)
+    return render_template("reveal.html", natid=crypto.natid_decrypt(row["natid_enc"]),
+                           masked=row["natid_masked"], cid=cid, reason=reason)
+
+
+# แก้บั๊ก M2: voucher.status='revoked' และ audit.REVOKE_VOUCHER ถูกประกาศไว้ในสคีมา/
+# common/audit.py มาตั้งแต่แรก แต่ไม่มี endpoint ไหนเรียกใช้จริงเลย -- ค่า 'revoked' จึง
+# ไม่มีทางเกิดขึ้นได้จริงในฐานข้อมูล เพิ่ม endpoint นี้ให้ใช้งานได้จริงตามที่ schema ตั้งใจไว้
+@app.post("/vouchers/<int:vid>/revoke")
+@login_required
+def revoke_voucher(vid: int):
+    """ยกเลิก voucher ก่อนหมดอายุ (เช่น ออกผิด/ลูกค้าขอยกเลิก) -- ยกเลิกได้เฉพาะใบที่ยัง active"""
+    n = execute("UPDATE voucher SET status='revoked' WHERE id=%s AND status='active'", (vid,))
+    if not n:
+        abort(404, "ไม่พบ voucher นี้ หรือถูกยกเลิก/หมดอายุไปแล้ว")
+    audit.log(audit.REVOKE_VOUCHER, staff_id=session["staff_id"], target=f"voucher:{vid}",
+              client_ip=g.client_ip)
+    flash("ยกเลิก voucher เรียบร้อย", "success")
+    return redirect(url_for("dashboard"))
+
+
+# แก้บั๊ก M2: customer.is_blocked ถูกอ่านใน /issue และ /login ของ fas มาตั้งแต่แรก (บล็อก
+# ลูกค้าไม่ให้ออก voucher ใหม่/ล็อกอินได้) แต่ไม่มีหน้าจอไหนตั้งค่านี้เป็น true ได้เลย
+@app.post("/customers/<int:cid>/block")
+@login_required
+@admin_required
+def toggle_block_customer(cid: int):
+    row = query_one("SELECT is_blocked FROM customer WHERE id=%s", (cid,))
+    if not row:
+        abort(404)
+    new_state = not row["is_blocked"]
+    execute("UPDATE customer SET is_blocked=%s WHERE id=%s", (new_state, cid))
+    audit.log("block_customer" if new_state else "unblock_customer",
+              staff_id=session["staff_id"], target=f"customer:{cid}", client_ip=g.client_ip)
+    flash("ระงับลูกค้ารายนี้แล้ว" if new_state else "ยกเลิกการระงับแล้ว", "success")
+    return redirect(url_for("customers"))
+
+
+@app.errorhandler(403)
+def e403(e):
+    return render_template("error.html", title="ไม่มีสิทธิ์", message=str(e)), 403
+
+
+@app.errorhandler(404)
+def e404(e):
+    return render_template("error.html", title="ไม่พบหน้านี้", message=str(e)), 404
+
+
+@app.errorhandler(500)
+def e500(e):
+    # แก้บั๊ก (ผลข้างเคียงของ M6): ไฟล์นี้ไม่มี handler 500 มาก่อนเลย ต่างจาก fas/app.py
+    # ทำให้ error ที่ไม่คาดคิดโผล่เป็นหน้า Werkzeug ดิบ ๆ แทนหน้า error.html ที่สอดคล้องกัน
+    app.logger.exception("unhandled error")
+    return render_template("error.html", title="เกิดข้อผิดพลาด",
+                           message="กรุณาลองใหม่อีกครั้ง หรือแจ้งผู้ดูแลระบบ"), 500
+
+
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port=int(os.environ.get("ADMIN_PORT", 18443)), debug=False)

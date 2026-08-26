@@ -1,0 +1,1503 @@
+#!/usr/bin/env bash
+#
+# ============================================================================
+#  Cafe Wi-Fi Gateway & Management System  --  Universal Linux Installer
+#  Project-01 / สาขาวิศวกรรมคอมพิวเตอร์และการสื่อสาร
+# ----------------------------------------------------------------------------
+#  รองรับ: Debian / Ubuntu / Raspberry Pi OS, Fedora / RHEL / Rocky / Alma,
+#          Arch / Manjaro, openSUSE, Alpine
+#
+#  โหมดเครือข่าย: สาย LAN เส้นเดียว (one-armed router) -- RPi ต่อเราเตอร์บ้านด้วย
+#  RJ45 เส้นเดียว, ตัวเราเตอร์ปล่อย Wi-Fi ให้ลูกค้าและปิด DHCP ของตัวเอง (ดู PROJECT_PLAN.md §3.1)
+#
+#  ใช้งาน:
+#     sudo ./install.sh                                     # โหมดถาม-ตอบ
+#     sudo ./install.sh -y --nic eth0 --uplink-gw 192.168.1.1
+#     sudo ./install.sh --skip-network                      # โหมดพัฒนาบน VM/แล็ปท็อป
+#     ./install.sh --dry-run                                # ดูว่าจะทำอะไรบ้าง
+#     sudo ./install.sh --uninstall
+# ============================================================================
+
+set -Eeuo pipefail
+
+readonly APP_NAME="cafe-wifi"
+readonly APP_VERSION="1.0.0"
+readonly APP_USER="cafewifi"
+readonly ETC_DIR="/etc/${APP_NAME}"
+readonly OPT_DIR="/opt/${APP_NAME}"
+readonly LOG_DIR="/var/log/${APP_NAME}"
+readonly BACKUP_DIR="/var/backups/${APP_NAME}"  # แก้บั๊ก H4 (เดิมไม่มี backup DB เลยในระบบ)
+readonly VENV_DIR="${OPT_DIR}/venv"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR
+readonly STATE_FILE="${ETC_DIR}/install.state"
+
+# ---- ค่าเริ่มต้น (override ได้ด้วย flag) -----------------------------------
+# ---- โหมดสาย LAN เส้นเดียว (D17) -- ต่อ Pi เข้ากับเราเตอร์บ้านด้วยสายเดียว แล้วให้ Pi
+#      ถือ 2 IP บนอินเทอร์เฟซเดียวกัน: หนึ่งไว้คุยกับเราเตอร์/ออกเน็ต อีกหนึ่งเป็น gateway
+#      ของลูกค้า (ดู PROJECT_PLAN.md §3.1 สำหรับเหตุผลและข้อจำกัด) -----------------------
+NIC=""                          # อินเทอร์เฟซเดียว (เช่น eth0) -- ไม่มี WAN/LAN แยกกันอีกแล้ว
+UPLINK_CIDR="192.168.1.2/24"    # IP ของ Pi ฝั่งเราเตอร์ (ใช้ออกเน็ต + SSH เข้ามาดูแล)
+UPLINK_GW="192.168.1.1"         # IP ของเราเตอร์บ้าน (default route ของ Pi)
+CLIENT_CIDR="10.10.0.1/24"      # IP ของ Pi ฝั่งลูกค้า (เป็น gateway/DHCP/DNS ให้ลูกค้า)
+DHCP_START="10.10.0.100"
+DHCP_END="10.10.0.250"
+DHCP_LEASE="4h"
+DB_NAME="cafewifi"
+DB_USER="cafewifi"
+DB_PASS=""
+ADMIN_PORT="8443"          # nginx https  (หน้าพนักงาน)
+FAS_PORT="8080"            # nginx http   (หน้าลูกค้า) -- openNDS ชี้มาที่นี่
+NDS_PORT="2050"            # openNDS gateway port
+ADMIN_BACKEND="18443"      # gunicorn ภายใน
+FAS_BACKEND="18080"        # gunicorn ภายใน
+GATEWAY_NAME="Cafe-Guest"
+# แก้บั๊ก M4: ปักเวอร์ชัน openNDS ที่ build แทนการดึง default branch ล่าสุดทุกครั้ง
+# *** ตรวจว่า tag นี้ยังมีอยู่จริงที่ https://github.com/openNDS/openNDS/tags ก่อนใช้งานจริง
+# เสมอ (ยังไม่เคย build/ทดสอบ tag นี้บนฮาร์ดแวร์จริง) เปลี่ยนได้ด้วย --opennds-ref ***
+OPENNDS_REF="v10.1.3"
+NTP_SERVERS="time1.nimt.or.th time2.nimt.or.th th.pool.ntp.org"
+LOG_RETENTION_DAYS="180"
+BACKUP_RETENTION_DAYS="14"  # แก้บั๊ก H4 -- เก็บ backup DB ในเครื่องกี่วัน (ไม่ใช่ log ตาม ม.26
+                            # จึงไม่มีขั้นต่ำตามกฎหมายเหมือน LOG_RETENTION_DAYS)
+
+INTERACTIVE=1
+DRY_RUN=0
+DO_UNINSTALL=0
+SKIP_OPENNDS=0
+SKIP_NETWORK=0
+ASSUME_YES=0
+ENABLE_PARTITIONS=0        # แก้บั๊ก (พบตอนตรวจทานรอบ 2) -- opt-in สำหรับ sql/003_partitions.sql
+
+# ---- สี / logging ----------------------------------------------------------
+if [[ -t 1 ]] && command -v tput >/dev/null 2>&1 && [[ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]]; then
+  C_RED=$(tput setaf 1); C_GRN=$(tput setaf 2); C_YEL=$(tput setaf 3)
+  C_BLU=$(tput setaf 6); C_DIM=$(tput dim);     C_RST=$(tput sgr0)
+else
+  C_RED=""; C_GRN=""; C_YEL=""; C_BLU=""; C_DIM=""; C_RST=""
+fi
+
+info() { printf '%s[ %s ]%s %s\n'     "$C_BLU" "INFO" "$C_RST" "$*"; }
+ok()   { printf '%s[ %s ]%s %s\n'     "$C_GRN" " OK " "$C_RST" "$*"; }
+warn() { printf '%s[ %s ]%s %s\n' >&2 "$C_YEL" "WARN" "$C_RST" "$*"; }
+err()  { printf '%s[ %s ]%s %s\n' >&2 "$C_RED" "FAIL" "$C_RST" "$*"; }
+die()  { err "$*"; exit 1; }
+step() { printf '\n%s==>%s %s%s%s\n' "$C_BLU" "$C_RST" "$C_GRN" "$*" "$C_RST"; }
+
+run() {
+  if (( DRY_RUN )); then printf '%s      $ %s%s\n' "$C_DIM" "$*" "$C_RST"; return 0; fi
+  "$@"
+}
+
+run_sh() {  # สำหรับคำสั่งที่ต้องใช้ pipe / redirect
+  if (( DRY_RUN )); then printf '%s      $ %s%s\n' "$C_DIM" "$1" "$C_RST"; return 0; fi
+  bash -c "$1"
+}
+
+# write_file <path> [mode] [owner:group]   -- เนื้อหามาจาก stdin (heredoc)
+write_file() {
+  local path="$1" mode="${2:-0644}" own="${3:-}"
+  if (( DRY_RUN )); then
+    printf '%s      $ เขียนไฟล์ %s (mode %s)%s\n' "$C_DIM" "$path" "$mode" "$C_RST"
+    cat >/dev/null
+    return 0
+  fi
+  install -d -m 0755 "$(dirname "$path")"
+  cat > "$path"
+  chmod "$mode" "$path"
+  [[ -n "$own" ]] && chown "$own" "$path"
+  return 0
+}
+
+on_error() {
+  local rc=$? line=${1:-?}
+  err "ติดตั้งล้มเหลวที่บรรทัด ${line} (exit=${rc})"
+  err "ดู log ได้ที่ ${LOG_DIR}/install.log"
+  err "ถอนการติดตั้งบางส่วนออกด้วย: sudo $0 --uninstall"
+  exit "$rc"
+}
+trap 'on_error $LINENO' ERR
+
+# ============================================================================
+#  1. Argument parsing
+# ============================================================================
+usage() {
+  cat <<'USAGE'
+Cafe Wi-Fi Gateway Installer
+
+  --nic <iface>            อินเทอร์เฟซเดียวที่ต่อไปเราเตอร์บ้าน (เช่น eth0) -- โหมดสาย LAN เส้นเดียว
+  --uplink-cidr <cidr>     IP/prefix ของ Pi ฝั่งเราเตอร์ (default 192.168.1.2/24)
+  --uplink-gw <ip>         IP ของเราเตอร์บ้าน / default route (default 192.168.1.1)
+  --client-cidr <cidr>     IP/prefix ของ Pi ฝั่งลูกค้า (default 10.10.0.1/24)
+  --dhcp-range <a>,<b>    ช่วง DHCP ฝั่งลูกค้า (default 10.10.0.100,10.10.0.250)
+  --ssid <name>           ชื่อที่แสดงบน captive portal (default Cafe-Guest)
+  --admin-port <p>        พอร์ต Admin Panel HTTPS (default 8443)
+  --fas-port <p>          พอร์ต Captive Portal HTTP (default 8080)
+  --db-pass <pw>          รหัสผ่าน DB (ไม่ใส่ = สุ่มให้)
+  --retention-days <n>    เก็บ log กี่วันก่อนลบ (default 180, ขั้นต่ำตามกฎหมาย 90)
+  --backup-retention-days <n>  เก็บ backup DB ในเครื่องกี่วัน (default 14)
+  --opennds-ref <tag>     git tag ของ openNDS ที่จะ build (default: ดูค่าใน install.sh
+                          -- ตรวจ tag ล่าสุดที่ github.com/openNDS/openNDS/tags ก่อนใช้จริง)
+
+  -y, --non-interactive   ไม่ถาม ใช้ค่า default/flag ทั้งหมด
+  --skip-network          ไม่แตะ dnsmasq/nftables/routing (โหมดพัฒนาบน VM)
+  --skip-opennds          ไม่ build openNDS
+  --enable-partitions     เปิด sql/003_partitions.sql (partition รายสัปดาห์ + event scheduler
+                          -- optional, ตาราง conn_log/dns_log ที่มีข้อมูลอยู่แล้วอาจ ALTER ช้า)
+  --dry-run               แสดงคำสั่งที่จะรัน แต่ไม่รันจริง
+  --uninstall             ถอนการติดตั้ง
+  --version | -h/--help
+USAGE
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --nic)             NIC="$2"; shift 2 ;;
+      --uplink-cidr)     UPLINK_CIDR="$2"; shift 2 ;;
+      --uplink-gw)       UPLINK_GW="$2"; shift 2 ;;
+      --client-cidr)     CLIENT_CIDR="$2"; shift 2 ;;
+      --wan-if|--lan-if|--lan-cidr)
+        die "ตัวเลือก $1 ถูกยกเลิกแล้ว (D17 เปลี่ยนเป็นโหมดสาย LAN เส้นเดียว) ใช้ --nic / --uplink-gw / --client-cidr แทน" ;;
+      --dhcp-range)      DHCP_START="${2%%,*}"; DHCP_END="${2##*,}"; shift 2 ;;
+      --ssid)            GATEWAY_NAME="$2"; shift 2 ;;
+      --admin-port)      ADMIN_PORT="$2"; ADMIN_BACKEND=$((ADMIN_PORT+10000)); shift 2 ;;
+      --fas-port)        FAS_PORT="$2";   FAS_BACKEND=$((FAS_PORT+10000));     shift 2 ;;
+      --db-pass)         DB_PASS="$2"; shift 2 ;;
+      --retention-days)  LOG_RETENTION_DAYS="$2"; shift 2 ;;
+      --backup-retention-days) BACKUP_RETENTION_DAYS="$2"; shift 2 ;;
+      --opennds-ref)     OPENNDS_REF="$2"; shift 2 ;;
+      -y|--non-interactive) INTERACTIVE=0; ASSUME_YES=1; shift ;;
+      --skip-network)    SKIP_NETWORK=1; shift ;;
+      --skip-opennds)    SKIP_OPENNDS=1; shift ;;
+      --enable-partitions) ENABLE_PARTITIONS=1; shift ;;
+      --dry-run)         DRY_RUN=1; shift ;;
+      --uninstall)       DO_UNINSTALL=1; shift ;;
+      --version)         echo "${APP_NAME} installer ${APP_VERSION}"; exit 0 ;;
+      -h|--help)         usage; exit 0 ;;
+      *) die "ไม่รู้จักตัวเลือก: $1  (ดู --help)" ;;
+    esac
+  done
+}
+
+confirm() {
+  if (( ASSUME_YES )); then return 0; fi
+  local ans
+  read -r -p "$(printf '%s?%s %s [y/N] ' "$C_YEL" "$C_RST" "${1:-ดำเนินการต่อ?}")" ans || true
+  [[ "${ans,,}" == y* ]]
+}
+
+ask() {  # ask VAR "คำถาม" "ค่า default"
+  local __var="$1" __q="$2" __def="$3" __ans
+  if (( ! INTERACTIVE )); then printf -v "$__var" '%s' "$__def"; return 0; fi
+  read -r -p "$(printf '%s>%s %s [%s]: ' "$C_BLU" "$C_RST" "$__q" "$__def")" __ans || true
+  printf -v "$__var" '%s' "${__ans:-$__def}"
+}
+
+# ============================================================================
+#  2. Distro detection + package abstraction
+# ============================================================================
+DISTRO_ID=""; DISTRO_NAME=""; PKG=""
+
+detect_distro() {
+  [[ -r /etc/os-release ]] || die "ไม่พบ /etc/os-release — ไม่รองรับระบบนี้"
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  DISTRO_ID="${ID:-unknown}"
+  DISTRO_NAME="${PRETTY_NAME:-$DISTRO_ID}"
+
+  if   command -v apt-get >/dev/null 2>&1; then PKG=apt
+  elif command -v dnf     >/dev/null 2>&1; then PKG=dnf
+  elif command -v yum     >/dev/null 2>&1; then PKG=yum
+  elif command -v pacman  >/dev/null 2>&1; then PKG=pacman
+  elif command -v zypper  >/dev/null 2>&1; then PKG=zypper
+  elif command -v apk     >/dev/null 2>&1; then PKG=apk
+  else die "ไม่พบ package manager ที่รองรับ (apt/dnf/yum/pacman/zypper/apk)"
+  fi
+  info "ระบบปฏิบัติการ: ${DISTRO_NAME}   package manager: ${PKG}"
+}
+
+pkg_map() {
+  case "$1:$PKG" in
+    mariadb:apt)             echo "mariadb-server mariadb-client" ;;
+    mariadb:dnf|mariadb:yum) echo "mariadb-server" ;;
+    mariadb:pacman)          echo "mariadb" ;;
+    mariadb:zypper)          echo "mariadb" ;;
+    mariadb:apk)             echo "mariadb mariadb-client" ;;
+
+    python:apt)              echo "python3 python3-venv python3-dev python3-pip" ;;
+    python:dnf|python:yum)   echo "python3 python3-devel python3-pip" ;;
+    python:pacman)           echo "python python-pip" ;;
+    python:zypper)           echo "python3 python3-devel python3-pip" ;;
+    python:apk)              echo "python3 python3-dev py3-pip" ;;
+
+    buildtools:apt)                echo "build-essential pkg-config libffi-dev libssl-dev" ;;
+    buildtools:dnf|buildtools:yum) echo "gcc gcc-c++ make pkgconf-pkg-config libffi-devel openssl-devel" ;;
+    buildtools:pacman)             echo "base-devel libffi openssl" ;;
+    buildtools:zypper)             echo "gcc gcc-c++ make pkg-config libffi-devel libopenssl-devel" ;;
+    buildtools:apk)                echo "build-base pkgconf libffi-dev openssl-dev" ;;
+
+    microhttpd:apt)                echo "libmicrohttpd-dev" ;;
+    microhttpd:dnf|microhttpd:yum) echo "libmicrohttpd-devel" ;;
+    microhttpd:pacman)             echo "libmicrohttpd" ;;
+    microhttpd:zypper)             echo "libmicrohttpd-devel" ;;
+    microhttpd:apk)                echo "libmicrohttpd-dev" ;;
+
+    conntrack:apt)                echo "conntrack" ;;
+    conntrack:dnf|conntrack:yum)  echo "conntrack-tools" ;;
+    conntrack:pacman)             echo "conntrack-tools" ;;
+    conntrack:zypper)             echo "conntrack-tools" ;;
+    conntrack:apk)                echo "conntrack-tools" ;;
+
+    iproute:apt) echo "iproute2" ;;
+    iproute:apk) echo "iproute2" ;;
+    iproute:*)   echo "iproute2" ;;
+
+    nginx:*)    echo "nginx" ;;
+    dnsmasq:*)  echo "dnsmasq" ;;
+    nftables:*) echo "nftables" ;;
+    chrony:*)   echo "chrony" ;;
+    git:*)      echo "git" ;;
+    curl:*)     echo "curl" ;;
+    openssl:*)  echo "openssl" ;;
+    tcpdump:*)  echo "tcpdump" ;;
+    *)          echo "$1" ;;
+  esac
+}
+
+pkg_refresh() {
+  case "$PKG" in
+    apt)
+      # หมายเหตุ (พบจริงตอนติดตั้งบน Pi 2026-08-26):
+      #   1) apt/DNS resolver บางระบบลอง IPv6 ก่อนแล้วพัง "Network is unreachable" ทันที
+      #      โดยไม่ fallback ไป IPv4 เอง ทั้งที่เครือข่ายโหมดสายเดียวของเราเป็น IPv4-only
+      #      ล้วน -- บังคับ apt ให้ใช้ IPv4 เท่านั้นกันไว้ก่อนเสมอ (idempotent)
+      #   2) Debian trixie เปลี่ยนสถานะจาก testing เป็น stable ทำให้ repo metadata
+      #      เปลี่ยนชื่อ/โครงสร้าง apt จะปฏิเสธ cache เก่าด้วย error "Release file...
+      #      no longer has a Release file" ถ้าไม่อนุญาตให้เปลี่ยนสถานะ suite
+      write_file /etc/apt/apt.conf.d/99force-ipv4 0644 <<'APTCONF'
+Acquire::ForceIPv4 "true";
+APTCONF
+      run_sh "DEBIAN_FRONTEND=noninteractive apt-get update -qq --allow-releaseinfo-change"
+      ;;
+    dnf)    run dnf -q makecache ;;
+    yum)    run yum -q makecache ;;
+    pacman) run pacman -Sy --noconfirm ;;
+    zypper) run zypper --non-interactive refresh ;;
+    apk)    run apk update ;;
+  esac
+}
+
+pkg_install() {
+  local list=() p
+  for p in "$@"; do
+    # shellcheck disable=SC2206
+    list+=( $(pkg_map "$p") )
+  done
+  info "ติดตั้งแพ็กเกจ: ${list[*]}"
+  case "$PKG" in
+    apt)    run_sh "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ${list[*]}" ;;
+    dnf)    run dnf install -y "${list[@]}" ;;
+    yum)    run yum install -y "${list[@]}" ;;
+    pacman) run pacman -S --needed --noconfirm "${list[@]}" ;;
+    zypper) run zypper --non-interactive install "${list[@]}" ;;
+    apk)    run apk add --no-cache "${list[@]}" ;;
+  esac
+}
+
+INIT_SYS=""
+detect_init() {
+  if   [[ -d /run/systemd/system ]];          then INIT_SYS=systemd
+  elif command -v rc-service >/dev/null 2>&1; then INIT_SYS=openrc
+  else INIT_SYS=none; fi
+  info "ระบบ init: ${INIT_SYS}"
+  [[ "$INIT_SYS" == none ]] && warn "ไม่พบ systemd/OpenRC — จะไม่ตั้งค่า service อัตโนมัติ"
+  return 0
+}
+
+svc() {  # svc <enable|disable|start|stop|restart|reload> <name>
+  local action="$1" name="$2"
+  case "$INIT_SYS" in
+    systemd)
+      case "$action" in
+        enable)  run systemctl enable --now "$name" ;;
+        disable) run systemctl disable --now "$name" 2>/dev/null || true ;;
+        *)       run systemctl "$action" "$name" ;;
+      esac ;;
+    openrc)
+      case "$action" in
+        enable)  run rc-update add "$name" default; run rc-service "$name" start ;;
+        disable) run rc-service "$name" stop 2>/dev/null || true
+                 run rc-update del "$name" default 2>/dev/null || true ;;
+        *)       run rc-service "$name" "$action" ;;
+      esac ;;
+    none) warn "ข้ามการจัดการ service '${name}'" ;;
+  esac
+}
+
+# ============================================================================
+#  3. Preflight
+# ============================================================================
+require_root() {
+  if (( DRY_RUN )); then return 0; fi
+  [[ $EUID -eq 0 ]] || die "ต้องรันด้วย root  ->  sudo $0 ..."
+}
+
+preflight() {
+  step "ตรวจสอบความพร้อมของระบบ (preflight)"
+  local fail=0 arch mem_mb free_mb p
+
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64|aarch64|armv7l|armv6l) info "สถาปัตยกรรม: ${arch}" ;;
+    *) warn "สถาปัตยกรรม ${arch} ยังไม่เคยทดสอบ — อาจต้อง build บางส่วนเอง" ;;
+  esac
+  info "เคอร์เนล: $(uname -r)"
+
+  mem_mb=$(awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)
+  if (( mem_mb < 900 )); then
+    warn "RAM ${mem_mb} MB (ต่ำกว่า 1 GB) — MariaDB อาจทำงานไม่ราบรื่น"
+  else
+    ok "RAM ${mem_mb} MB"
+  fi
+
+  free_mb=$(df -Pm / | awk 'NR==2{print $4}')
+  if (( free_mb < 2048 )); then
+    err "พื้นที่ว่างบน / เหลือ ${free_mb} MB (ต้องการอย่างน้อย 2048 MB)"; fail=1
+  else
+    ok "พื้นที่ว่าง ${free_mb} MB"
+  fi
+
+  if curl -fsS --max-time 8 -o /dev/null https://pypi.org 2>/dev/null; then
+    ok "เชื่อมต่ออินเทอร์เน็ตได้"
+  else
+    warn "ตรวจอินเทอร์เน็ตไม่ผ่าน — การติดตั้งแพ็กเกจอาจล้มเหลว"
+  fi
+
+  # เตือนถ้ารันบน SD card (write endurance ต่ำกว่า SSD)
+  local rootdev
+  rootdev="$(findmnt -no SOURCE / 2>/dev/null || echo '')"
+  if [[ "$rootdev" == *mmcblk* ]]; then
+    warn "root filesystem อยู่บน SD card (${rootdev})"
+    warn "ใช้ได้สำหรับเฟสทดสอบในแล็บ แต่ก่อนใช้งานจริงควรย้าย ${LOG_DIR} และ MariaDB ไป SSD"
+    warn "ความเสี่ยงหลักคือไฟดับแล้ว filesystem พัง ไม่ใช่การเขียนจนหมดอายุ"
+  fi
+
+  if (( ! SKIP_NETWORK )); then
+    if ! command -v ip >/dev/null 2>&1; then
+      # iproute2 ปกติมากับทุก distro หลักอยู่แล้ว (Debian/RPi OS/Ubuntu/Fedora ฯลฯ) แต่ระบบ
+      # ขั้นต่ำสุดบางแบบอาจยังไม่มีตอนนี้ -- ข้ามการตรวจอินเทอร์เฟซแทนที่จะทำให้สคริปต์ล้ม
+      # ทั้งดุ้น (install_packages ขั้นตอนถัดไปจะติดตั้ง iproute2 ให้อยู่ดี)
+      warn "ไม่พบคำสั่ง 'ip' (iproute2) — ข้ามการตรวจสอบอินเทอร์เฟซตอนนี้ จะติดตั้ง iproute2 ให้ในขั้นตอนถัดไป แล้วตรวจใหม่ตอนตั้งค่าเครือข่ายจริง"
+    else
+      local ifaces
+      ifaces=$(ip -o link show 2>/dev/null | awk -F': ' '$2!="lo"{print $2}' | paste -sd' ' -)
+      info "อินเทอร์เฟซที่พบ: ${ifaces:-<ไม่พบ>}"
+      if [[ -n "$NIC" ]]; then
+        ip link show "$NIC" >/dev/null 2>&1 || { err "ไม่พบอินเทอร์เฟซ '${NIC}'"; fail=1; }
+      fi
+    fi
+    # โหมดสาย LAN เส้นเดียว (D17) -- ไม่มีการตรวจ WAN!=LAN อีกแล้ว เพราะตั้งใจใช้อินเทอร์เฟซเดียว
+  fi
+
+  if ! command -v ss >/dev/null 2>&1; then
+    warn "ไม่พบคำสั่ง 'ss' (iproute2) — ข้ามการตรวจพอร์ตชนกันตอนนี้"
+  fi
+  for p in "$ADMIN_PORT" "$FAS_PORT" "$NDS_PORT" "$ADMIN_BACKEND" "$FAS_BACKEND"; do
+    command -v ss >/dev/null 2>&1 || continue
+    if ss -Hltn "sport = :${p}" 2>/dev/null | grep -q .; then
+      err "พอร์ต ${p} ถูกใช้งานอยู่แล้ว"; fail=1
+    fi
+  done
+
+  if command -v firewalld >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+    warn "firewalld ทำงานอยู่ — อาจขัดกับ nftables rules ของระบบนี้"
+  fi
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    warn "ufw ทำงานอยู่ — อาจขัดกับ nftables rules ของระบบนี้"
+  fi
+
+  (( fail )) && die "preflight ไม่ผ่าน — แก้ตามข้อความข้างบนแล้วรันใหม่"
+  ok "preflight ผ่าน"
+}
+
+# ============================================================================
+#  4. Wizard
+# ============================================================================
+guess_nic() {
+  # เดาอินเทอร์เฟซที่มีอยู่จริงตัวแรก (ไม่นับ loopback/virtual) -- โหมดสายเดียวใช้อินเทอร์เฟซนี้
+  # ทั้งคุยกับเราเตอร์และเป็น gateway ให้ลูกค้า
+  local def_route
+  def_route="$(ip route show default 2>/dev/null | awk '/default/{print $5; exit}')"
+  if [[ -n "$def_route" ]]; then echo "$def_route"; return 0; fi
+  local i
+  for i in $(ip -o link show 2>/dev/null | awk -F': ' '$2!="lo"{print $2}'); do
+    case "$i" in docker*|br-*|veth*|virbr*|tailscale*) continue ;; esac
+    echo "$i"; return 0
+  done
+}
+
+wizard() {
+  step "ตั้งค่าการติดตั้ง"
+  local def_nic
+  def_nic="${NIC:-$(guess_nic)}"
+
+  if (( ! SKIP_NETWORK )); then
+    ask NIC          "อินเทอร์เฟซเดียวที่ต่อไปเราเตอร์บ้าน (โหมดสาย LAN เส้นเดียว)" "${def_nic:-eth0}"
+    ask UPLINK_CIDR  "IP ของ Pi ฝั่งเราเตอร์ (ใช้ออกเน็ต + SSH)"                    "$UPLINK_CIDR"
+    ask UPLINK_GW    "IP ของเราเตอร์บ้าน (default route)"                          "$UPLINK_GW"
+    ask CLIENT_CIDR  "IP ของ Pi ฝั่งลูกค้า (gateway/DHCP/DNS)"                     "$CLIENT_CIDR"
+  fi
+  ask GATEWAY_NAME       "ชื่อที่แสดงบนหน้า captive portal"        "$GATEWAY_NAME"
+  ask ADMIN_PORT         "พอร์ต Admin Panel (HTTPS)"               "$ADMIN_PORT"
+  ask FAS_PORT           "พอร์ต Captive Portal (HTTP)"             "$FAS_PORT"
+  ask LOG_RETENTION_DAYS "เก็บ log กี่วันก่อนลบ (ขั้นต่ำ 90)"       "$LOG_RETENTION_DAYS"
+  ADMIN_BACKEND=$((ADMIN_PORT+10000))
+  FAS_BACKEND=$((FAS_PORT+10000))
+
+  printf '\n  %sสรุปการติดตั้ง%s\n' "$C_BLU" "$C_RST"
+  printf '  --------------------------------------------------\n'
+  printf '    ระบบปฏิบัติการ  : %s\n' "$DISTRO_NAME"
+  printf '    อินเทอร์เฟซ      : %s\n' "${NIC:-<ข้าม>}"
+  printf '    Uplink (เราเตอร์) : %s  ผ่าน gw %s\n' "${UPLINK_CIDR:-<ข้าม>}" "${UPLINK_GW:-<ข้าม>}"
+  printf '    Client gateway   : %s\n' "$CLIENT_CIDR"
+  printf '    DHCP pool       : %s - %s\n' "$DHCP_START" "$DHCP_END"
+  printf '    ชื่อ portal      : %s\n' "$GATEWAY_NAME"
+  printf '    Admin Panel     : https  port %s\n' "$ADMIN_PORT"
+  printf '    Captive Portal  : http   port %s\n' "$FAS_PORT"
+  printf '    เก็บ log        : %s วัน\n' "$LOG_RETENTION_DAYS"
+  printf '    ติดตั้งไปที่     : %s , %s , %s\n' "$OPT_DIR" "$ETC_DIR" "$LOG_DIR"
+  printf '  --------------------------------------------------\n\n'
+  confirm "เริ่มติดตั้ง" || die "ยกเลิกโดยผู้ใช้"
+}
+
+# ============================================================================
+#  5. ขั้นตอนติดตั้ง
+# ============================================================================
+create_user_and_dirs() {
+  step "สร้างผู้ใช้ระบบและไดเรกทอรี"
+  if ! id -u "$APP_USER" >/dev/null 2>&1; then
+    if command -v useradd >/dev/null 2>&1; then
+      run useradd --system --home-dir "$OPT_DIR" --shell /usr/sbin/nologin "$APP_USER"
+    else
+      run adduser -S -H -h "$OPT_DIR" -s /sbin/nologin "$APP_USER"
+    fi
+    ok "สร้างผู้ใช้ ${APP_USER}"
+  else
+    info "ผู้ใช้ ${APP_USER} มีอยู่แล้ว"
+  fi
+  run install -d -m 0755 -o root        -g root        "$OPT_DIR"
+  run install -d -m 0750 -o root        -g "$APP_USER" "$ETC_DIR"
+  run install -d -m 0750 -o "$APP_USER" -g "$APP_USER" "$LOG_DIR"
+  run install -d -m 0750 -o "$APP_USER" -g "$APP_USER" "${LOG_DIR}/archive"
+  run install -d -m 0750 -o root        -g "$APP_USER" "$BACKUP_DIR"  # แก้บั๊ก H4
+  ok "ไดเรกทอรีพร้อม"
+}
+
+gen_secrets() {
+  step "สร้างกุญแจเข้ารหัส (secrets)"
+  local secrets="${ETC_DIR}/secrets.env"
+  if [[ -f "$secrets" ]] && (( ! DRY_RUN )); then
+    warn "พบ ${secrets} อยู่แล้ว — ใช้ของเดิม (สร้างใหม่จะทำให้ข้อมูลเดิมถอดรหัสไม่ได้)"
+    return 0
+  fi
+  [[ -z "$DB_PASS" ]] && DB_PASS="$(openssl rand -base64 32 | tr -dc 'A-Za-z0-9' | head -c 28)"
+  local pepper dek flask faskey setup_token
+  pepper="$(openssl rand -hex 32)"
+  dek="$(openssl rand -hex 32)"
+  flask="$(openssl rand -hex 32)"
+  faskey="$(openssl rand -hex 16)"
+  setup_token="$(openssl rand -hex 24)"
+
+  write_file "$secrets" 0640 "root:${APP_USER}" <<SECRETS
+# ============================================================
+#  ${APP_NAME} secrets  --  ห้าม commit ไฟล์นี้เข้า Git เด็ดขาด
+#  สร้างเมื่อ: $(date -Iseconds)
+# ------------------------------------------------------------
+#  ถ้าไฟล์นี้หาย: เลขบัตรประชาชนที่เข้ารหัสไว้จะถอดกลับไม่ได้อีก
+#  -> สำรองไฟล์นี้ไว้นอกเครื่อง ในที่ที่ปลอดภัย
+# ============================================================
+DB_HOST=127.0.0.1
+DB_PORT=3306
+DB_NAME=${DB_NAME}
+DB_USER=${DB_USER}
+DB_PASS=${DB_PASS}
+
+# HMAC pepper สำหรับ hash เลขบัตรประชาชน (ใช้ค้นหา/กันซ้ำ)
+NATID_PEPPER=${pepper}
+# Data Encryption Key สำหรับ AES-256-GCM (เก็บเลขบัตรแบบถอดกลับได้ตามหมายศาล)
+NATID_DEK=${dek}
+# Flask session secret
+SECRET_KEY=${flask}
+# openNDS FAS shared key (fas_secure_enabled = 2)
+FAS_KEY=${faskey}
+
+FAS_PORT=${FAS_BACKEND}
+ADMIN_PORT=${ADMIN_BACKEND}
+NDS_PORT=${NDS_PORT}
+GATEWAY_NAME=${GATEWAY_NAME}
+ETC_DIR=${ETC_DIR}
+LOG_DIR=${LOG_DIR}
+LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS}
+BACKUP_DIR=${BACKUP_DIR}
+BACKUP_RETENTION_DAYS=${BACKUP_RETENTION_DAYS}
+SECRETS
+
+  write_file "${ETC_DIR}/setup.token" 0640 "root:${APP_USER}" <<TOKEN
+${setup_token}
+TOKEN
+
+  ok "สร้าง secrets แล้ว: ${secrets} (mode 0640)"
+  warn "สำรอง ${secrets} ไว้ที่อื่นด้วย — ถ้าหาย ข้อมูลที่เข้ารหัสไว้จะกู้ไม่ได้"
+}
+
+install_packages() {
+  step "ติดตั้งแพ็กเกจของระบบ"
+  pkg_refresh
+  local pkgs=(python buildtools git curl openssl mariadb nginx chrony iproute)
+  (( SKIP_NETWORK )) || pkgs+=(dnsmasq nftables conntrack tcpdump)
+  (( SKIP_OPENNDS )) || pkgs+=(microhttpd)
+  pkg_install "${pkgs[@]}"
+  ok "ติดตั้งแพ็กเกจเสร็จ"
+}
+
+setup_python() {
+  step "สร้าง Python virtualenv"
+  run_sh "python3 -m venv '${VENV_DIR}'"
+  run_sh "'${VENV_DIR}/bin/pip' install --quiet --upgrade pip wheel setuptools"
+  local req="${SCRIPT_DIR}/app/requirements.txt"
+  if [[ -f "$req" ]]; then
+    run_sh "'${VENV_DIR}/bin/pip' install --quiet -r '${req}'"
+  else
+    run_sh "'${VENV_DIR}/bin/pip' install --quiet Flask gunicorn PyMySQL cryptography argon2-cffi pyotp"
+  fi
+  ok "Python environment พร้อม (${VENV_DIR})"
+}
+
+install_app_files() {
+  step "คัดลอกไฟล์แอปพลิเคชัน"
+  if [[ -d "${SCRIPT_DIR}/app" ]]; then
+    run_sh "cp -a '${SCRIPT_DIR}/app/.' '${OPT_DIR}/'"
+    ok "คัดลอก app/ -> ${OPT_DIR}"
+  else
+    warn "ไม่พบโฟลเดอร์ app/ ข้าง install.sh — ข้ามขั้นตอนนี้"
+  fi
+  [[ -d "${SCRIPT_DIR}/sql" ]]   && run_sh "cp -a '${SCRIPT_DIR}/sql'   '${OPT_DIR}/'"
+  [[ -d "${SCRIPT_DIR}/tools" ]] && run_sh "cp -a '${SCRIPT_DIR}/tools' '${OPT_DIR}/'"
+  [[ -d "${SCRIPT_DIR}/docs" ]]  && run_sh "cp -a '${SCRIPT_DIR}/docs'  '${OPT_DIR}/'"
+  run_sh "chown -R root:'${APP_USER}' '${OPT_DIR}'"
+  run_sh "find '${OPT_DIR}' -type d -exec chmod 0755 {} + 2>/dev/null || true"
+  return 0
+}
+
+setup_database() {
+  step "ตั้งค่าฐานข้อมูล MariaDB"
+  local dbsvc="mariadb"
+  if [[ "$INIT_SYS" == systemd ]] && systemctl list-unit-files 2>/dev/null | grep -q '^mysqld\.service'; then
+    dbsvc="mysqld"
+  fi
+
+  # Alpine / distro ที่ต้อง init data dir ก่อน
+  if [[ ! -d /var/lib/mysql/mysql ]] && command -v mariadb-install-db >/dev/null 2>&1; then
+    run_sh "mariadb-install-db --user=mysql --datadir=/var/lib/mysql >/dev/null 2>&1 || true"
+  fi
+  svc enable "$dbsvc"
+
+  if (( ! DRY_RUN )); then
+    local i
+    for i in $(seq 1 30); do mysqladmin ping >/dev/null 2>&1 && break; sleep 1; done
+    mysqladmin ping >/dev/null 2>&1 || die "MariaDB ไม่ตอบสนองภายใน 30 วินาที"
+    DB_PASS="$(grep -E '^DB_PASS=' "${ETC_DIR}/secrets.env" | cut -d= -f2-)"
+  fi
+
+  # แก้บั๊ก (พบตอนตรวจทานรอบ 2): เดิม GRANT ALL PRIVILEGES ให้ user ของแอป ทำให้ทั้ง
+  # Flask apps และ tools/*.py มีสิทธิ์ DROP/ALTER ตารางหลักฐานได้โดยไม่จำเป็น -- ไม่มีจุดไหน
+  # ในโค้ดรัน DDL ผ่าน user นี้เลย (schema โหลดครั้งเดียวตอนติดตั้งผ่าน root/socket auth
+  # ด้านล่าง ไม่ใช่ DB_USER) จำกัดให้เหลือแค่สิทธิ์ที่ใช้จริง (SELECT/INSERT/UPDATE/DELETE)
+  if (( DRY_RUN )); then
+    printf '%s      $ สร้าง database %s + user %s%s\n' "$C_DIM" "$DB_NAME" "$DB_USER" "$C_RST"
+  else
+    mysql <<SQL
+CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS '${DB_USER}'@'127.0.0.1' IDENTIFIED BY '${DB_PASS}';
+CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';
+ALTER USER '${DB_USER}'@'127.0.0.1' IDENTIFIED BY '${DB_PASS}';
+ALTER USER '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';
+GRANT SELECT, INSERT, UPDATE, DELETE ON \`${DB_NAME}\`.* TO '${DB_USER}'@'127.0.0.1';
+GRANT SELECT, INSERT, UPDATE, DELETE ON \`${DB_NAME}\`.* TO '${DB_USER}'@'localhost';
+FLUSH PRIVILEGES;
+SQL
+  fi
+  ok "database '${DB_NAME}' + user '${DB_USER}' พร้อม"
+
+  local schema="${SCRIPT_DIR}/sql/001_schema.sql"
+  if [[ -f "$schema" ]]; then
+    run_sh "mysql '${DB_NAME}' < '${schema}'"
+    ok "โหลด schema แล้ว"
+  else
+    warn "ไม่พบ sql/001_schema.sql — ต้องโหลด schema เอง"
+  fi
+
+  # แก้บั๊ก (พบตอนตรวจทานรอบ 2): sql/003_partitions.sql มีอยู่ในโปรเจกต์และ Task Board
+  # ติ๊กว่าเขียนแล้ว แต่ install.sh ไม่เคยเรียกใช้ไฟล์นี้เลยสักบรรทัด -- เป็น optional
+  # ตามที่ comment ในไฟล์บอกไว้ (ไม่มีก็ทำงานถูกต้อง แค่ purge ช้ากว่าเมื่อข้อมูลเยอะมาก)
+  # จึงทำเป็น opt-in ผ่าน --enable-partitions แทนที่จะบังคับ ALTER TABLE บนทุกเครื่อง
+  # (partition ตารางที่มีข้อมูลอยู่แล้วอาจช้า/ล็อกตารางได้ ไม่ควรทำเงียบ ๆ โดยไม่ให้เลือก)
+  if (( ENABLE_PARTITIONS )); then
+    local partsql="${SCRIPT_DIR}/sql/003_partitions.sql"
+    if [[ -f "$partsql" ]]; then
+      run_sh "mysql '${DB_NAME}' < '${partsql}'"
+      # ไฟล์ .sql เขียน retention_days=180 ตายตัวไว้ในนิยาม event -- ผูกกับ
+      # LOG_RETENTION_DAYS จริงที่ผู้ติดตั้งตั้งไว้แทน (แก้บั๊ก M4 เดิม เลข 180 ไม่ตรงกับ
+      # ค่าที่ตั้งจริงถ้าไม่ใช่ default)
+      run_sh "mysql '${DB_NAME}' -e \"ALTER EVENT cafewifi_daily_partition_maintenance ON SCHEDULE EVERY 1 DAY STARTS (CURRENT_DATE + INTERVAL 1 DAY + INTERVAL 3 HOUR) DO CALL cafewifi_partition_maintenance(${LOG_RETENTION_DAYS});\""
+      run_sh "mysql -e 'SET GLOBAL event_scheduler = ON;'"
+      ok "เปิด partition รายสัปดาห์ + event scheduler แล้ว (retention ${LOG_RETENTION_DAYS} วัน)"
+      warn "หมายเหตุ: tools/backup_db.py ไม่ได้ backup event/procedure พวกนี้ (ตั้งใจ ดู"
+      warn "  docstring ในไฟล์นั้น) ถ้า restore DB ใหม่ ต้องรัน sql/003_partitions.sql ซ้ำเองด้วย"
+    else
+      warn "ระบุ --enable-partitions แต่ไม่พบ sql/003_partitions.sql"
+    fi
+  else
+    info "ข้าม sql/003_partitions.sql (optional — เปิดด้วย --enable-partitions ถ้าต้องการ)"
+  fi
+
+  local cnf_dir=""
+  for d in /etc/mysql/mariadb.conf.d /etc/my.cnf.d /etc/mysql/conf.d; do
+    [[ -d "$d" ]] && { cnf_dir="$d"; break; }
+  done
+  if [[ -n "$cnf_dir" ]]; then
+    {
+      echo "[mysqld]"
+      echo "bind-address                   = 127.0.0.1"
+      echo "innodb_buffer_pool_size        = 256M"
+      echo "innodb_log_file_size           = 64M"
+      echo "# ทนไฟดับ -- สำคัญมากเมื่อรันบน SD card"
+      echo "innodb_flush_log_at_trx_commit = 1"
+      echo "innodb_flush_method            = O_DIRECT"
+      echo "max_connections                = 64"
+      # แก้บั๊ก (พบตอนตรวจทานรอบ 2): SET GLOBAL event_scheduler ที่ตั้งตอน --enable-partitions
+      # มีผลแค่ session ปัจจุบัน หายไปเมื่อ MariaDB restart -- ต้องตั้งถาวรในไฟล์ config ด้วย
+      if (( ENABLE_PARTITIONS )); then
+        echo "event_scheduler                = ON"
+      fi
+    } | write_file "${cnf_dir}/99-${APP_NAME}.cnf" 0644
+    svc restart "$dbsvc"
+    ok "ปรับแต่ง MariaDB (${cnf_dir}/99-${APP_NAME}.cnf)"
+  fi
+}
+
+configure_time() {
+  step "ตั้งค่านาฬิกา (chrony) — กฎหมายกำหนดคลาดเคลื่อนไม่เกิน 10 ms"
+  local conf=/etc/chrony/chrony.conf s marker="# --- ${APP_NAME} installer (ต่อท้าย, ไม่ลบของเดิม) ---"
+  [[ -f /etc/chrony.conf ]] && conf=/etc/chrony.conf
+
+  # แก้บั๊ก (พบตอนตรวจทานรอบ 2 — และแก้ผิดไปรอบหนึ่งแล้วด้วยระหว่างพยายามแก้บั๊กนี้):
+  #   เดิมเขียนทับ chrony.conf ทั้งไฟล์ ลบค่า default ของ distro ทิ้งหมด (เช่น Raspberry
+  #   Pi OS ใส่ `confdir /etc/chrony/conf.d`, `sourcedir /run/chrony-dhcp` ไว้ให้แล้ว)
+  #   รอบแรกที่ลองแก้ ใช้วิธีเขียนไฟล์ลง conf.d/ ถ้าเจอโฟลเดอร์นั้น -- แต่พบว่าไม่ปลอดภัย
+  #   พอ ๆ กัน: เจอโฟลเดอร์ conf.d อยู่จริง ไม่ได้แปลว่า chrony.conf มีบรรทัด `confdir`/
+  #   `include` ชี้มาที่มันจริง (เดายืนยันไม่ได้ในสคริปต์ติดตั้งที่ไม่รู้จักทุก distro
+  #   ล่วงหน้า) ถ้าเดาผิด ไฟล์ที่เขียนไปจะไม่ถูกอ่านเลย แล้ว NTP server ที่ตั้งใจเพิ่มก็จะ
+  #   ไม่มีผลอะไรทั้งที่ควรมี -- แก้ให้ถูกจริง ๆ ด้วยการ "ต่อท้าย" ไฟล์ที่ยืนยันแล้วว่า
+  #   chrony อ่านแน่ ๆ (คือ $conf เอง) แทน โดยเช็ค marker กันการต่อท้ายซ้ำเวลารัน
+  #   install.sh ซ้ำ ไม่แตะบรรทัดเดิมที่มีอยู่ก่อนเลยสักบรรทัด
+  if [[ -f "$conf" ]] && grep -qF "$marker" "$conf" 2>/dev/null; then
+    info "ตั้งค่า chrony ไว้แล้ว (เจอ marker ใน ${conf}) — ข้าม"
+  else
+    # ห้ามทำ `cat "$conf" | write_file "$conf"` (source กับ destination เป็นไฟล์เดียวกัน)
+    # เพราะ pipeline รันทุก stage พร้อมกัน -- ฝั่งเขียนจะ truncate ไฟล์ก่อนฝั่งอ่านอ่านจบ
+    # ได้ (เจอจริงจากการทดสอบ: เนื้อหาเดิมหายเกือบทุกรอบ เหลือแต่ที่ต่อท้ายอย่างเดียว)
+    # ต้องอ่านให้จบเป็นตัวแปรก่อน (command substitution บล็อกจนอ่านเสร็จ) แล้วค่อยเขียนทับ
+    local old_content=""
+    [[ -f "$conf" ]] && old_content="$(cat "$conf")"
+    {
+      [[ -n "$old_content" ]] && printf '%s\n' "$old_content"
+      echo ""
+      echo "$marker"
+      for s in $NTP_SERVERS; do echo "server ${s} iburst"; done
+      echo "makestep 1.0 3"
+    } | write_file "$conf" 0644
+    ok "เพิ่ม NTP server ต่อท้าย ${conf} แล้ว (ไม่ลบค่า default เดิมของ distro)"
+  fi
+
+  svc enable chronyd 2>/dev/null || svc enable chrony 2>/dev/null || warn "เปิด chrony อัตโนมัติไม่สำเร็จ"
+
+  # แก้บั๊ก (พบตอนตรวจทานรอบ 2) 2 จุดพร้อมกันเพราะเป็นสาเหตุ-ผลกันตรง ๆ:
+  #   (1) เดิมมี `set -e` ครอบทั้งสคริปต์ แต่ chronyc ล้มได้ (เช่น chronyd ยังไม่พร้อม) และ
+  #       pipefail ทำให้ทั้ง pipeline คืน exit code ที่ไม่ใช่ 0 -- ตัวแปร `off="$(...)"`
+  #       assignment ที่ fail จะทำให้ `set -e` ฆ่าสคริปต์ทันที "ก่อน" ถึงบรรทัด printf เลย
+  #       แปลว่า fallback ${off:-unknown} เป็นโค้ดตาย ไม่มีทางถูกรันจริง -- ต้องเอา `-e` ออก
+  #   (2) เดิมวัดค่าอย่างเดียว ไม่เคยแจ้งเตือนเลยแม้นาฬิกาจะเพี้ยนเกิน 10ms ตามที่กฎหมาย
+  #       กำหนด (หรืออ่านค่าไม่ได้เลย) -- เพิ่ม log แจ้งเตือนแยกต่างหากเมื่อเกินเกณฑ์
+  write_file "${OPT_DIR}/check_time.sh" 0755 <<'TIMECHK'
+#!/usr/bin/env bash
+# บันทึกความคลาดเคลื่อนของนาฬิกาเป็นหลักฐานตาม พ.ร.บ.คอมพิวเตอร์ ม.26 (ต้อง < 10 ms)
+set -uo pipefail
+LOG_DIR="${LOG_DIR:-/var/log/cafe-wifi}"
+LOG="${LOG_DIR}/time-accuracy.log"
+ALERT_LOG="${LOG_DIR}/time-accuracy-alerts.log"
+
+# ไม่ใส่ -e ตรงนี้โดยตั้งใจ: chronyc ล้มได้ (เช่น chronyd ยังไม่พร้อมตอนบูต) ต้องให้สคริปต์
+# รันต่อจนถึง printf เพื่อบันทึก "unknown" ไว้เป็นหลักฐานว่าตรวจไม่ได้ ไม่ใช่เงียบหายไปเฉย ๆ
+off="$(chronyc tracking 2>/dev/null | awk -F': *' '/System time/{print $2}')"
+off="${off:-unknown}"
+printf '%s  %s\n' "$(date -Iseconds)" "$off" >> "$LOG"
+
+if [[ "$off" == "unknown" ]]; then
+  printf '%s  WARN: อ่านค่า chronyc ไม่ได้ -- ตรวจว่า chronyd ทำงานอยู่ (chronyc tracking)\n' \
+    "$(date -Iseconds)" >> "$ALERT_LOG"
+else
+  # off มีรูปแบบ "0.000123456 seconds slow of NTP time" (chronyc ไม่ใส่เครื่องหมาย +/-
+  # เอง ใช้คำว่า slow/fast แทน) เอาแค่ตัวเลขวินาทีไปคูณ 1000 หาหน่วย ms
+  secs="${off%% *}"
+  ms="$(awk -v s="$secs" 'BEGIN{printf "%.3f", (s+0)*1000}' 2>/dev/null || echo "")"
+  if [[ -n "$ms" ]] && awk -v m="$ms" 'BEGIN{exit !(m>10)}'; then
+    printf '%s  WARN: นาฬิกาคลาดเคลื่อน %s ms (เกิน 10ms ตามที่กฎหมายกำหนด)\n' \
+      "$(date -Iseconds)" "$ms" >> "$ALERT_LOG"
+  fi
+fi
+TIMECHK
+
+  # แก้บั๊ก (พบตอนตรวจทานรอบ 4): cafe-maintenance.service ไม่มี User= (รันเป็น root) แต่
+  # logrotate ตั้ง `create 0640 ${APP_USER} ${APP_USER}` ไว้สำหรับไฟล์ที่หมุนใหม่ -- ถ้าไม่
+  # สร้างไฟล์นี้ไว้ล่วงหน้าด้วย owner ที่ถูกต้องตั้งแต่แรก ไฟล์แรกสุด (ก่อน logrotate รอบแรก)
+  # จะเป็น root:root mode ตาม umask ปกติ ไม่ตรงกับไฟล์ที่หมุนแล้วซึ่งเป็น cafewifi:cafewifi
+  # -- touch+chown ไว้ล่วงหน้าเหมือนที่ทำกับ dnsmasq.log ให้ owner สม่ำเสมอตั้งแต่ไฟล์แรก
+  run_sh "touch '${LOG_DIR}/time-accuracy.log' '${LOG_DIR}/time-accuracy-alerts.log'"
+  run_sh "chown '${APP_USER}:${APP_USER}' '${LOG_DIR}/time-accuracy.log' '${LOG_DIR}/time-accuracy-alerts.log'"
+  run_sh "chmod 0640 '${LOG_DIR}/time-accuracy.log' '${LOG_DIR}/time-accuracy-alerts.log'"
+  ok "chrony พร้อม — ตรวจด้วย: chronyc tracking"
+}
+
+# cidr_to_network <ip/prefix>  ->  พิมพ์ "network/prefix" เช่น 10.10.0.1/24 -> 10.10.0.0/24
+# ใช้คำนวณ subnet ของ nftables โดยไม่ต้องพึ่ง ipcalc (ไม่มีติดมากับทุก distro)
+cidr_to_network() {
+  local cidr="$1" ip prefix a b c d mask ip_int net_int
+  ip="${cidr%%/*}"; prefix="${cidr##*/}"
+  IFS='.' read -r a b c d <<< "$ip"
+  ip_int=$(( (a<<24) + (b<<16) + (c<<8) + d ))
+  if (( prefix == 0 )); then mask=0; else mask=$(( (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF )); fi
+  net_int=$(( ip_int & mask ))
+  printf '%d.%d.%d.%d/%d' $(( (net_int>>24)&255 )) $(( (net_int>>16)&255 )) $(( (net_int>>8)&255 )) $(( net_int&255 )) "$prefix"
+}
+
+configure_network() {
+  if (( SKIP_NETWORK )); then info "ข้ามการตั้งค่าเครือข่าย (--skip-network)"; return 0; fi
+  step "ตั้งค่าเครือข่าย (โหมดสาย LAN เส้นเดียว -- routing / NAT / DHCP / DNS บนอินเทอร์เฟซเดียว)"
+  local client_ip="${CLIENT_CIDR%%/*}"
+  local client_net upl_ip upl_net
+  client_net="$(cidr_to_network "$CLIENT_CIDR")"
+  upl_ip="${UPLINK_CIDR%%/*}"
+  upl_net="$(cidr_to_network "$UPLINK_CIDR")"
+
+  write_file "/etc/sysctl.d/99-${APP_NAME}.conf" 0644 <<'SYSCTL'
+net.ipv4.ip_forward = 1
+net.ipv4.conf.all.rp_filter = 0
+net.ipv4.conf.all.arp_ignore = 1
+net.ipv4.conf.all.arp_announce = 2
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+SYSCTL
+  # หมายเหตุ rp_filter=0: โหมดสายเดียวมี 2 IP บนอินเทอร์เฟซเดียว ทำให้ reverse-path
+  # ของแพ็กเก็ตขาเข้า/ขาออกไม่สมมาตรได้ตามธรรมชาติ (asymmetric routing) -- ตั้งเป็น strict
+  # (ค่า 1 เดิม) จะทำให้ Linux drop แพ็กเก็ตที่ถูกต้องทิ้งอย่างงงงวย ความปลอดภัยส่วนนี้เรา
+  # คุมด้วย nftables (ip saddr/daddr ตาม subnet) แทนอยู่แล้ว ไม่ได้พึ่ง rp_filter
+  run sysctl -q --system
+
+  # ---------- IP บนอินเทอร์เฟซเดียว: uplink (ต่อเราเตอร์) เป็น primary, client เป็น secondary
+  # ***ห้ามใช้ `ip addr replace` กับ uplink เด็ดขาด — ถ้าผู้ติดตั้งกำลัง SSH ผ่าน IP นี้อยู่
+  # จะทำให้หลุดการเชื่อมต่อทันที (ดู PROJECT_PLAN.md §3.1.7)*** ใช้ `ip addr add` แบบ
+  # idempotent (เพิกเฉยถ้ามี IP นี้อยู่แล้ว) แทน
+  run_sh "ip addr add '${UPLINK_CIDR}' dev '${NIC}' 2>/dev/null || true"
+  run_sh "ip addr add '${CLIENT_CIDR}' dev '${NIC}' 2>/dev/null || true"
+  run_sh "ip link set '${NIC}' up 2>/dev/null || true"
+  run_sh "ip route replace default via '${UPLINK_GW}' dev '${NIC}' 2>/dev/null || true"
+
+  if command -v nmcli >/dev/null 2>&1; then
+    info "พบ NetworkManager — ตั้ง connection ถาวรให้ ${NIC} (2 IP บนอินเทอร์เฟซเดียว)"
+    run_sh "nmcli con delete '${APP_NAME}-nic' >/dev/null 2>&1 || true"
+    run_sh "nmcli con add type ethernet ifname '${NIC}' con-name '${APP_NAME}-nic' ipv4.method manual ipv4.addresses '${UPLINK_CIDR} ${CLIENT_CIDR}' ipv4.gateway '${UPLINK_GW}' ipv6.method disabled autoconnect yes >/dev/null 2>&1 || true"
+  elif [[ -d /etc/systemd/network ]]; then
+    write_file "/etc/systemd/network/20-${APP_NAME}-nic.network" 0644 <<NETD
+[Match]
+Name=${NIC}
+
+[Network]
+Address=${UPLINK_CIDR}
+Address=${CLIENT_CIDR}
+Gateway=${UPLINK_GW}
+IPForward=yes
+NETD
+  else
+    warn "ไม่พบ NetworkManager/systemd-networkd — IP จะหายเมื่อรีบูต ให้ตั้งถาวรเองตาม distro"
+  fi
+
+  # ---------- dnsmasq (ให้บริการ DHCP/DNS เฉพาะฝั่งลูกค้าเท่านั้น ผ่าน listen-address) ----------
+  write_file "/etc/dnsmasq.d/${APP_NAME}.conf" 0644 <<DNSMASQ
+# managed by ${APP_NAME} installer -- DHCP + DNS + query logging
+# โหมดสาย LAN เส้นเดียว: อินเทอร์เฟซเดียวกับ uplink แต่ผูก DHCP/DNS ไว้ที่ IP ฝั่งลูกค้าเท่านั้น
+interface=${NIC}
+bind-interfaces
+except-interface=lo
+listen-address=${client_ip}
+
+dhcp-range=${DHCP_START},${DHCP_END},255.255.255.0,${DHCP_LEASE}
+dhcp-option=option:router,${client_ip}
+dhcp-option=option:dns-server,${client_ip}
+dhcp-authoritative
+dhcp-leasefile=/var/lib/misc/${APP_NAME}.leases
+
+server=1.1.1.1
+server=8.8.8.8
+domain-needed
+bogus-priv
+no-resolv
+
+# แหล่งข้อมูลของ dns_log -- logger/dns_collector.py อ่านไฟล์นี้
+log-queries
+log-facility=${LOG_DIR}/dnsmasq.log
+log-async=25
+
+# ให้ลูกค้าพิมพ์ cafe.wifi เข้าหน้า portal เองได้เมื่อ captive detection ไม่เด้ง
+address=/cafe.wifi/${client_ip}
+DNSMASQ
+
+  run_sh "touch '${LOG_DIR}/dnsmasq.log'"
+  run_sh "chown dnsmasq:'${APP_USER}' '${LOG_DIR}/dnsmasq.log' 2>/dev/null || chown root:'${APP_USER}' '${LOG_DIR}/dnsmasq.log'"
+  run_sh "chmod 0640 '${LOG_DIR}/dnsmasq.log'"
+  svc enable dnsmasq
+  svc restart dnsmasq
+  ok "dnsmasq พร้อม (DHCP ${DHCP_START}-${DHCP_END}, ผูกเฉพาะ ${client_ip})"
+
+  # ---------- nftables (อิง subnet แทนชื่ออินเทอร์เฟซ เพราะมีอินเทอร์เฟซเดียว) ----------
+  write_file /etc/nftables.conf 0644 <<NFT
+#!/usr/sbin/nft -f
+# managed by ${APP_NAME} installer -- โหมดสาย LAN เส้นเดียว (D17): อินเทอร์เฟซเดียวกันทั้ง
+# ขาเข้าและขาออก จึงแยกทิศทางด้วย ip saddr/daddr ตาม subnet แทน iifname/oifname แบบเดิม
+# แก้ไขแล้วโหลดใหม่ด้วย:  nft -f /etc/nftables.conf
+flush ruleset
+
+define CLIENT_NET = ${client_net}
+define CLIENT_GW  = ${client_ip}
+define UPLINK_NET = ${upl_net}
+define UPLINK_GW  = ${UPLINK_GW}
+
+table inet filter {
+  chain input {
+    type filter hook input priority filter; policy drop;
+
+    ct state established,related accept
+    ct state invalid drop
+    iif lo accept
+
+    ip protocol icmp icmp type { echo-request, destination-unreachable, time-exceeded } limit rate 10/second accept
+
+    # จากฝั่งลูกค้า อนุญาตเฉพาะบริการที่จำเป็น
+    ip saddr \$CLIENT_NET udp dport { 53, 67 } accept
+    ip saddr \$CLIENT_NET tcp dport 53 accept
+    ip saddr \$CLIENT_NET tcp dport ${NDS_PORT} accept
+    ip saddr \$CLIENT_NET tcp dport ${FAS_PORT} accept
+    ip saddr \$CLIENT_NET tcp dport 80 accept
+
+    # T8: Admin Panel และ SSH ต้องเข้าจากฝั่งลูกค้าไม่ได้ (มาก่อนกฎ accept ทั่วไปด้านล่างเสมอ)
+    ip saddr \$CLIENT_NET tcp dport ${ADMIN_PORT} drop
+    ip saddr \$CLIENT_NET tcp dport 22 drop
+
+    # จากฝั่งเราเตอร์/อัพลิงก์ (คนละ source กับ CLIENT_NET) อนุญาต SSH + Admin ตามปกติ
+    tcp dport ${ADMIN_PORT} accept
+    tcp dport 22 accept
+  }
+
+  chain forward {
+    type filter hook forward priority filter; policy drop;
+
+    ct state established,related accept
+    ct state invalid drop
+
+    # D9: กันลูกค้าคุยกันเอง (ป้องกัน sniffing / ARP spoof ภายในวงเดียวกัน)
+    ip saddr \$CLIENT_NET ip daddr \$CLIENT_NET drop
+
+    # กันลูกค้าเข้าถึงเครือข่ายส่วนตัวฝั่งอัพลิงก์ของร้าน (ปลายทางอินเทอร์เน็ตสาธารณะไม่ติดกฎนี้)
+    ip saddr \$CLIENT_NET ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } drop
+
+    # ลูกค้าที่ผ่านการยืนยันแล้ว (openNDS อนุญาต MAC) ออกอินเทอร์เน็ตผ่าน uplink เส้นเดียวกันได้
+    ip saddr \$CLIENT_NET accept
+  }
+
+  chain output { type filter hook output priority filter; policy accept; }
+}
+
+table ip nat {
+  chain prerouting {
+    type nat hook prerouting priority dstnat; policy accept;
+    # บังคับทุก DNS query จากฝั่งลูกค้าให้วิ่งเข้า dnsmasq (กัน DNS bypass)
+    ip saddr \$CLIENT_NET udp dport 53 ip daddr != \$CLIENT_GW dnat to \$CLIENT_GW:53
+    ip saddr \$CLIENT_NET tcp dport 53 ip daddr != \$CLIENT_GW dnat to \$CLIENT_GW:53
+  }
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    # single-NIC: masquerade ตาม source subnet แทน oifname (ไม่มีอินเทอร์เฟซแยกให้ระบุ)
+    ip saddr \$CLIENT_NET masquerade
+  }
+}
+NFT
+
+  if ! run_sh "nft -c -f /etc/nftables.conf"; then
+    warn "nft -c ไม่ผ่าน — ไม่ได้โหลด rules ตรวจสอบ /etc/nftables.conf เอง"
+    return 0
+  fi
+
+  # ---------- dead-man switch (§3.1.6 ข้อ 10) ----------
+  # เปลี่ยนกฎ firewall บนอินเทอร์เฟซเดียวกับที่ผู้ติดตั้งอาจกำลัง SSH เข้ามาอยู่ = เสี่ยงล็อก
+  # ตัวเองออก (ดู PROJECT_PLAN.md §3.1.7) แม้ ct state established จะกันเซสชันปัจจุบันไว้ได้
+  # แต่ถ้าเซสชันหลุดแล้วเชื่อมต่อใหม่ไม่ได้จะเข้าเครื่องไม่ได้อีกเลย -- ตั้งเวลาล้างกฎอัตโนมัติ
+  # ไว้ก่อน ถ้าตรวจสอบแล้วว่ายัง SSH เข้าได้ปกติ ให้ยกเลิกด้วยคำสั่งที่พิมพ์ไว้ด้านล่าง
+  local dead_man="${APP_NAME}-nft-failsafe"
+  if [[ "$INIT_SYS" == systemd ]] && command -v systemd-run >/dev/null 2>&1; then
+    run_sh "systemctl reset-failed '${dead_man}.service' >/dev/null 2>&1 || true"
+    run_sh "systemd-run --unit='${dead_man}' --on-active=300 /usr/sbin/nft flush ruleset >/dev/null 2>&1 || true"
+    warn "ตั้ง dead-man switch ไว้แล้ว: ถ้าไม่ยกเลิก nftables จะถูกล้างอัตโนมัติใน 5 นาที"
+    warn "ตรวจสอบว่า SSH ยังเข้าได้ปกติก่อน แล้วยกเลิกด้วย: sudo systemctl stop ${dead_man}.timer 2>/dev/null; sudo systemctl reset-failed ${dead_man} 2>/dev/null"
+  else
+    warn "ไม่มี systemd-run ใช้ได้ — ข้ามการตั้ง dead-man switch อัตโนมัติ ตรวจ SSH เองให้ดีก่อนตัดการเชื่อมต่อ"
+  fi
+
+  run_sh "nft -f /etc/nftables.conf"
+  svc enable nftables
+  ok "nftables โหลดแล้ว (NAT + client isolation + DNS redirect, อิงตาม subnet)"
+  return 0
+}
+
+build_opennds() {
+  if (( SKIP_OPENNDS )) || (( SKIP_NETWORK )); then info "ข้าม openNDS"; return 0; fi
+  step "ติดตั้ง openNDS (captive portal engine)"
+
+  if command -v opennds >/dev/null 2>&1; then
+    info "พบ openNDS ติดตั้งอยู่แล้ว"
+  else
+    local src="/usr/local/src/opennds"
+    run_sh "rm -rf '${src}'"
+    # แก้บั๊ก M4: เดิม clone --depth 1 จาก default branch ตรง ๆ ทุกครั้ง ได้ commit ล่าสุด
+    # ของ upstream เสมอ ไม่ reproducible และเสี่ยง build พังกลางคันถ้า upstream เปลี่ยนโค้ด
+    # -- ปักเป็น tag ที่ระบุได้ผ่าน --opennds-ref (ตรวจ tag ล่าสุดจริงที่
+    # github.com/openNDS/openNDS/tags ก่อนใช้งานจริงบนเครื่อง เพราะรายชื่อ tag เปลี่ยนได้
+    # เรื่อย ๆ ตามการ release ของ upstream) ถ้า checkout tag ไม่สำเร็จ fallback ไป default
+    # branch แล้วเตือนชัดเจนแทนที่จะ pretend ว่า pin สำเร็จ
+    if run_sh "git clone --branch '${OPENNDS_REF}' --depth 1 https://github.com/openNDS/openNDS.git '${src}'"; then
+      ok "clone openNDS (${OPENNDS_REF}) สำเร็จ"
+    else
+      warn "clone openNDS tag '${OPENNDS_REF}' ไม่สำเร็จ (อาจไม่มี tag นี้จริงแล้ว — ตรวจที่ https://github.com/openNDS/openNDS/tags แล้วระบุใหม่ด้วย --opennds-ref) ใช้ default branch (ล่าสุด, ไม่ pin) แทน"
+      run_sh "rm -rf '${src}'"
+      if ! run_sh "git clone --depth 1 https://github.com/openNDS/openNDS.git '${src}'"; then
+        warn "clone openNDS ไม่สำเร็จ — ติดตั้งเองภายหลังแล้วรันซ้ำด้วย --skip-opennds"
+        return 0
+      fi
+    fi
+    if ! run_sh "make -C '${src}' -j\"\$(nproc)\" && make -C '${src}' install"; then
+      warn "build openNDS ไม่สำเร็จ (มักขาด libmicrohttpd-dev)"
+      warn "ติดตั้งเองแล้วรันซ้ำด้วย --skip-opennds"
+      return 0
+    fi
+    ok "build + ติดตั้ง openNDS สำเร็จ"
+  fi
+
+  local faskey="CHANGEME"
+  if [[ -f "${ETC_DIR}/secrets.env" ]] && (( ! DRY_RUN )); then
+    faskey="$(grep -E '^FAS_KEY=' "${ETC_DIR}/secrets.env" | cut -d= -f2-)"
+  fi
+
+  # โหมดสาย LAN เส้นเดียว (D17): eth0 เดียวมี 2 IP -- ต้องระบุ GatewayAddress ให้ชัด
+  # ไม่งั้น openNDS อาจหยิบ IP ผิดตัว (เอา uplink ip แทนที่จะเป็น client ip) เพราะมีมากกว่า
+  # 1 IP บนอินเทอร์เฟซเดียวกัน (§3.1.6 ข้อ 9) -- 🔶 ยังไม่เคยทดสอบกับ hardware จริงว่า
+  # openNDS ทำงานถูกต้องบนโหมดนี้หรือไม่ (R11 ความเสี่ยงอันดับ 1) ถ้าไม่ได้ ให้ลอง Plan B
+  # (macvlan ซ้อนบน ${NIC}) ตามที่บันทึกไว้ใน PROJECT_PLAN.md §3.1.6
+  local client_ip_nds="${CLIENT_CIDR%%/*}"
+  # mode 0640 root:root (แก้บั๊ก H1: เดิม 0644 = ทุกคนบนเครื่องอ่าน FaskeyOverride ได้ตรง ๆ
+  # ทั้งที่กุญแจตัวเดียวกันถูกป้องกันไว้อย่างดีที่ secrets.env อยู่แล้ว -- openNDS รันเป็น
+  # root เองอยู่แล้วจึงยังอ่านไฟล์นี้ได้ปกติ ไม่กระทบการทำงาน)
+  write_file /etc/opennds/opennds.conf 0640 <<NDS
+# managed by ${APP_NAME} installer
+GatewayInterface ${NIC}
+GatewayAddress ${client_ip_nds}
+GatewayName '${GATEWAY_NAME}'
+GatewayPort ${NDS_PORT}
+
+# Forwarding Authentication Service -> Flask app ของเรา
+FasPort ${FAS_PORT}
+FasPath /login
+FasSecureEnabled 2
+FaskeyOverride ${faskey}
+
+# แก้บั๊ก H3: เดิมตั้งตายตัวที่ 240 นาที (4 ชม.) แม้หน้า /issue ให้พนักงานเลือกอายุ
+# voucher ได้ 1-24 ชม. -- voucher 1 ชม. เคยใช้ได้จริงยาวกว่าที่จ่าย (4 ชม.) ส่วน voucher
+# 24 ชม. เคยถูกตัดสั้นกว่าที่จ่าย (แค่ 4 ชม.) ตั้งเป็น 1440 (=24 ชม., ค่าสูงสุดที่ /issue
+# อนุญาต) กัน "ตัดเร็วเกินไป" ไว้ก่อน แล้วให้ cafe-enforce.timer (tools/enforce_voucher_
+# expiry.py ทุก 5 นาที) เป็นตัวบังคับเวลาที่แท้จริงตาม valid_until ในฐานข้อมูลแทน
+SessionTimeout 1440
+PreAuthIdleTimeout 10
+AuthIdleTimeout 30
+CheckInterval 60
+
+# walled garden: ต้องเปิดให้ OS ตรวจเจอ captive portal
+WalledGarden captive.apple.com
+WalledGarden connectivitycheck.gstatic.com
+WalledGarden www.msftconnecttest.com
+WalledGarden detectportal.firefox.com
+WalledGarden nmcheck.gnome.org
+
+DebugLevel 1
+NDS
+  ok "เขียน /etc/opennds/opennds.conf"
+}
+
+install_services() {
+  step "ติดตั้ง service"
+  if [[ "$INIT_SYS" != systemd ]]; then
+    warn "ไม่ใช่ systemd — ข้ามการสร้าง unit (ต้องเขียน init script เอง)"
+    return 0
+  fi
+
+  # แก้บั๊ก (พบตอนตรวจทานรอบ 2): เดิม --workers 2 แต่ rate-limit (_attempts dict) และ
+  # SECRET_KEY fallback ใน admin/app.py กับ fas/app.py เป็น in-memory ต่อ "โปรเซส" -- gunicorn
+  # worker คือคนละโปรเซสกัน ไม่ได้แชร์หน่วยความจำ ทำให้ limit จริงกลายเป็น 2 เท่าของที่ตั้งไว้
+  # (เช่น 5 ครั้ง/10 นาที กลายเป็นได้ถึง 10 ครั้งถ้า request กระจายไปคนละ worker) และรีเซ็ต
+  # ทุกครั้งที่ worker ถูก respawn -- ใช้ --workers 1 --threads 4 แทน (thread ใน process
+  # เดียวกันแชร์หน่วยความจำได้ปกติ ยังรับ concurrent request ได้ปกติผ่าน thread ไม่ใช่ process)
+  # ตรงกับที่ comment ในโค้ดเขียนไว้แต่แรกว่า "พอสำหรับ 1 เครื่อง; ถ้าขยายหลาย worker ให้ย้ายไป DB"
+  #
+  # ข้อแลกเปลี่ยนที่ตั้งใจ (ชัดเจนไว้ก่อน พบตอนตรวจทานรอบ 4): --workers 1 แปลว่าไม่มี worker
+  # สำรอง -- ถ้า request หนึ่งค้าง (เช่น query ช้าผิดปกติ) worker เดียวนั้นจะไม่ตอบ request อื่น
+  # จนกว่า gunicorn arbiter จะตรวจพบว่าเกิน --timeout 60 วินาทีแล้ว "ฆ่า+เกิดใหม่" worker ให้เอง
+  # อัตโนมัติ (เป็นกลไกของ gunicorn เอง ไม่ต้องพึ่ง systemd Restart=on-failure) -- ผลคือระบบ
+  # หยุดตอบสนองได้นานสุด ~60 วินาทีระหว่างนั้น ก่อนจะกลับมาใช้งานได้เองโดยไม่ต้องมีใครเข้าไปแตะ
+  # ยอมรับข้อแลกเปลี่ยนนี้เพราะสเกลของระบบ (คาเฟ่ร้านเดียว) กับความถูกต้องของ rate-limit/
+  # SECRET_KEY สำคัญกว่า -- ถ้าจะขยายเป็นหลาย worker ในอนาคตจริง ๆ ต้องย้าย rate-limit ไป DB
+  # ก่อนเสมอ (ตามที่ comment เดิมบอกไว้)
+  local name desc mod port
+  for spec in "cafe-fas|Cafe WiFi Captive Portal (FAS)|fas.app|${FAS_BACKEND}" \
+              "cafe-admin|Cafe WiFi Admin Panel|admin.app|${ADMIN_BACKEND}"; do
+    IFS='|' read -r name desc mod port <<< "$spec"
+    write_file "/etc/systemd/system/${name}.service" 0644 <<UNIT
+[Unit]
+Description=${desc}
+After=network-online.target mariadb.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${APP_USER}
+Group=${APP_USER}
+WorkingDirectory=${OPT_DIR}
+EnvironmentFile=${ETC_DIR}/secrets.env
+Environment=PYTHONPATH=${OPT_DIR}
+ExecStart=${VENV_DIR}/bin/gunicorn --workers 1 --threads 4 --timeout 60 --bind 127.0.0.1:${port} --access-logfile ${LOG_DIR}/${name}-access.log --error-logfile ${LOG_DIR}/${name}-error.log ${mod}:app
+Restart=on-failure
+RestartSec=5
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=${LOG_DIR} ${ETC_DIR}
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  done
+
+  # แก้บั๊ก M3: เดิม User=root แบบไม่มี hardening directive เลยสักบรรทัด ทั้งที่ service
+  # ที่สิทธิ์น้อยกว่า (cafe-admin/cafe-fas) กลับได้ hardening ครบชุด -- รันเป็นผู้ใช้ธรรมดา
+  # แล้วให้เฉพาะ CAP_NET_ADMIN/CAP_NET_RAW ที่ conn_collector.py ต้องใช้เรียก `conntrack -E`
+  # ผ่าน AmbientCapabilities+CapabilityBoundingSet (จำกัดไม่ให้ได้สิทธิ์อื่นเกินสองตัวนี้)
+  # หมายเหตุ: RestrictAddressFamilies ต้องเปิด AF_NETLINK ด้วย (ไม่เหมือน cafe-admin/cafe-fas)
+  # เพราะ conntrack ใช้ netlink socket คุยกับเคอร์เนล -- ถ้าลืมเปิดจะรันไม่ได้เงียบ ๆ
+  write_file /etc/systemd/system/cafe-logger.service 0644 <<UNIT
+[Unit]
+Description=Cafe WiFi connection/DNS log collector
+After=network-online.target mariadb.service dnsmasq.service
+
+[Service]
+Type=simple
+User=${APP_USER}
+Group=${APP_USER}
+WorkingDirectory=${OPT_DIR}
+EnvironmentFile=${ETC_DIR}/secrets.env
+Environment=PYTHONPATH=${OPT_DIR}
+ExecStart=${VENV_DIR}/bin/python -m logger.run_all
+Restart=on-failure
+RestartSec=10
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+  # แก้บั๊ก C2/M5 (ผลข้างเคียง): เติม `-` นำหน้าทุกบรรทัด ExecStart -- เดิมถ้าคำสั่งไหนคำสั่ง
+  # หนึ่งพัง (exit code != 0) systemd oneshot จะหยุดทั้งหน่วยทันที ทำให้คำสั่งถัดไปในหน่วย
+  # เดียวกันไม่ถูกรันตามไปด้วยแบบเงียบ ๆ (นี่คือกลไกที่ทำให้บั๊ก C2 ลามไปกระทบ integrity/
+  # check_time ทั้งที่ไม่เกี่ยวกัน) `-` บอก systemd ให้ไม่สนใจ exit code ของบรรทัดนั้นแล้ว
+  # ไปรันบรรทัดถัดไปต่อเสมอ -- ความล้มเหลวแต่ละงานยังคงถูกบันทึกลง journal ให้ตรวจสอบได้
+  # แก้บั๊ก H4: เพิ่ม backup_db (สำรอง DB รายวัน หลัง purge เพื่อให้ backup มีขนาดเล็กลง)
+  write_file /etc/systemd/system/cafe-maintenance.service 0644 <<UNIT
+[Unit]
+Description=Cafe WiFi daily maintenance (retention purge + DB backup + log integrity + time check)
+
+[Service]
+Type=oneshot
+EnvironmentFile=${ETC_DIR}/secrets.env
+Environment=PYTHONPATH=${OPT_DIR}
+WorkingDirectory=${OPT_DIR}
+ExecStart=-${VENV_DIR}/bin/python -m tools.purge_old_data
+ExecStart=-${VENV_DIR}/bin/python -m tools.backup_db
+ExecStart=-${VENV_DIR}/bin/python -m logger.integrity
+ExecStart=-${OPT_DIR}/check_time.sh
+UNIT
+
+  write_file /etc/systemd/system/cafe-maintenance.timer 0644 <<'UNIT'
+[Unit]
+Description=Run cafe-wifi maintenance daily
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+  # แก้บั๊ก H3/M1: บังคับอายุ voucher จริง + ปิด session ค้าง -- ต้องรันถี่กว่างาน
+  # maintenance รายคืนมาก เพราะเป็นการบังคับสิทธิ์การเข้าถึงเครือข่าย ไม่ใช่แค่ housekeeping
+  # (ทุก 5 นาที คือ ความคลาดเคลื่อนสูงสุดที่ลูกค้าจะใช้เน็ตเกินเวลาที่จ่ายไว้ได้)
+  # แก้บั๊ก (พบตอนตรวจทานรอบ 2): เพิ่ง hardening cafe-logger ไปเอง (M3) แล้วสร้าง unit ใหม่
+  # ตัวนี้ทิ้งปัญหาเดียวกันไว้ -- ไม่มี User=/hardening สักบรรทัด รันเป็น root โดยปริยาย
+  # ไม่ต้องการ CAP_NET_ADMIN/CAP_NET_RAW (ไม่แตะ raw socket เอง แค่ shell ออกไปเรียก `ndsctl`
+  # ซึ่งคุยกับ openNDS ผ่าน unix socket ของมันเอง และต่อ DB ผ่าน TCP ธรรมดา) จึงรันเป็น
+  # ${APP_USER} พร้อม hardening ชุดเดียวกับ cafe-admin/cafe-fas ได้เลย
+  # 🔶 หมายเหตุยังไม่ยืนยันบนฮาร์ดแวร์จริง: ถ้า openNDS จำกัดสิทธิ์ unix socket ควบคุมไว้ที่
+  # root เท่านั้น (ยังไม่เคยตรวจสอบ) `ndsctl deauth` อาจ permission denied ใต้ ${APP_USER} --
+  # deauth_mac() ใน enforce_voucher_expiry.py ดักกรณีนี้ไว้แล้ว (log warning + คืน False
+  # ไม่ throw) ระบบจะยังปิด session ในฐานข้อมูลถูกต้อง เพียงแต่ไม่ตัดเน็ตที่ openNDS จริง --
+  # ถ้าเจอปัญหานี้บนเครื่องจริง ให้เปลี่ยนเป็น User=root เฉพาะ unit นี้
+  write_file /etc/systemd/system/cafe-enforce.service 0644 <<UNIT
+[Unit]
+Description=Cafe WiFi voucher expiry enforcement (deauth + close stale sessions)
+After=network-online.target mariadb.service
+
+[Service]
+Type=oneshot
+User=${APP_USER}
+Group=${APP_USER}
+EnvironmentFile=${ETC_DIR}/secrets.env
+Environment=PYTHONPATH=${OPT_DIR}
+WorkingDirectory=${OPT_DIR}
+ExecStart=${VENV_DIR}/bin/python -m tools.enforce_voucher_expiry
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+UNIT
+
+  write_file /etc/systemd/system/cafe-enforce.timer 0644 <<'UNIT'
+[Unit]
+Description=Run cafe-wifi voucher expiry enforcement every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+  run systemctl daemon-reload
+  ok "สร้าง systemd unit แล้ว"
+}
+
+configure_nginx() {
+  step "ตั้งค่า Nginx (reverse proxy + TLS)"
+  local lan_ip="${CLIENT_CIDR%%/*}" cert="${ETC_DIR}/tls"  # IP ฝั่งลูกค้า -- cert ครอบคลุม cafe.wifi ที่ลูกค้าเห็น
+  run install -d -m 0750 -o root -g "$APP_USER" "$cert"
+
+  if [[ ! -f "${cert}/server.crt" ]] && (( ! DRY_RUN )); then
+    openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
+      -keyout "${cert}/server.key" -out "${cert}/server.crt" \
+      -subj "/C=TH/O=Cafe WiFi Gateway/CN=cafe.wifi" \
+      -addext "subjectAltName=DNS:cafe.wifi,DNS:localhost,IP:${lan_ip}" >/dev/null 2>&1
+    chmod 0640 "${cert}/server.key"; chown root:"$APP_USER" "${cert}/server.key"
+    ok "สร้าง self-signed certificate (825 วัน)"
+  fi
+
+  local sites=/etc/nginx/conf.d
+  [[ -d /etc/nginx/sites-available ]] && sites=/etc/nginx/sites-available
+
+  write_file "${sites}/${APP_NAME}.conf" 0644 <<NGINX
+# ---- Captive Portal (ต้องเป็น HTTP ลูกค้าถึงจะเด้งได้) ----
+server {
+    listen ${FAS_PORT};
+    listen 80 default_server;
+    server_name cafe.wifi _;
+    access_log ${LOG_DIR}/portal-access.log;
+
+    location / {
+        proxy_pass http://127.0.0.1:${FAS_BACKEND};
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        # แก้บั๊ก C3: proxy_add_x_forwarded_for "ต่อท้าย" ค่าที่ไคลเอนต์ส่งมาเอง ทำให้ตัวแรก
+        # ใน header (ที่แอปเคยหยิบไปใช้) เป็นค่าที่ผู้โจมตีปลอมได้ตรง ๆ -- เขียนทับด้วย
+        # \$remote_addr แทน (เชื่อถือได้เสมอเพราะ nginx เป็นคนกำหนดเอง ไม่รับต่อจากไคลเอนต์)
+        proxy_set_header X-Forwarded-For \$remote_addr;
+    }
+}
+
+# ---- Admin Panel (HTTPS เท่านั้น) ----
+server {
+    listen ${ADMIN_PORT} ssl;
+    server_name cafe.wifi _;
+
+    ssl_certificate     ${ETC_DIR}/tls/server.crt;
+    ssl_certificate_key ${ETC_DIR}/tls/server.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    add_header X-Frame-Options DENY always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy no-referrer always;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    access_log ${LOG_DIR}/admin-access.log;
+    client_max_body_size 4m;
+
+    location / {
+        proxy_pass http://127.0.0.1:${ADMIN_BACKEND};
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$remote_addr;  # แก้บั๊ก C3 (ดูหมายเหตุด้านบน)
+        proxy_set_header X-Forwarded-Proto https;
+    }
+}
+NGINX
+
+  if [[ -d /etc/nginx/sites-enabled ]]; then
+    run_sh "rm -f /etc/nginx/sites-enabled/default"
+    run_sh "ln -sf '${sites}/${APP_NAME}.conf' /etc/nginx/sites-enabled/${APP_NAME}.conf"
+  fi
+
+  if run_sh "nginx -t >/dev/null 2>&1"; then
+    svc enable nginx
+    svc restart nginx
+    ok "Nginx พร้อม"
+  else
+    warn "nginx -t ไม่ผ่าน — ตรวจสอบ ${sites}/${APP_NAME}.conf"
+  fi
+  return 0
+}
+
+configure_logrotate() {
+  step "ตั้งค่า log rotation (เก็บ ${LOG_RETENTION_DAYS} วัน)"
+  write_file "/etc/logrotate.d/${APP_NAME}" 0644 <<ROT
+# managed by ${APP_NAME} installer
+${LOG_DIR}/*.log {
+    daily
+    rotate ${LOG_RETENTION_DAYS}
+    missingok
+    notifempty
+    compress
+    delaycompress
+    dateext
+    dateformat -%Y-%m-%d
+    create 0640 ${APP_USER} ${APP_USER}
+    olddir ${LOG_DIR}/archive
+    sharedscripts
+    postrotate
+        systemctl reload nginx    >/dev/null 2>&1 || true
+        systemctl restart dnsmasq >/dev/null 2>&1 || true
+    endscript
+    # หมายเหตุ (แก้บั๊ก M5): เดิมเรียก logger.integrity ตรงนี้ด้วย แต่ไม่มี PYTHONPATH/
+    # EnvironmentFile ให้เลย (logrotate รันเอง ไม่ผ่าน systemd unit) ทำให้ import โมดูล
+    # หรือต่อ DB ไม่ได้เสมอ แล้วก็ถูก `|| true` กลบ error ไว้เงียบ ๆ -- cafe-maintenance.timer
+    # (03:30 ทุกคืน) เรียก logger.integrity พร้อม env ที่ครบอยู่แล้ว ไม่ต้องเรียกซ้ำที่นี่
+}
+ROT
+  ok "logrotate พร้อม (archive ที่ ${LOG_DIR}/archive)"
+}
+
+start_services() {
+  step "เปิดใช้งาน service"
+  if [[ "$INIT_SYS" != systemd ]]; then warn "ข้าม"; return 0; fi
+  local s
+  for s in cafe-fas cafe-admin cafe-maintenance.timer cafe-enforce.timer; do
+    run systemctl enable --now "$s" 2>/dev/null || warn "เปิด ${s} ไม่สำเร็จ — ตรวจด้วย: systemctl status ${s}"
+  done
+  if (( ! SKIP_NETWORK )); then
+    run systemctl enable --now cafe-logger 2>/dev/null || warn "เปิด cafe-logger ไม่สำเร็จ"
+    run systemctl enable --now opennds     2>/dev/null || warn "openNDS ยังไม่มี unit — เริ่มเองด้วยคำสั่ง: opennds"
+  fi
+  ok "เปิด service เรียบร้อย"
+}
+
+write_state() {
+  if (( DRY_RUN )); then return 0; fi
+  write_file "$STATE_FILE" 0640 "root:${APP_USER}" <<STATE
+INSTALLED_AT=$(date -Iseconds)
+INSTALLER_VERSION=${APP_VERSION}
+DISTRO=${DISTRO_NAME}
+PKG=${PKG}
+INIT=${INIT_SYS}
+NIC=${NIC}
+UPLINK_CIDR=${UPLINK_CIDR}
+UPLINK_GW=${UPLINK_GW}
+CLIENT_CIDR=${CLIENT_CIDR}
+ADMIN_PORT=${ADMIN_PORT}
+FAS_PORT=${FAS_PORT}
+DB_NAME=${DB_NAME}
+ENABLE_PARTITIONS=${ENABLE_PARTITIONS}
+STATE
+}
+
+# ============================================================================
+#  6. สรุปหลังติดตั้ง + first-run setup
+# ============================================================================
+final_summary() {
+  # แก้บั๊ก (เดิมชี้ไป CLIENT_CIDR/IP ฝั่งลูกค้า): nftables ปิดไม่ให้วง CLIENT_NET เข้า
+  # ADMIN_PORT ไว้เอง (T8) พนักงานต้องเข้าจากฝั่งอัพลิงก์/เราเตอร์เท่านั้น ดู PROJECT_PLAN.md §15
+  local lan_ip="${UPLINK_CIDR%%/*}" token="<ดูที่ ${ETC_DIR}/setup.token>"  # หน้า /setup เข้าจาก IP ฝั่งอัพลิงก์เท่านั้น
+  if [[ -f "${ETC_DIR}/setup.token" ]] && (( ! DRY_RUN )); then
+    token="$(cat "${ETC_DIR}/setup.token")"
+  fi
+
+  printf '\n%s============================================================%s\n' "$C_GRN" "$C_RST"
+  printf '%s  ติดตั้งเสร็จสมบูรณ์  --  %s v%s%s\n'  "$C_GRN" "$APP_NAME" "$APP_VERSION" "$C_RST"
+  printf '%s============================================================%s\n\n' "$C_GRN" "$C_RST"
+
+  printf '  %sขั้นตอนถัดไป: สร้างบัญชีผู้ดูแลระบบหลัก%s\n\n' "$C_YEL" "$C_RST"
+  printf '    1) เปิดเบราว์เซอร์จากเครื่องพนักงาน ไปที่\n\n'
+  printf '         %shttps://%s:%s/setup%s\n\n' "$C_BLU" "$lan_ip" "$ADMIN_PORT" "$C_RST"
+  printf '       (เป็น self-signed cert เบราว์เซอร์จะเตือน — กด Advanced > Proceed)\n\n'
+  printf '    2) กรอก Setup Token นี้\n\n'
+  printf '         %s%s%s\n\n' "$C_BLU" "$token" "$C_RST"
+  printf '    3) ตั้ง username / รหัสผ่านของผู้ดูแลระบบหลัก\n\n'
+  printf '  %sหน้า /setup จะปิดตัวเองถาวรทันทีที่สร้างบัญชีแรกสำเร็จ%s\n' "$C_DIM" "$C_RST"
+  printf '  %sและไฟล์ %s/setup.token จะถูกลบอัตโนมัติ%s\n\n' "$C_DIM" "$ETC_DIR" "$C_RST"
+
+  printf '  ------------------------------------------------------------\n'
+  printf '  ไฟล์สำคัญ\n'
+  printf '    โปรแกรม         : %s\n' "$OPT_DIR"
+  printf '    กุญแจเข้ารหัส    : %s/secrets.env  %s<-- สำรองไว้! ถ้าหายถอดรหัสข้อมูลเดิมไม่ได้%s\n' "$ETC_DIR" "$C_RED" "$C_RST"
+  printf '    Log             : %s\n' "$LOG_DIR"
+  printf '    ฐานข้อมูล        : %s (localhost)\n\n' "$DB_NAME"
+  printf '  คำสั่งที่ใช้บ่อย\n'
+  printf '    systemctl status cafe-admin cafe-fas cafe-logger cafe-enforce.timer\n'
+  printf '    journalctl -u cafe-admin -f\n'
+  printf '    chronyc tracking            # ความคลาดเคลื่อนนาฬิกา ต้อง < 10 ms\n'
+  printf '    nft list ruleset            # ดู firewall\n'
+  printf '    sudo %s --uninstall\n' "$0"
+  printf '  ------------------------------------------------------------\n\n'
+}
+
+# ============================================================================
+#  7. Uninstall
+# ============================================================================
+uninstall() {
+  step "ถอนการติดตั้ง ${APP_NAME}"
+  warn "จะหยุด service และลบไฟล์โปรแกรม"
+  warn "ฐานข้อมูล '${DB_NAME}' และ log จะไม่ถูกลบ (ต้องลบเองถ้าต้องการ)"
+  confirm "ยืนยันถอนการติดตั้ง" || die "ยกเลิก"
+
+  local s
+  for s in cafe-fas cafe-admin cafe-logger cafe-maintenance.timer cafe-maintenance \
+          cafe-enforce.timer cafe-enforce opennds; do
+    svc disable "$s"
+    run_sh "rm -f /etc/systemd/system/${s}.service /etc/systemd/system/${s}.timer"
+  done
+  run_sh "systemctl daemon-reload 2>/dev/null || true"
+  run_sh "rm -f /etc/dnsmasq.d/${APP_NAME}.conf"
+  run_sh "rm -f /etc/nginx/conf.d/${APP_NAME}.conf /etc/nginx/sites-available/${APP_NAME}.conf /etc/nginx/sites-enabled/${APP_NAME}.conf"
+  run_sh "rm -f /etc/logrotate.d/${APP_NAME} /etc/sysctl.d/99-${APP_NAME}.conf"
+  run_sh "rm -rf '${OPT_DIR}'"
+  run_sh "systemctl restart dnsmasq 2>/dev/null || true"
+  run_sh "systemctl reload nginx 2>/dev/null || true"
+  ok "ถอนการติดตั้งเสร็จ"
+
+  printf '\n  สิ่งที่ %sยังเหลืออยู่%s (ลบเองถ้าต้องการ)\n' "$C_YEL" "$C_RST"
+  printf '    %-24s กุญแจเข้ารหัส %sห้ามลบถ้ายังต้องถอดรหัสข้อมูลเดิม%s\n' "$ETC_DIR" "$C_RED" "$C_RST"
+  printf '    %-24s log ตามกฎหมาย (ต้องเก็บ >= 90 วัน)\n' "$LOG_DIR"
+  printf '    %-24s backup DB %sมี natid_enc เข้ารหัสอยู่ ต้องมี secrets.env คู่กันถึงถอดได้%s\n' "$BACKUP_DIR" "$C_RED" "$C_RST"
+  printf '    %-24s ลบด้วย: mysql -e "DROP DATABASE %s;"\n' "database ${DB_NAME}" "$DB_NAME"
+  printf '    %-24s ลบด้วย: userdel %s\n' "user ${APP_USER}" "$APP_USER"
+  printf '    %-24s firewall rules\n\n' "/etc/nftables.conf"
+}
+
+# ============================================================================
+#  main
+# ============================================================================
+main() {
+  parse_args "$@"
+
+  printf '\n%s  Cafe Wi-Fi Gateway & Management System%s\n'   "$C_GRN" "$C_RST"
+  printf '%s  Universal Linux Installer v%s%s\n\n'            "$C_DIM" "$APP_VERSION" "$C_RST"
+  if (( DRY_RUN )); then warn "โหมด DRY-RUN: แสดงคำสั่งอย่างเดียว ไม่แก้ไขระบบจริง"; fi
+
+  require_root
+  detect_distro
+  detect_init
+
+  if (( DO_UNINSTALL )); then uninstall; exit 0; fi
+
+  if (( ! DRY_RUN )); then
+    install -d -m 0750 "$LOG_DIR"
+    exec > >(tee -a "${LOG_DIR}/install.log") 2>&1
+  fi
+
+  if (( INTERACTIVE )); then wizard; fi
+
+  # แก้บั๊ก (พบตอนตรวจทานรอบ 4): เช็คนี้เคยอยู่ข้างใน wizard() เท่านั้น -- `sudo ./install.sh
+  # -y --retention-days 30` (ไม่ผ่าน wizard เลยเพราะ INTERACTIVE=0) จึงติดตั้งผ่านไปเงียบ ๆ
+  # โดยไม่เตือนเรื่องขั้นต่ำ 90 วันตามกฎหมายเลยสักครั้ง แล้ว purge_old_data.py/partition
+  # maintenance จะปฏิเสธทำงานทุกคืนแบบเงียบ ๆ ต่อไป (ExecStart มี `-` นำหน้าอยู่แล้ว) --
+  # ย้ายมาไว้นอก wizard() ให้ทำงานเสมอไม่ว่าจะผ่าน wizard หรือไม่ก็ตาม
+  # (confirm() คืนค่า true ทันทีถ้า ASSUME_YES แต่ warn บรรทัดก่อนหน้ายังพิมพ์ให้เห็นเสมอ
+  # ไม่ได้ถูกกลืนไปเงียบ ๆ เหมือนเดิม)
+  if (( LOG_RETENTION_DAYS < 90 )); then
+    warn "พ.ร.บ.คอมพิวเตอร์ ม.26 กำหนดให้เก็บข้อมูลจราจรไม่น้อยกว่า 90 วัน"
+    confirm "ยืนยันใช้ ${LOG_RETENTION_DAYS} วันจริงหรือไม่" || die "ยกเลิก"
+  fi
+
+  preflight
+
+  create_user_and_dirs
+  install_packages
+  gen_secrets
+  setup_python
+  install_app_files
+  setup_database
+  configure_time
+  configure_network
+  build_opennds
+  install_services
+  configure_nginx
+  configure_logrotate
+  start_services
+  write_state
+  final_summary
+}
+
+main "$@"

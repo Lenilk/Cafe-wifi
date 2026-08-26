@@ -1,0 +1,153 @@
+"""
+tools/backup_db.py — สำรองฐานข้อมูลรายวัน (แก้บั๊ก H4)
+
+บั๊กเดิม: งาน maintenance รายคืน (cafe-maintenance.service) มีแค่ purge + integrity +
+check_time -- ไม่มี backup DB เลยสักจุดในระบบ ทั้งที่ระบบตั้งใจให้รันบน SD card ตาม D14
+(ซึ่งเสียเป็นเรื่องปกติ ไม่ใช่เรื่องบังเอิญ) SD พังโดยไม่มี backup = log ตาม ม.26 หายทั้งหมด
+กู้คืนไม่ได้เลย = ผิดหน้าที่ตามกฎหมายทันที
+
+รันทุกวันผ่าน cafe-maintenance.timer (ตั้งโดย install.sh) ต่อจาก purge_old_data
+
+ขอบเขตที่ทำจริง (ต้องซื่อสัตย์): dump ไปเก็บไว้ *ในเครื่องเดียวกัน* ที่ BACKUP_DIR (mode 0600
+root-only เพราะเนื้อหาในนั้นมี natid_enc ที่เข้ารหัสอยู่ -- backup เองไม่ได้ทำให้ปลอดภัยกว่า
+secrets.env เดิม เพราะยังต้องมี DEK ใน secrets.env คู่กันถึงจะถอดรหัสได้) การก็อปปี้ backup
+ออกไปเก็บนอกเครื่อง (offsite) จริง ๆ (เช่น rclone/scp ไปเครื่องอื่น) *ยังไม่ได้ทำในสคริปต์นี้*
+เพราะต้องรู้ปลายทางที่เจ้าของระบบเลือก -- ทำ backup ในเครื่องให้ก่อนเป็นด่านแรก แล้วเจ้าของ
+ระบบต้องตั้ง cron/rclone ส่งไฟล์ในโฟลเดอร์นี้ออกนอกเครื่องเองอีกชั้นหนึ่ง
+
+บั๊กที่เกือบเกิดจริง (พบตอนตรวจทานรอบ 4): เดิม dump_cmd มี --routines --triggers ซึ่งต้องใช้
+สิทธิ์อ่าน mysql.proc/TRIGGER ที่ DB_USER ไม่มีแล้วหลังแก้ GRANT ให้แคบลงเหลือแค่
+SELECT/INSERT/UPDATE/DELETE (แก้บั๊ก GRANT ALL รอบ 3) -- ถ้ารันจริงอาจ error หรือ warning
+กลางทาง เอาสองแฟลกนี้ออกแล้วตั้งใจแยก "schema เป็นโค้ด" ออกจาก "data เป็น backup" แทน:
+โครงสร้าง (ตาราง/procedure/event ใน sql/001_schema.sql และ sql/003_partitions.sql ถ้าเปิด
+--enable-partitions ไว้) มี DROP...IF EXISTS/CREATE...IF NOT EXISTS คุมไว้แล้ว รันซ้ำได้เสมอ
+ไม่ต้องพึ่ง mysqldump มาช่วยจับ -- ตอน restore ให้รัน `mysql db < sql/001_schema.sql` (และ
+`< sql/003_partitions.sql` ถ้าเคยเปิด partition ไว้) ก่อน แล้วค่อย restore ไฟล์ backup นี้ทับ
+ข้อมูล วิธีนี้ตรงไปตรงมากว่า และไม่ต้องเพิ่มสิทธิ์ DB_USER กลับไปเสี่ยงเหมือนเดิม
+"""
+from __future__ import annotations
+
+import logging
+import os
+import shutil
+import subprocess
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from pathlib import Path
+
+log = logging.getLogger("cafe-wifi.backup")
+
+
+class BackupError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class BackupResult:
+    path: Path
+    size_bytes: int
+    pruned: int
+
+
+def dump_database(db_name: str, host: str, port: int, user: str, password: str,
+                  out_path: Path, mysqldump_bin: str = "mysqldump",
+                  gzip_bin: str = "gzip") -> Path:
+    """
+    รัน mysqldump --single-transaction (ไม่ lock ตาราง InnoDB ระหว่าง dump) ต่อสายผ่าน
+    pipe จริงเข้า `gzip` (คนละโปรเซส) เขียนผ่านไฟล์ .tmp ก่อนแล้วค่อย rename ให้เป็นชื่อจริง
+    ตอนจบ (atomic -- กัน backup ค้างไฟล์เขียนไม่ครบถ้า process ถูกฆ่ากลางคัน)
+
+    หมายเหตุ (กันบั๊กที่เกือบเกิด): ห้ามใช้ `subprocess.run(cmd, stdout=gzip.GzipFile(...))`
+    เพราะ subprocess เรียก .fileno() ของ stdout เพื่อส่งให้ child process เขียนตรง ๆ ที่
+    เคอร์เนล -- GzipFile.fileno() คืน fd ของไฟล์ดิบข้างใน "ไม่ผ่าน" การบีบอัดของ Python เลย
+    ผลคือ mysqldump จะเขียนข้อความดิบทับไฟล์ตรง ๆ (gzip header/trailer มาปะหัวท้ายเฉย ๆ)
+    ได้ไฟล์ .gz ที่เปิดไม่ได้จริง -- ต้องรัน gzip เป็นอีกโปรเซสหนึ่งต่อ pipe กันจริง ๆ แทน
+    """
+    if shutil.which(mysqldump_bin) is None:
+        raise BackupError(f"ไม่พบคำสั่ง '{mysqldump_bin}' — ตรวจว่าติดตั้ง mariadb-client แล้ว")
+    if shutil.which(gzip_bin) is None:
+        raise BackupError(f"ไม่พบคำสั่ง '{gzip_bin}'")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+
+    # ไม่ใส่ --routines/--triggers/--events ตั้งใจ -- ต้องการสิทธิ์ที่ DB_USER ไม่มีแล้ว
+    # (ดู docstring ด้านบน) โครงสร้าง schema/procedure/event อยู่ใน sql/*.sql (คุมด้วย
+    # DROP...IF EXISTS/CREATE...IF NOT EXISTS อยู่แล้ว) ให้รันไฟล์เหล่านั้นตอน restore แทน
+    dump_cmd = [mysqldump_bin, "--single-transaction", "--no-tablespaces",
+               "-h", host, "-P", str(port), "-u", user, db_name]
+    env = dict(os.environ, MYSQL_PWD=password)  # ไม่ใส่รหัสผ่านใน argv (โผล่ใน `ps` ได้)
+
+    dump_proc = gzip_proc = None
+    try:
+        with open(tmp_path, "wb") as out_file:
+            dump_proc = subprocess.Popen(dump_cmd, stdout=subprocess.PIPE,
+                                         stderr=subprocess.PIPE, env=env)
+            gzip_proc = subprocess.Popen([gzip_bin], stdin=dump_proc.stdout,
+                                         stdout=out_file, stderr=subprocess.PIPE)
+            dump_proc.stdout.close()  # ให้ SIGPIPE ทำงานถูกถ้า gzip ตายก่อน (idiom มาตรฐาน)
+            _, dump_err = dump_proc.communicate()
+            _, gzip_err = gzip_proc.communicate()
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+    if dump_proc.returncode != 0:
+        tmp_path.unlink(missing_ok=True)
+        raise BackupError(f"mysqldump exit code {dump_proc.returncode}: "
+                          f"{dump_err.decode(errors='replace')[:500]}")
+    if gzip_proc.returncode != 0:
+        tmp_path.unlink(missing_ok=True)
+        raise BackupError(f"gzip exit code {gzip_proc.returncode}: "
+                          f"{gzip_err.decode(errors='replace')[:500]}")
+
+    tmp_path.rename(out_path)
+    out_path.chmod(0o600)  # เนื้อหามี natid_enc -- จำกัดสิทธิ์เหมือน secrets.env
+    return out_path
+
+
+def prune_old_backups(backup_dir: Path, keep_days: int, pattern: str = "*.sql.gz") -> int:
+    """ลบ backup ที่เก่ากว่า keep_days วัน (นับจาก mtime) คืนจำนวนไฟล์ที่ลบ"""
+    cutoff = datetime.now() - timedelta(days=keep_days)
+    pruned = 0
+    for path in backup_dir.glob(pattern):
+        if datetime.fromtimestamp(path.stat().st_mtime) < cutoff:
+            path.unlink()
+            pruned += 1
+    return pruned
+
+
+def run(backup_dir: Path | None = None, keep_days: int | None = None) -> BackupResult:
+    backup_dir = backup_dir or Path(os.environ.get("BACKUP_DIR", "/var/backups/cafe-wifi"))
+    keep_days = keep_days or int(os.environ.get("BACKUP_RETENTION_DAYS", "14"))
+
+    db_name = os.environ.get("DB_NAME", "cafewifi")
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    out_path = backup_dir / f"{db_name}-{stamp}.sql.gz"
+
+    dump_database(
+        db_name=db_name,
+        host=os.environ.get("DB_HOST", "127.0.0.1"),
+        port=int(os.environ.get("DB_PORT", "3306")),
+        user=os.environ.get("DB_USER", "cafewifi"),
+        password=os.environ.get("DB_PASS", ""),
+        out_path=out_path,
+    )
+    size = out_path.stat().st_size
+    pruned = prune_old_backups(backup_dir, keep_days)
+    log.info("สำรอง DB สำเร็จ: %s (%d bytes) — ลบ backup เก่า %d ไฟล์", out_path, size, pruned)
+    return BackupResult(path=out_path, size_bytes=size, pruned=pruned)
+
+
+def main() -> int:  # pragma: no cover
+    logging.basicConfig(level=logging.INFO)
+    try:
+        run()
+    except BackupError as exc:
+        log.error(str(exc))
+        return 1
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

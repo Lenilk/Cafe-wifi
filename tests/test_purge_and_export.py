@@ -1,0 +1,200 @@
+"""T-Purge/Export — tools/purge_old_data.py และ tools/export_evidence.py"""
+import contextlib
+import hashlib
+import json
+from datetime import datetime, timedelta
+
+import pytest
+
+from tools import export_evidence, purge_old_data
+
+
+# ---------------------------------------------------------------- purge: ตรรกะวันที่ล้วน ๆ
+def test_log_cutoff_rejects_below_legal_minimum():
+    with pytest.raises(ValueError, match="90"):
+        purge_old_data.compute_log_cutoff(89)
+
+
+def test_log_cutoff_accepts_legal_minimum():
+    now = datetime(2026, 8, 22)
+    cutoff = purge_old_data.compute_log_cutoff(90, now=now)
+    assert cutoff == now - timedelta(days=90)
+
+
+def test_log_cutoff_default_180_days():
+    now = datetime(2026, 8, 22)
+    assert purge_old_data.compute_log_cutoff(180, now=now) == now - timedelta(days=180)
+
+
+def test_customer_cutoff_is_plain_subtraction():
+    now = datetime(2026, 8, 22)
+    assert purge_old_data.compute_customer_cutoff(180, now=now) == now - timedelta(days=180)
+
+
+# ---------------------------------------------------------------- purge: DB จำลอง (fake executor)
+def test_purge_conn_and_dns_logs_calls_correct_sql():
+    calls = []
+
+    def fake_exec(sql, args=()):
+        calls.append((" ".join(sql.split()), args))
+        return 42
+
+    cutoff = datetime(2026, 1, 1)
+    n_conn, n_dns = purge_old_data.purge_conn_and_dns_logs(fake_exec, cutoff)
+    assert n_conn == 42 and n_dns == 42
+    assert calls[0] == ("DELETE FROM conn_log WHERE ts < %s", (cutoff,))
+    assert calls[1] == ("DELETE FROM dns_log WHERE ts < %s", (cutoff,))
+
+
+def test_purge_stale_customers_anonymizes_only_those_without_active_voucher():
+    """
+    บั๊กเดิม (C2): เคยเป็น DELETE FROM customer ตรง ๆ ซึ่งชน fk_voucher_customer
+    แตกจริงบนเครื่อง (ลูกค้าทุกรายมี voucher เสมอ) -- ตอนนี้เปลี่ยนเป็น UPDATE
+    เพื่อล้าง PII แต่ยังคงแถวไว้รักษาสาย FK
+    """
+    stale_rows = [{"id": 7}, {"id": 9}]
+    anonymized = []
+
+    def fake_query_all(sql, args=()):
+        return stale_rows
+
+    def fake_exec(sql, args=()):
+        assert sql.strip().upper().startswith("UPDATE CUSTOMER"), \
+            "ต้อง UPDATE (anonymize) ไม่ใช่ DELETE -- DELETE จะชน FK ของ voucher"
+        anonymized.append(args[0])
+        return 1
+
+    n = purge_old_data.purge_stale_customers(fake_query_all, fake_exec, datetime(2026, 1, 1))
+    assert n == 2
+    assert anonymized == [7, 9]
+
+
+def test_purge_stale_customers_none_found():
+    n = purge_old_data.purge_stale_customers(lambda *a: [], lambda *a: 0, datetime.now())
+    assert n == 0
+
+
+# ---------------------------------------------------------------- purge: end-to-end ผ่าน run()
+class _FakeCursor:
+    def __init__(self, anonymized_log, stale_customers):
+        self._anonymized_log = anonymized_log
+        self._stale = stale_customers
+        self.rowcount = 0
+        self._select_result = []
+
+    def execute(self, sql, args=()):
+        s = " ".join(sql.split()).lower()
+        if s.startswith("delete from conn_log"):
+            self.rowcount = 5
+        elif s.startswith("delete from dns_log"):
+            self.rowcount = 8
+        elif s.startswith("select c.id from customer"):
+            self._select_result = self._stale
+        elif s.startswith("update customer set natid_hash"):
+            self._anonymized_log.append(args[0])
+            self.rowcount = 1
+        elif s.startswith("insert into audit_log"):
+            self.rowcount = 1
+        else:
+            raise AssertionError(f"ไม่รู้จัก SQL: {s[:60]}")
+
+    def fetchall(self):
+        return self._select_result
+
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+
+
+def test_run_end_to_end_with_fake_db(monkeypatch):
+    anonymized_customers = []
+    stale = [{"id": 1}, {"id": 2}, {"id": 3}]
+
+    class FakeConn:
+        def cursor(self):
+            return _FakeCursor(anonymized_customers, stale)
+
+    import common.db as db
+    monkeypatch.setattr(db, "get_conn", lambda: contextlib.nullcontext(FakeConn()))
+    audit_calls = []
+    # audit.py เรียก db.execute(...) แบบ dynamic (ดูเหตุผลใน common/audit.py) จึง patch
+    # ที่ common.db.execute ตรง ๆ ไม่ใช่ผ่านชื่อที่เคย import เข้าไปใน common.audit
+    monkeypatch.setattr(db, "execute", lambda sql, args=(): audit_calls.append(args))
+
+    summary = purge_old_data.run(retention_days=180, customer_retention_days=180)
+    assert summary.conn_log_deleted == 5
+    assert summary.dns_log_deleted == 8
+    assert summary.customers_deleted == 3
+    assert anonymized_customers == [1, 2, 3]
+    assert len(audit_calls) == 1
+
+
+def test_run_refuses_below_legal_minimum(monkeypatch):
+    with pytest.raises(ValueError):
+        purge_old_data.run(retention_days=30)
+
+
+# ---------------------------------------------------------------- export_evidence
+SAMPLE_CONN = [
+    dict(ts="2026-08-01 10:00:00", mac="AA:BB:CC:DD:EE:01", src_ip="10.10.0.105",
+        src_port=51322, dst_ip="93.184.216.34", dst_port=443, proto="tcp",
+        bytes_out=1400, bytes_in=8200),
+]
+SAMPLE_DNS = [
+    dict(ts="2026-08-01 10:00:00", client_ip="10.10.0.105", mac="AA:BB:CC:DD:EE:01",
+        qname="example.com", qtype="A", answer="93.184.216.34"),
+]
+
+
+def test_rows_to_csv_text_has_header_and_row():
+    text = export_evidence.rows_to_csv_text(SAMPLE_CONN, export_evidence.CONN_FIELDS)
+    lines = text.strip().splitlines()
+    assert lines[0].split(",") == export_evidence.CONN_FIELDS
+    assert "AA:BB:CC:DD:EE:01" in lines[1]
+
+
+def test_rows_to_csv_text_ignores_extra_fields():
+    rows = [dict(SAMPLE_CONN[0], unexpected_field="should not appear")]
+    text = export_evidence.rows_to_csv_text(rows, export_evidence.CONN_FIELDS)
+    assert "unexpected_field" not in text
+    assert "should not appear" not in text
+
+
+def test_write_export_file_matches_sha256(tmp_path):
+    ef = export_evidence.write_export_file(SAMPLE_CONN, export_evidence.CONN_FIELDS,
+                                           tmp_path / "conn.csv")
+    on_disk = (tmp_path / "conn.csv").read_bytes()
+    assert ef.sha256 == hashlib.sha256(on_disk).hexdigest()
+    assert ef.row_count == 1
+
+
+def test_export_end_to_end_writes_csv_and_manifest(tmp_path):
+    audit_calls = []
+    import common.db as db_mod
+    orig = db_mod.execute
+    db_mod.execute = lambda sql, args=(): audit_calls.append(args)
+    try:
+        result = export_evidence.export(
+            mac="AA:BB:CC:DD:EE:01", start=datetime(2026, 8, 1), end=datetime(2026, 8, 22),
+            out_dir=tmp_path, query_conn_fn=lambda *a: SAMPLE_CONN,
+            query_dns_fn=lambda *a: SAMPLE_DNS, staff_id=1)
+    finally:
+        db_mod.execute = orig
+
+    assert result["conn_file"].path.exists()
+    assert result["dns_file"].path.exists()
+    # ต้องระบุ encoding="utf-8" ชัดเจน (ไฟล์เขียนด้วย utf-8 เสมอใน build_manifest แต่
+    # read_text() แบบไม่ระบุ encoding จะใช้ locale ของเครื่อง -- พังจริงถ้า locale ไม่ใช่ UTF-8
+    # เช่น cp1252 บน Windows หรือ C locale บน container Linux แบบ minimal)
+    manifest = json.loads(result["manifest_path"].read_text(encoding="utf-8"))
+    assert manifest["criteria"]["mac"] == "AA:BB:CC:DD:EE:01"
+    assert len(manifest["files"]) == 2
+    for f in manifest["files"]:
+        actual = hashlib.sha256((tmp_path / f["filename"]).read_bytes()).hexdigest()
+        assert actual == f["sha256"], f"sha256 ใน manifest ต้องตรงกับไฟล์จริงเสมอ ({f['filename']})"
+    assert len(audit_calls) == 1, "ต้องบันทึก audit_log ทุกครั้งที่ export"
+
+
+def test_export_rejects_invalid_date_range(tmp_path):
+    with pytest.raises(ValueError):
+        export_evidence.export(None, datetime(2026, 8, 22), datetime(2026, 8, 1), tmp_path,
+                               lambda *a: [], lambda *a: [])

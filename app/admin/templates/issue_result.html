@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}รหัสสำหรับลูกค้า{% endblock %}
+{% block body %}
+<div class="card" style="max-width:520px">
+  <h1>รหัสสำหรับลูกค้า</h1>
+  <div class="msg warn noprint">
+    <strong>รหัสผ่านนี้แสดงเพียงครั้งเดียว</strong> — ระบบเก็บไว้เป็น hash เท่านั้น
+    ถ้าปิดหน้านี้แล้วจะดูย้อนหลังไม่ได้ ต้องออกรหัสใหม่
+  </div>
+
+  <p class="hint">เชื่อมต่อ Wi-Fi ชื่อ <strong>{{ gateway_name }}</strong> แล้วกรอก</p>
+  <p class="hint" style="margin:0">ชื่อผู้ใช้</p>
+  <div class="cred">{{ code }}</div>
+  <p class="hint" style="margin:0">รหัสผ่าน</p>
+  <div class="cred">{{ password }}</div>
+
+  <table style="margin-top:1rem">
+    <tr><th>ลูกค้า</th><td class="mono">{{ masked }}</td></tr>
+    <tr><th>ใช้ได้ถึง</th><td>{{ valid_until.strftime('%d/%m/%Y %H:%M น.') }}</td></tr>
+    <tr><th>อุปกรณ์สูงสุด</th><td>{{ devices }} เครื่อง</td></tr>
+  </table>
+
+  <p class="noprint" style="margin-top:1.25rem">
+    <button onclick="window.print()">พิมพ์สลิป</button>
+    <a class="btn ghost" href="{{ url_for('issue') }}"
+       style="background:transparent;border:1px solid var(--line);color:var(--ink)">ออกรหัสให้คนถัดไป</a>
+  </p>
+</div>
+{% endblock %}
