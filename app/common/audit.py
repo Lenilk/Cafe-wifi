@@ -18,6 +18,7 @@ EXPORT_LOG = "export_log"
 LOGIN_OK = "login_ok"
 LOGIN_FAIL = "login_fail"
 SETUP_ADMIN = "setup_admin"
+DISK_ALERT = "disk_alert"  # N1 (CODING_BRIEF.md) -- ดิสก์เต็ม = log หยุดเขียน = ผิด ม.26
 
 
 def log(action: str, staff_id: int | None = None, target: str = "",

@@ -1153,9 +1153,11 @@ UNIT
   # check_time ทั้งที่ไม่เกี่ยวกัน) `-` บอก systemd ให้ไม่สนใจ exit code ของบรรทัดนั้นแล้ว
   # ไปรันบรรทัดถัดไปต่อเสมอ -- ความล้มเหลวแต่ละงานยังคงถูกบันทึกลง journal ให้ตรวจสอบได้
   # แก้บั๊ก H4: เพิ่ม backup_db (สำรอง DB รายวัน หลัง purge เพื่อให้ backup มีขนาดเล็กลง)
+  # N1 (CODING_BRIEF.md): เพิ่ม check_disk ต่อจาก backup_db -- แจ้งเตือนดิสก์ใกล้เต็มก่อนที่
+  # การเขียน log ตามกฎหมายจะหยุดทำงานเงียบ ๆ (ดู Risk Register R5 ใน PROJECT_PLAN.md)
   write_file /etc/systemd/system/cafe-maintenance.service 0644 <<UNIT
 [Unit]
-Description=Cafe WiFi daily maintenance (retention purge + DB backup + log integrity + time check)
+Description=Cafe WiFi daily maintenance (retention purge + DB backup + disk check + log integrity + time check)
 
 [Service]
 Type=oneshot
@@ -1164,6 +1166,7 @@ Environment=PYTHONPATH=${OPT_DIR}
 WorkingDirectory=${OPT_DIR}
 ExecStart=-${VENV_DIR}/bin/python -m tools.purge_old_data
 ExecStart=-${VENV_DIR}/bin/python -m tools.backup_db
+ExecStart=-${VENV_DIR}/bin/python -m tools.check_disk
 ExecStart=-${VENV_DIR}/bin/python -m logger.integrity
 ExecStart=-${OPT_DIR}/check_time.sh
 UNIT
