@@ -74,8 +74,14 @@ def purge_stale_customers(query_all_fn, execute_fn, cutoff: datetime) -> int:
     แก้เป็น "ล้างข้อมูลระบุตัวตน" (เคลียร์ natid_hash/natid_enc/natid_masked) แทนการลบ
     ทั้งแถว -- แถว customer ยังคงอยู่เพื่อรักษาสาย FK ที่ voucher/device/portal_session
     อ้างถึงอยู่ (ยังใช้เป็นหลักฐานจำนวนครั้ง/อุปกรณ์ตาม ม.26 ได้ แม้ตัวตนจะถูกลบไปแล้ว)
-    ตรงกับเจตนาจริงของ retention policy คือ "ลบ PII เมื่อพ้นกำหนด" ไม่ใช่ "ลบแถว"
+    ตรงกับเจตนาจริงของ retention policy คือ "ลบ PII เมื่อพ้นกำหนด" ไม่ใช่ "ลบแถว" -- ตรรกะ
+    การล้าง 1 คนใช้ร่วมกับ DSR (N6, CODING_BRIEF.md) ผ่าน common.customer.anonymize_customer()
+    เพื่อไม่ให้ 2 เส้นทางเขียนตรรกะเดียวกันซ้ำกันคนละที่ (ดู docstring ของฟังก์ชันนั้น)
     """
+    from common.customer import anonymize_customer
+
+    # หมายเหตุ: 'PURGED' ในเงื่อนไข WHERE ข้างล่างต้องตรงกับ natid_masked ที่
+    # anonymize_customer() เขียนจริง (common/customer.py) -- ถ้าจะเปลี่ยนค่านี้ต้องแก้ทั้งคู่พร้อมกัน
     stale = query_all_fn("""
         SELECT c.id FROM customer c
         WHERE c.last_seen < %s
@@ -87,10 +93,7 @@ def purge_stale_customers(query_all_fn, execute_fn, cutoff: datetime) -> int:
     """, (cutoff,))
     count = 0
     for row in stale:
-        execute_fn(
-            "UPDATE customer SET natid_hash = CONCAT('PURGED-', id), "
-            "natid_enc = '', natid_masked = 'PURGED' WHERE id = %s",
-            (row["id"],))
+        anonymize_customer(execute_fn, row["id"])
         count += 1
     return count
 

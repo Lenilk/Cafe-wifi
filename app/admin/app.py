@@ -20,6 +20,7 @@ from flask import (Flask, abort, flash, g, redirect, render_template,
                    request, session, url_for)
 
 from common import audit, crypto
+from common.customer import PURGED_MARK, anonymize_customer
 from common.db import execute, get_conn, query_all, query_one
 from logger.integrity import SqlManifestStore, verify_chain
 
@@ -399,6 +400,15 @@ def reveal(cid: int):
     row = query_one("SELECT natid_enc, natid_masked FROM customer WHERE id = %s", (cid,))
     if not row:
         abort(404)
+    # N6 (CODING_BRIEF.md): หลัง DSR erase natid_enc จะว่างเปล่า -- ถอดรหัสไม่ได้ (natid_decrypt
+    # จะ raise ValueError) ปฏิเสธชัดเจนแทนที่จะปล่อยให้หลุดไปเป็น 500 ทั่วไปที่อ่านไม่ออก
+    # (ไม่ใช้ abort() เพราะ 410 ไม่มี errorhandler ลงทะเบียนไว้ -- render_template ตรง ๆ
+    # แบบเดียวกับที่ setup() ทำตอน token ถูกใช้ไปแล้ว เพื่อให้หน้าตาสอดคล้องกันทั้งแอป)
+    if row["natid_masked"] == PURGED_MARK:
+        return render_template(
+            "error.html", title="ลบข้อมูลไปแล้ว",
+            message="ลูกค้ารายนี้ถูกลบข้อมูลระบุตัวตนไปแล้วตามคำขอ (DSR) — ไม่มีเลขบัตรให้เปิดเผยอีกต่อไป",
+        ), 410
 
     audit.log(audit.REVEAL_NATID, staff_id=session["staff_id"], target=f"customer:{cid}",
               client_ip=g.client_ip, detail=reason)
@@ -436,6 +446,36 @@ def toggle_block_customer(cid: int):
     audit.log("block_customer" if new_state else "unblock_customer",
               staff_id=session["staff_id"], target=f"customer:{cid}", client_ip=g.client_ip)
     flash("ระงับลูกค้ารายนี้แล้ว" if new_state else "ยกเลิกการระงับแล้ว", "success")
+    return redirect(url_for("customers"))
+
+
+# N6 (CODING_BRIEF.md): DSR -- §6.2 ข้อ 6 ของนโยบายความเป็นส่วนตัวประกาศสิทธิ์นี้ไว้แล้ว
+# แต่ก่อนหน้านี้มีแค่ /reveal กับ /block ลบรายคนตามคำขอไม่ได้เลย -- ใช้ตรรกะ anonymize
+# เดียวกับที่ tools/purge_old_data.py ใช้ล้างลูกค้าเก่าอัตโนมัติ (ผ่าน common/customer.py
+# ตัวเดียวกัน ไม่เขียนซ้ำ) ล้าง natid_hash/natid_enc/natid_masked แต่**คงแถวไว้เสมอ** --
+# ห้าม DELETE เพราะชน fk_voucher_customer (D20 ในแผน, บั๊กจริง C2 ที่เคยเจอมาก่อน)
+@app.post("/customers/<int:cid>/erase")
+@login_required
+@admin_required
+def erase_customer(cid: int):
+    reason = (request.form.get("reason") or "").strip()
+    if len(reason) < 10:
+        abort(400, "ต้องระบุเหตุผล/คำขอของเจ้าของข้อมูลอย่างน้อย 10 ตัวอักษร")
+
+    row = query_one("SELECT id, natid_masked FROM customer WHERE id = %s", (cid,))
+    if not row:
+        abort(404)
+    if row["natid_masked"] == PURGED_MARK:
+        flash("ลูกค้ารายนี้ถูกลบข้อมูลระบุตัวตนไปแล้ว", "warn")
+        return redirect(url_for("customers"))
+
+    n = anonymize_customer(execute, cid)
+    if not n:
+        abort(404)
+
+    audit.log(audit.ERASE_CUSTOMER, staff_id=session["staff_id"], target=f"customer:{cid}",
+              client_ip=g.client_ip, detail=reason)
+    flash("ลบข้อมูลระบุตัวตนของลูกค้ารายนี้แล้วตามคำขอ", "success")
     return redirect(url_for("customers"))
 
 
