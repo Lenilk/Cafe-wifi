@@ -569,7 +569,11 @@ setup_python() {
   if [[ -f "$req" ]]; then
     run_sh "'${VENV_DIR}/bin/pip' install --quiet -r '${req}'"
   else
-    run_sh "'${VENV_DIR}/bin/pip' install --quiet Flask gunicorn PyMySQL cryptography argon2-cffi pyotp"
+    # แก้บั๊ก (N8, CODING_BRIEF.md): รายชื่อ fallback นี้เคยหลุดไม่ตรงกับ requirements.txt จริง
+    # มาก่อนแล้ว (ไม่มี qrcode ที่ N7 เพิ่งเพิ่ม) -- ถือโอกาสซิงค์ให้ตรงพร้อมกันตอนถอด pyotp
+    # ออก (2FA ตัดสินใจไม่ทำ ดู sql/006_drop_totp.sql) ไม่งั้นเครื่องที่ไม่มี requirements.txt
+    # (กรณีสำรองเท่านั้น ปกติมีเสมอ) จะติดตั้งแพ็กเกจไม่ครบ/เกินความจำเป็นแบบเงียบ ๆ
+    run_sh "'${VENV_DIR}/bin/pip' install --quiet Flask gunicorn PyMySQL cryptography argon2-cffi qrcode"
   fi
   ok "Python environment พร้อม (${VENV_DIR})"
 }
@@ -636,6 +640,18 @@ SQL
     ok "โหลด schema แล้ว"
   else
     warn "ไม่พบ sql/001_schema.sql — ต้องโหลด schema เอง"
+  fi
+
+  # N8 (CODING_BRIEF.md): ตัดสินใจถอด 2FA (TOTP) ออก เพราะ pyotp ค้างใน requirements.txt
+  # มาตั้งแต่แรกโดยไม่มีไฟล์ไหน import เลยสักบรรทัด (ดู R8 ใน §13 ที่บอกไว้แล้วว่าตัด Phase 5
+  # ได้) -- 001_schema.sql apply ไปแล้วแก้ตรง ๆ ไม่ได้ (§5 กติกา) ต้องลบคอลัมน์ totp_secret
+  # ผ่าน migration ใหม่แทน -- ใช้ได้ไม่ว่าเครื่องใหม่หรือเครื่องที่เคย apply schema เก่าไปแล้ว
+  local droptotp="${SCRIPT_DIR}/sql/006_drop_totp.sql"
+  if [[ -f "$droptotp" ]]; then
+    run_sh "mysql '${DB_NAME}' < '${droptotp}'"
+    ok "ถอดคอลัมน์ staff.totp_secret แล้ว (N8 -- 2FA ตัดสินใจไม่ทำ)"
+  else
+    warn "ไม่พบ sql/006_drop_totp.sql — ข้าม (staff.totp_secret จะยังค้างอยู่ในสคีมาเฉย ๆ ไม่กระทบการทำงาน)"
   fi
 
   # แก้บั๊ก (พบตอนตรวจทานรอบ 2): sql/003_partitions.sql มีอยู่ในโปรเจกต์และ Task Board

@@ -299,11 +299,19 @@ def issue():
     raw = request.form.get("natid", "")
     # บั๊กเดิม: int(...) โดยไม่ดัก ValueError -- กรอกอะไรที่ไม่ใช่ตัวเลขในช่อง
     # hours/devices จะทำให้ 500 ดิบ ๆ หลุดออกไป (ไม่มี @app.errorhandler(500) ในไฟล์นี้ด้วย)
+    # N8 (CODING_BRIEF.md): quota_mb เดิมมีตรรกะบังคับใช้พร้อมแล้วใน enforce_voucher_expiry.py
+    # (mark_used_up_vouchers) แต่หน้านี้ไม่เคยส่งค่าเข้า INSERT เลยสักครั้ง -- ต่อสายให้ครบ
+    quota_raw = (request.form.get("quota_mb") or "").strip()
     try:
         hours = max(1, min(24, int(request.form.get("hours") or 4)))
         devices = max(1, min(5, int(request.form.get("devices") or 2)))
+        quota_mb: int | None = None
+        if quota_raw:
+            quota_mb = int(quota_raw)
+            if quota_mb <= 0:
+                raise ValueError
     except ValueError:
-        return render_template("issue.html", error="จำนวนชั่วโมง/อุปกรณ์ต้องเป็นตัวเลข",
+        return render_template("issue.html", error="จำนวนชั่วโมง/อุปกรณ์/โควตาต้องเป็นตัวเลข",
                                natid=raw), 400
     consent = request.form.get("consent") == "on"
 
@@ -341,20 +349,22 @@ def issue():
 
         cur.execute(
             "INSERT INTO voucher (customer_id, username, password_hash, issued_by, "
-            "valid_from, valid_until, max_devices, status) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, 'active')",
+            "valid_from, valid_until, max_devices, quota_mb, status) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'active')",
             (cust_id, code, crypto.hash_password(plain_pw), session["staff_id"],
-             now, now + timedelta(hours=hours), devices))
+             now, now + timedelta(hours=hours), devices, quota_mb))
 
     audit.log(audit.ISSUE_VOUCHER, staff_id=session["staff_id"], target=code,
-              client_ip=g.client_ip, detail=f"customer={masked} hours={hours} devices={devices}")
+              client_ip=g.client_ip,
+              detail=f"customer={masked} hours={hours} devices={devices} quota_mb={quota_mb or 'unlimited'}")
 
     # บั๊กเดิม (M6): เคย render ผลลัพธ์ตรง ๆ จาก POST -- กด F5 ที่หน้านั้นคือส่ง POST ซ้ำ
     # ได้ voucher ใบใหม่ให้ลูกค้าคนเดิมทันทีโดยไม่ตั้งใจ -- เปลี่ยนเป็น POST-Redirect-GET
     # เก็บรหัสผ่านไว้ใน session ชั่วคราว (เห็นได้ครั้งเดียว, pop ทิ้งทันทีที่อ่าน เหมือน flash)
     session["just_issued"] = dict(
         code=code, password=plain_pw, masked=masked,
-        valid_until=(now + timedelta(hours=hours)).isoformat(), devices=devices)
+        valid_until=(now + timedelta(hours=hours)).isoformat(), devices=devices,
+        quota_mb=quota_mb)
     return redirect(url_for("issue_result"))
 
 
@@ -369,10 +379,14 @@ def issue_result():
         return redirect(url_for("issue"))
     qr_text = (f"{os.environ.get('GATEWAY_NAME', 'Cafe-Guest')}\n"
               f"User: {data['code']}\nPass: {data['password']}")
+    quota_mb = data.get("quota_mb")
+    quota_label = "ไม่จำกัด" if not quota_mb else (
+        f"{quota_mb / 1000:g} GB" if quota_mb >= 1000 else f"{quota_mb} MB")
     return render_template("issue_result.html", code=data["code"], password=data["password"],
                            masked=data["masked"],
                            valid_until=datetime.fromisoformat(data["valid_until"]),
-                           devices=data["devices"], qr_svg=voucher_qr_svg(qr_text))
+                           devices=data["devices"], quota_label=quota_label,
+                           qr_svg=voucher_qr_svg(qr_text))
 
 
 # ---------------------------------------------------------------- ลูกค้า

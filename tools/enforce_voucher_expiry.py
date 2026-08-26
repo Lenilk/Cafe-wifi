@@ -26,9 +26,10 @@ tools/enforce_voucher_expiry.py — บังคับอายุ voucher จ�
        เขียนเลยทั้งที่ conn_log มีข้อมูล bytes ต่อ MAC อยู่แล้ว -- สคริปต์นี้: (1)ตั้ง
        status='expired' ให้ voucher ที่หมดอายุแล้ว (2) รวมยอด bytes จาก conn_log ต่อ mac
        ในช่วงเวลาของ session ลงใน portal_session.bytes_in/out + voucher.used_mb (3) ตั้ง
-       status='used_up' ถ้ามีการกำหนด quota_mb ไว้และใช้เกิน (หน้า /issue ยังไม่มีช่องกรอก
-       quota_mb ในตอนนี้ จึงยังไม่มี voucher ไหนตั้งค่านี้จริง --เป็นการต่อสายให้ฟีเจอร์พร้อม
-       ใช้เมื่อมีคนเพิ่ม UI ภายหลัง ไม่ใช่การอ้างว่า quota บังคับใช้ได้แล้ววันนี้)
+       status='used_up' ถ้ามีการกำหนด quota_mb ไว้และใช้เกิน -- ปิดครบสายแล้ว (N8,
+       CODING_BRIEF.md, 2026-08-26): หน้า /issue มีช่องกรอก quota_mb แล้ว (dropdown
+       ไม่จำกัด/500MB/1GB/2GB/5GB) ส่งเข้า INSERT INTO voucher จริง ฟังก์ชันนี้จึงถูกกระตุ้น
+       ใช้งานได้จริงแล้ว ไม่ใช่แค่ต่อสายรอเฉย ๆ เหมือนก่อนหน้านี้
 """
 from __future__ import annotations
 

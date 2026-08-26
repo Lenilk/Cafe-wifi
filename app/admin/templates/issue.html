@@ -31,6 +31,16 @@
     <label for="devices">จำนวนอุปกรณ์สูงสุด</label>
     <input type="number" id="devices" name="devices" min="1" max="5" value="2">
 
+    <label for="quota_mb">จำกัดปริมาณข้อมูล (ไม่บังคับ)</label>
+    <select id="quota_mb" name="quota_mb">
+      <option value="" selected>ไม่จำกัด</option>
+      <option value="500">500 MB</option>
+      <option value="1000">1 GB</option>
+      <option value="2000">2 GB</option>
+      <option value="5000">5 GB</option>
+    </select>
+    <div class="hint">ถึงโควตาแล้วระบบตัดอัตโนมัติภายใน 5 นาที (cafe-enforce.timer)</div>
+
     <label style="font-weight:400;display:flex;gap:.5rem;align-items:flex-start;margin-top:1rem">
       <input type="checkbox" name="consent" style="width:auto;margin-top:.35rem" required>
       <span>ได้แจ้งข้อความข้างต้นให้ลูกค้าทราบและลูกค้ายินยอมแล้ว</span>
