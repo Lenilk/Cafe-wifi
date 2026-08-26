@@ -8,12 +8,15 @@ check_time -- ไม่มี backup DB เลยสักจุดในระ�
 
 รันทุกวันผ่าน cafe-maintenance.timer (ตั้งโดย install.sh) ต่อจาก purge_old_data
 
-ขอบเขตที่ทำจริง (ต้องซื่อสัตย์): dump ไปเก็บไว้ *ในเครื่องเดียวกัน* ที่ BACKUP_DIR (mode 0600
-root-only เพราะเนื้อหาในนั้นมี natid_enc ที่เข้ารหัสอยู่ -- backup เองไม่ได้ทำให้ปลอดภัยกว่า
-secrets.env เดิม เพราะยังต้องมี DEK ใน secrets.env คู่กันถึงจะถอดรหัสได้) การก็อปปี้ backup
-ออกไปเก็บนอกเครื่อง (offsite) จริง ๆ (เช่น rclone/scp ไปเครื่องอื่น) *ยังไม่ได้ทำในสคริปต์นี้*
-เพราะต้องรู้ปลายทางที่เจ้าของระบบเลือก -- ทำ backup ในเครื่องให้ก่อนเป็นด่านแรก แล้วเจ้าของ
-ระบบต้องตั้ง cron/rclone ส่งไฟล์ในโฟลเดอร์นี้ออกนอกเครื่องเองอีกชั้นหนึ่ง
+ขอบเขตที่ทำจริง (ต้องซื่อสัตย์): dump เก็บไว้ที่ BACKUP_DIR ในเครื่องก่อน (mode 0600 root-only
+เพราะเนื้อหาในนั้นมี natid_enc ที่เข้ารหัสอยู่ -- backup เองไม่ได้ทำให้ปลอดภัยกว่า secrets.env
+เดิม เพราะยังต้องมี DEK ใน secrets.env คู่กันถึงจะถอดรหัสได้) แล้ว **คัดลอกออกนอกเครื่องด้วย
+ถ้าตั้ง OFFSITE_BACKUP_DIR ไว้** (N4, CODING_BRIEF.md -- §11.1 ข้อ 4 เขียนเงื่อนไขไว้เองว่า
+"ถ้าใช้ SD card ต้อง backup ออกนอกการ์ด" เพราะถ้า SD card ทั้งใบพัง แล้ว backup อยู่ใน SD
+ใบเดียวกัน ก็ไม่ต่างจากไม่มี backup เลย) OFFSITE_BACKUP_DIR ควรชี้ไปที่ mount point อื่น
+(เช่น USB drive/NAS ที่ mount ไว้) -- ถ้าไม่ตั้งค่านี้ จะข้ามขั้นตอนนี้พร้อม log ว่าข้ามเพราะอะไร
+ไม่ throw error (ยังไม่รองรับการส่งไป remote จริง ๆ เช่น rclone/scp ข้ามเครื่อง เป็นแค่ copy
+ไปยัง path ในเครื่องเดียวกัน/mount point ที่เข้าถึงได้ผ่าน filesystem ตรง ๆ เท่านั้น)
 
 บั๊กที่เกือบเกิดจริง (พบตอนตรวจทานรอบ 4): เดิม dump_cmd มี --routines --triggers ซึ่งต้องใช้
 สิทธิ์อ่าน mysql.proc/TRIGGER ที่ DB_USER ไม่มีแล้วหลังแก้ GRANT ให้แคบลงเหลือแค่
@@ -47,6 +50,7 @@ class BackupResult:
     path: Path
     size_bytes: int
     pruned: int
+    offsite_path: Path | None = None  # N4 -- None แปลว่าไม่ได้ตั้ง OFFSITE_BACKUP_DIR หรือคัดลอกไม่สำเร็จ
 
 
 def dump_database(db_name: str, host: str, port: int, user: str, password: str,
@@ -117,9 +121,41 @@ def prune_old_backups(backup_dir: Path, keep_days: int, pattern: str = "*.sql.gz
     return pruned
 
 
-def run(backup_dir: Path | None = None, keep_days: int | None = None) -> BackupResult:
+def copy_offsite(src: Path, offsite_dir: str | None) -> Path | None:
+    """
+    คัดลอก backup ออกนอกเครื่อง (N4) ถ้าตั้ง OFFSITE_BACKUP_DIR ไว้ -- คืน path ปลายทางถ้า
+    สำเร็จ, None ถ้าข้าม (ไม่ได้ตั้งค่า) หรือคัดลอกไม่สำเร็จ
+
+    ตั้งใจไม่ throw เมื่อคัดลอกไม่สำเร็จ (เช่น mount point ไม่อยู่/เขียนไม่ได้เต็มดิสก์)
+    เพราะ backup ในเครื่องสำเร็จไปแล้วก่อนหน้านี้ -- ความล้มเหลวของ offsite ไม่ควรทำให้
+    ทั้ง backup_db.py ถือว่าล้มเหลว (log ไว้ให้เห็นชัดเจนแทน แล้วปล่อยให้ backup ในเครื่อง
+    ที่ทำสำเร็จแล้วยังมีประโยชน์ต่อไป)
+    """
+    if not offsite_dir:
+        log.info("ไม่ได้ตั้ง OFFSITE_BACKUP_DIR — ข้าม backup ออกนอกเครื่อง "
+                 "(backup ยังอยู่ในเครื่องเดียวกันที่ %s เท่านั้น เสี่ยงถ้า SD card พังทั้งใบ)", src)
+        return None
+
+    dest_dir = Path(offsite_dir)
+    dest_path = dest_dir / src.name
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest_path)
+        dest_path.chmod(0o600)  # เนื้อหาเดียวกับต้นฉบับ มี natid_enc เข้ารหัสอยู่
+    except OSError as exc:
+        log.error("คัดลอก backup ออกนอกเครื่องไปที่ %s ไม่สำเร็จ: %s — backup ในเครื่องยังอยู่ที่ %s",
+                  dest_path, exc, src)
+        return None
+
+    log.info("คัดลอก backup ออกนอกเครื่องสำเร็จ: %s", dest_path)
+    return dest_path
+
+
+def run(backup_dir: Path | None = None, keep_days: int | None = None,
+       offsite_dir: str | None = None) -> BackupResult:
     backup_dir = backup_dir or Path(os.environ.get("BACKUP_DIR", "/var/backups/cafe-wifi"))
     keep_days = keep_days or int(os.environ.get("BACKUP_RETENTION_DAYS", "14"))
+    offsite_dir = offsite_dir or os.environ.get("OFFSITE_BACKUP_DIR", "")
 
     db_name = os.environ.get("DB_NAME", "cafewifi")
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -134,9 +170,11 @@ def run(backup_dir: Path | None = None, keep_days: int | None = None) -> BackupR
         out_path=out_path,
     )
     size = out_path.stat().st_size
+    offsite_path = copy_offsite(out_path, offsite_dir)  # N4
     pruned = prune_old_backups(backup_dir, keep_days)
-    log.info("สำรอง DB สำเร็จ: %s (%d bytes) — ลบ backup เก่า %d ไฟล์", out_path, size, pruned)
-    return BackupResult(path=out_path, size_bytes=size, pruned=pruned)
+    log.info("สำรอง DB สำเร็จ: %s (%d bytes) — ลบ backup เก่า %d ไฟล์ — offsite: %s",
+            out_path, size, pruned, offsite_path or "ข้าม")
+    return BackupResult(path=out_path, size_bytes=size, pruned=pruned, offsite_path=offsite_path)
 
 
 def main() -> int:  # pragma: no cover

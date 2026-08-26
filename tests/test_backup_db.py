@@ -13,7 +13,7 @@ import stat
 
 import pytest
 
-from tools.backup_db import BackupError, dump_database, prune_old_backups, run
+from tools.backup_db import BackupError, copy_offsite, dump_database, prune_old_backups, run
 
 pytestmark = pytest.mark.skipif(
     shutil.which("sh") is None or shutil.which("gzip") is None,
@@ -119,3 +119,75 @@ def test_run_end_to_end_writes_and_prunes(tmp_path, monkeypatch):
     assert result.pruned == 0
     content = gzip.open(result.path, "rt").read()
     assert "fake mysqldump output" in content
+    assert result.offsite_path is None, "ไม่ได้ตั้ง OFFSITE_BACKUP_DIR ในเทสต์นี้ ต้องข้าม"
+
+
+# ---------------------------------------------------------------- copy_offsite (N4, CODING_BRIEF.md)
+def test_copy_offsite_skips_when_env_not_set(tmp_path):
+    """กรณีที่ 1: ไม่ตั้ง OFFSITE_BACKUP_DIR -- ต้องข้าม ไม่ throw คืน None"""
+    src = tmp_path / "backup.sql.gz"
+    src.write_bytes(b"fake backup content")
+
+    result = copy_offsite(src, offsite_dir=None)
+    assert result is None
+
+
+def test_copy_offsite_skips_when_env_is_empty_string(tmp_path):
+    src = tmp_path / "backup.sql.gz"
+    src.write_bytes(b"fake backup content")
+    assert copy_offsite(src, offsite_dir="") is None
+
+
+def test_copy_offsite_copies_file_when_destination_is_writable(tmp_path):
+    """กรณีที่ 2: ตั้งค่าแล้วปลายทางเขียนได้ -- ต้องคัดลอกไฟล์จริง เนื้อหาตรงกับต้นฉบับ"""
+    src = tmp_path / "backup.sql.gz"
+    src.write_bytes(b"fake backup content for offsite copy")
+    offsite_dir = tmp_path / "offsite"  # ยังไม่มีอยู่ก่อน -- ต้องสร้างให้เองด้วย
+
+    result = copy_offsite(src, offsite_dir=str(offsite_dir))
+
+    assert result == offsite_dir / src.name
+    assert result.exists()
+    assert result.read_bytes() == src.read_bytes()
+    if os.name == "posix":
+        # เนื้อหามี natid_enc -- ต้องจำกัดสิทธิ์เหมือนต้นฉบับ (Windows ไม่มี POSIX permission
+        # bits จริง chmod() แค่สลับ read-only attribute เท่านั้น เช็คได้เฉพาะบน Linux เป้าหมาย)
+        assert oct(result.stat().st_mode)[-3:] == "600"
+
+
+def test_copy_offsite_returns_none_and_does_not_raise_when_destination_unwritable(tmp_path):
+    """
+    กรณีที่ 3: ปลายทางเขียนไม่ได้ -- จำลองด้วยการวางไฟล์ธรรมดาขวางตำแหน่งที่ควรเป็นโฟลเดอร์ไว้
+    ก่อน (mkdir(parents=True, exist_ok=True) จะ raise FileExistsError เพราะ path นั้นมีอยู่แล้ว
+    แต่ไม่ใช่โฟลเดอร์) วิธีนี้พกพาข้ามแพลตฟอร์มได้แน่นอน ต่างจากการตั้ง chmod 000 ที่ไม่น่าเชื่อถือ
+    บน Windows
+    """
+    src = tmp_path / "backup.sql.gz"
+    src.write_bytes(b"fake backup content")
+
+    blocked_path = tmp_path / "offsite_blocked"
+    blocked_path.write_text("ไฟล์ธรรมดาขวางอยู่ตรงนี้ ไม่ใช่โฟลเดอร์", encoding="utf-8")
+
+    result = copy_offsite(src, offsite_dir=str(blocked_path))
+    assert result is None, "คัดลอกไม่สำเร็จต้องคืน None ไม่ throw exception ออกมา"
+
+
+def test_run_copies_offsite_when_env_is_set(tmp_path, monkeypatch):
+    """ยืนยันว่า run() ต่อสาย copy_offsite() เข้ากับ OFFSITE_BACKUP_DIR จริง ไม่ใช่แค่ฟังก์ชันลอย ๆ"""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _make_fake_mysqldump(bin_dir, name="mysqldump")
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    monkeypatch.setenv("DB_NAME", "cafewifi")
+    monkeypatch.setenv("DB_HOST", "127.0.0.1")
+    monkeypatch.setenv("DB_PORT", "3306")
+    monkeypatch.setenv("DB_USER", "root")
+    monkeypatch.setenv("DB_PASS", "x")
+
+    offsite_dir = tmp_path / "offsite"
+    result = run(backup_dir=tmp_path / "backups", keep_days=14, offsite_dir=str(offsite_dir))
+
+    assert result.offsite_path is not None
+    assert result.offsite_path.exists()
+    assert result.offsite_path.read_bytes() == result.path.read_bytes()
