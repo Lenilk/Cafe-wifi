@@ -75,6 +75,7 @@
     <a href="{{ url_for('dashboard') }}">แดชบอร์ด</a>
     <a href="{{ url_for('issue') }}">ออกรหัสให้ลูกค้า</a>
     <a href="{{ url_for('customers') }}">ลูกค้า</a>
+    <a href="{{ url_for('search_logs') }}">ค้นหา log</a>
     <a href="{{ url_for('status_page') }}">สถานะระบบ</a>
     <span class="hint">{{ current_user }} ({{ current_role }})</span>
     <form method="post" action="{{ url_for('logout') }}" style="display:inline">

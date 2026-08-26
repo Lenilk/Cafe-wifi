@@ -499,6 +499,101 @@ def erase_customer(cid: int):
     return redirect(url_for("customers"))
 
 
+# N9 (CODING_BRIEF.md) ⭐ ช่องว่างที่ใหญ่ที่สุด -- DoD ของ Phase 4 เขียนว่า "ค้นย้อนกลับใน
+# Admin เจอครบ" และ T10 ทดสอบไม่ได้เลยถ้าไม่มีหน้านี้ (เดิมมีแค่ export ผ่าน command line
+# ใน tools/export_evidence.py) -- หน้านี้ค้น conn_log/dns_log ผ่านเว็บได้จริง
+LOGS_PAGE_SIZE = 50
+
+# mapping ย้อนกลับ conn_log.mac / dns_log.mac -> device -> voucher -> customer -- join ตาม mac
+# แล้วจับคู่ voucher ที่ valid_from..valid_until ครอบคลุม ts ของแถว log นั้น ๆ (ไม่ใช่แค่ join
+# ตาม mac เฉย ๆ) เพราะ MAC เดียวกันใช้กับ voucher คนละใบคนละช่วงเวลาได้จริง (device.mac ไม่ได้
+# unique ทั้งตาราง มีแค่ unique (voucher_id, mac)) -- ถ้า join แค่ mac เฉย ๆ จะได้ผลลัพธ์ผิดคน
+# เมื่อ MAC ถูกนำกลับมาใช้ซ้ำข้ามช่วงเวลา ส่วน c.natid_masked มาจากคอลัมน์ที่เก็บค่า mask ไว้แล้ว
+# ใน DB (ไม่เคย SELECT natid_enc/natid_hash ในหน้านี้เลย) จึงไม่มีทางเห็นเลขเต็มไม่ว่า role ไหน
+# ตรงตาม §6.2 ข้อ 5 -- role staff จะเห็นแบบเดียวกับ admin ในหน้านี้เป๊ะ (เหมือนหน้า /customers เดิม)
+_MAPPING_JOIN = (
+    " LEFT JOIN device d ON d.mac = {alias}.mac"
+    " LEFT JOIN voucher v ON v.id = d.voucher_id AND {alias}.ts BETWEEN v.valid_from AND v.valid_until"
+    " LEFT JOIN customer c ON c.id = v.customer_id"
+)
+
+
+@app.get("/logs")
+@login_required
+def search_logs():
+    log_type = request.args.get("log_type", "conn")
+    if log_type not in ("conn", "dns"):
+        log_type = "conn"
+    start_raw = (request.args.get("start") or "").strip()
+    end_raw = (request.args.get("end") or "").strip()
+    mac = (request.args.get("mac") or "").strip().upper()
+    domain = (request.args.get("domain") or "").strip()
+    ip = (request.args.get("ip") or "").strip()
+    try:
+        page = max(1, int(request.args.get("page") or 1))
+    except ValueError:
+        page = 1
+
+    ctx = dict(log_type=log_type, start=start_raw, end=end_raw, mac=mac, domain=domain,
+              ip=ip, page=page, rows=[], has_next=False, has_prev=page > 1)
+
+    # บังคับกรอกช่วงเวลาเสมอ -- ห้ามค้นแบบไม่จำกัดช่วง (Pi 4B RAM จำกัด, ตารางโตเร็วตาม ม.26
+    # ที่บังคับเก็บ traffic log อย่างน้อย 90 วัน) query ไม่มี WHERE ts BETWEEN จะกวาดทั้งตาราง
+    if not start_raw or not end_raw:
+        return render_template("logs_search.html", error="ต้องระบุช่วงเวลาเริ่มต้นและสิ้นสุดเสมอ "
+                               "(ห้ามค้นแบบไม่จำกัดช่วง)", **ctx), 400
+    try:
+        start = datetime.fromisoformat(start_raw)
+        end = datetime.fromisoformat(end_raw)
+    except ValueError:
+        return render_template("logs_search.html", error="รูปแบบวันเวลาไม่ถูกต้อง", **ctx), 400
+    if end <= start:
+        return render_template("logs_search.html", error="วันที่สิ้นสุดต้องอยู่หลังวันที่เริ่มต้น",
+                               **ctx), 400
+
+    offset = (page - 1) * LOGS_PAGE_SIZE
+    # ดึงเกิน 1 แถวเพื่อรู้ว่า "มีหน้าถัดไปไหม" โดยไม่ต้องรัน COUNT(*) แยกอีกคิวรี่ (คิวรี่นับแถว
+    # ทั้งชุดที่กรองแล้วก็หนักพอ ๆ กับคิวรี่ค้นเองบนตารางใหญ่ -- Pi 4B RAM จำกัด ไม่คุ้มที่จะรันซ้ำ)
+    if log_type == "dns":
+        sql = ("SELECT dl.ts, dl.client_ip, dl.mac, dl.qname, dl.qtype, dl.answer, "
+              "v.username AS voucher_username, c.natid_masked "
+              "FROM dns_log dl" + _MAPPING_JOIN.format(alias="dl") +
+              " WHERE dl.ts BETWEEN %s AND %s")
+        params: list = [start, end]
+        if mac:
+            sql += " AND dl.mac = %s"; params.append(mac)
+        if domain:
+            sql += " AND dl.qname LIKE %s"; params.append(f"%{domain}%")
+        sql += " ORDER BY dl.ts DESC LIMIT %s OFFSET %s"
+        params += [LOGS_PAGE_SIZE + 1, offset]
+    else:
+        sql = ("SELECT cl.ts, cl.mac, cl.src_ip, cl.src_port, cl.dst_ip, cl.dst_port, cl.proto, "
+              "cl.bytes_out, cl.bytes_in, v.username AS voucher_username, c.natid_masked "
+              "FROM conn_log cl" + _MAPPING_JOIN.format(alias="cl") +
+              " WHERE cl.ts BETWEEN %s AND %s")
+        params = [start, end]
+        if mac:
+            sql += " AND cl.mac = %s"; params.append(mac)
+        if ip:
+            sql += " AND (cl.src_ip = %s OR cl.dst_ip = %s)"; params += [ip, ip]
+        sql += " ORDER BY cl.ts DESC LIMIT %s OFFSET %s"
+        params += [LOGS_PAGE_SIZE + 1, offset]
+
+    rows = query_all(sql, tuple(params))
+    has_next = len(rows) > LOGS_PAGE_SIZE
+    rows = rows[:LOGS_PAGE_SIZE]
+    ctx.update(rows=rows, has_next=has_next)
+
+    # ลง audit_log ทุกครั้งที่ค้นสำเร็จ (PDPA + จุดขายตอนนำเสนอ) -- ไม่ลงตอนถูกปฏิเสธด้านบน
+    # เพราะยังไม่มีการค้นข้อมูลอะไรเกิดขึ้นจริง (ตรงกับแบบแผนเดิมของ /customers/<id>/erase
+    # ที่ไม่ลง audit ตอน validation ล้มเหลวเหมือนกัน)
+    audit.log(audit.SEARCH_LOG, staff_id=session["staff_id"], client_ip=g.client_ip,
+              detail=f"log_type={log_type} start={start.isoformat()} end={end.isoformat()} "
+                    f"mac={mac or '-'} domain={domain or '-'} ip={ip or '-'} page={page}")
+
+    return render_template("logs_search.html", error=None, **ctx)
+
+
 # N2 (CODING_BRIEF.md): logger/integrity.py มี verify_chain() พร้อมใช้และมีเทสต์ผ่านแล้ว
 # แต่ไม่เคยมีปุ่มไหนต่อเรียกมันในหน้าเว็บเลย -- ปุ่มนี้คือ T12 ที่สาธิตสดได้ใน 20 วินาที
 # (แก้ไฟล์ log ที่ผนึกแล้ว 1 ตัวอักษร -> กดปุ่ม -> เจอ hash_mismatch ทันที)

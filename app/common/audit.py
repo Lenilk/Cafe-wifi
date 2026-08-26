@@ -20,6 +20,7 @@ LOGIN_FAIL = "login_fail"
 SETUP_ADMIN = "setup_admin"
 DISK_ALERT = "disk_alert"  # N1 (CODING_BRIEF.md) -- ดิสก์เต็ม = log หยุดเขียน = ผิด ม.26
 ERASE_CUSTOMER = "erase_customer"  # N6 (CODING_BRIEF.md) -- DSR: ลบข้อมูลรายบุคคลตามคำขอ (PDPA §6.2 ข้อ 6)
+SEARCH_LOG = "search_log"  # N9 (CODING_BRIEF.md) -- ค้น conn_log/dns_log ใน Admin ต้องมีร่องรอยทุกครั้งตาม PDPA
 
 
 def log(action: str, staff_id: int | None = None, target: str = "",

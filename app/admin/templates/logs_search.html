@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+{% block title %}ค้นหา log{% endblock %}
+{% block body %}
+<div class="card">
+  <h1>ค้นหา log ย้อนหลัง</h1>
+  <p class="hint">
+    ค้นได้ทั้ง conn_log (การเชื่อมต่อ) และ dns_log (DNS query) — <strong>ต้องระบุช่วงเวลาเสมอ</strong>
+    (ห้ามค้นแบบไม่จำกัดช่วง) ผลลัพธ์แสดงย้อนกลับถึงลูกค้าเจ้าของ MAC ในช่วงเวลานั้น (แสดงเลขบัตร
+    แบบ masked เท่านั้นทุก role — ต้องกด "เปิดเผยเลขเต็ม" ในหน้าลูกค้าแยกต่างหากถ้าต้องการเลขเต็ม)
+  </p>
+
+  {% if error %}<div class="msg err">{{ error }}</div>{% endif %}
+
+  <form method="get">
+    <label>ประเภท log</label>
+    <div style="display:flex;gap:1.5rem;margin:.3rem 0">
+      <label style="font-weight:400;display:flex;gap:.4rem;align-items:center;margin:0">
+        <input type="radio" name="log_type" value="conn" style="width:auto"
+               {{ 'checked' if log_type != 'dns' }}> conn_log (การเชื่อมต่อ / IP)
+      </label>
+      <label style="font-weight:400;display:flex;gap:.4rem;align-items:center;margin:0">
+        <input type="radio" name="log_type" value="dns" style="width:auto"
+               {{ 'checked' if log_type == 'dns' }}> dns_log (โดเมน)
+      </label>
+    </div>
+
+    <div class="grid" style="grid-template-columns:1fr 1fr">
+      <div>
+        <label for="start">ช่วงเวลาเริ่มต้น</label>
+        <input type="datetime-local" id="start" name="start" value="{{ start }}" required>
+      </div>
+      <div>
+        <label for="end">ถึง</label>
+        <input type="datetime-local" id="end" name="end" value="{{ end }}" required>
+      </div>
+    </div>
+
+    <label for="mac">MAC address (ไม่บังคับ)</label>
+    <input type="text" id="mac" name="mac" class="mono" value="{{ mac }}"
+           placeholder="AA:BB:CC:DD:EE:FF">
+
+    <label for="ip">IP address (ไม่บังคับ — ใช้กับ conn_log เท่านั้น)</label>
+    <input type="text" id="ip" name="ip" class="mono" value="{{ ip }}" placeholder="10.10.0.105">
+
+    <label for="domain">โดเมน (ไม่บังคับ — ใช้กับ dns_log เท่านั้น, ค้นแบบ contains)</label>
+    <input type="text" id="domain" name="domain" class="mono" value="{{ domain }}"
+           placeholder="example.com">
+
+    <p><button type="submit">ค้นหา</button></p>
+  </form>
+</div>
+
+{% if rows %}
+<div class="card">
+  <h2>ผลการค้นหา (หน้า {{ page }}{{ ' — มีผลลัพธ์เพิ่มเติม' if has_next }})</h2>
+  <div style="overflow-x:auto">
+  <table>
+    {% if log_type == 'dns' %}
+    <tr><th>เวลา</th><th>IP ลูกค้า</th><th>MAC</th><th>โดเมน</th><th>ประเภท</th><th>คำตอบ</th>
+        <th>รหัสวอเชอร์</th><th>ลูกค้า</th></tr>
+    {% for r in rows %}
+    <tr>
+      <td>{{ r.ts.strftime('%d/%m/%Y %H:%M:%S') }}</td>
+      <td class="mono">{{ r.client_ip }}</td>
+      <td class="mono">{{ r.mac or '-' }}</td>
+      <td class="mono">{{ r.qname }}</td>
+      <td>{{ r.qtype or '-' }}</td>
+      <td class="mono">{{ r.answer or '-' }}</td>
+      <td class="mono">{{ r.voucher_username or '-' }}</td>
+      <td class="mono">{{ r.natid_masked or 'ไม่ทราบ' }}</td>
+    </tr>
+    {% endfor %}
+    {% else %}
+    <tr><th>เวลา</th><th>MAC</th><th>ต้นทาง</th><th>ปลายทาง</th><th>โปรโตคอล</th>
+        <th>bytes out</th><th>bytes in</th><th>รหัสวอเชอร์</th><th>ลูกค้า</th></tr>
+    {% for r in rows %}
+    <tr>
+      <td>{{ r.ts.strftime('%d/%m/%Y %H:%M:%S') }}</td>
+      <td class="mono">{{ r.mac }}</td>
+      <td class="mono">{{ r.src_ip }}:{{ r.src_port or '-' }}</td>
+      <td class="mono">{{ r.dst_ip }}:{{ r.dst_port or '-' }}</td>
+      <td>{{ r.proto }}</td>
+      <td>{{ r.bytes_out or 0 }}</td>
+      <td>{{ r.bytes_in or 0 }}</td>
+      <td class="mono">{{ r.voucher_username or '-' }}</td>
+      <td class="mono">{{ r.natid_masked or 'ไม่ทราบ' }}</td>
+    </tr>
+    {% endfor %}
+    {% endif %}
+  </table>
+  </div>
+
+  <p style="margin-top:1rem;display:flex;gap:.5rem">
+    {% if has_prev %}
+    <a class="btn ghost" style="background:transparent;border:1px solid var(--line);color:var(--ink)"
+       href="{{ url_for('search_logs', log_type=log_type, start=start, end=end, mac=mac, ip=ip, domain=domain, page=page-1) }}">← ก่อนหน้า</a>
+    {% endif %}
+    {% if has_next %}
+    <a class="btn ghost" style="background:transparent;border:1px solid var(--line);color:var(--ink)"
+       href="{{ url_for('search_logs', log_type=log_type, start=start, end=end, mac=mac, ip=ip, domain=domain, page=page+1) }}">ถัดไป →</a>
+    {% endif %}
+  </p>
+</div>
+{% elif not error %}
+<div class="card"><p class="hint">ไม่พบผลลัพธ์ในเงื่อนไขที่ค้น</p></div>
+{% endif %}
+{% endblock %}
