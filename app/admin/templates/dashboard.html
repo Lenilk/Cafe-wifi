@@ -35,4 +35,14 @@
     {% endfor %}
   </table>
 </div>
+
+<div class="card" style="margin-top:1rem">
+  <h2>ความถูกต้องของ log (hash chain)</h2>
+  {% if current_role == 'admin' %}
+  <p class="hint">ตรวจว่าไฟล์ log ที่ผนึกไว้ (§6.1) ยังไม่ถูกแก้ไขเลยตั้งแต่ผนึก</p>
+  <form method="post" action="{{ url_for('verify_log_integrity') }}">
+    <button type="submit">ตรวจสอบความถูกต้องของ log</button>
+  </form>
+  {% else %}<span class="hint">เฉพาะ admin</span>{% endif %}
+</div>
 {% endblock %}

@@ -21,9 +21,11 @@ from flask import (Flask, abort, flash, g, redirect, render_template,
 
 from common import audit, crypto
 from common.db import execute, get_conn, query_all, query_one
+from logger.integrity import SqlManifestStore, verify_chain
 
 ETC_DIR = Path(os.environ.get("ETC_DIR", "/etc/cafe-wifi"))
 SETUP_TOKEN_FILE = ETC_DIR / "setup.token"
+LOG_DIR = Path(os.environ.get("LOG_DIR", "/var/log/cafe-wifi"))  # N2 (CODING_BRIEF.md)
 
 app = Flask(__name__)
 app.config.update(
@@ -423,6 +425,20 @@ def toggle_block_customer(cid: int):
               staff_id=session["staff_id"], target=f"customer:{cid}", client_ip=g.client_ip)
     flash("ระงับลูกค้ารายนี้แล้ว" if new_state else "ยกเลิกการระงับแล้ว", "success")
     return redirect(url_for("customers"))
+
+
+# N2 (CODING_BRIEF.md): logger/integrity.py มี verify_chain() พร้อมใช้และมีเทสต์ผ่านแล้ว
+# แต่ไม่เคยมีปุ่มไหนต่อเรียกมันในหน้าเว็บเลย -- ปุ่มนี้คือ T12 ที่สาธิตสดได้ใน 20 วินาที
+# (แก้ไฟล์ log ที่ผนึกแล้ว 1 ตัวอักษร -> กดปุ่ม -> เจอ hash_mismatch ทันที)
+@app.post("/logs/verify")
+@login_required
+@admin_required
+def verify_log_integrity():
+    archive_dir = LOG_DIR / "archive"
+    issues = verify_chain(SqlManifestStore(), archive_dir)
+    audit.log("verify_integrity", staff_id=session["staff_id"], client_ip=g.client_ip,
+              detail=(f"พบ {len(issues)} ปัญหา" if issues else "chain สมบูรณ์ ไม่พบปัญหา"))
+    return render_template("logs_verify.html", issues=issues, archive_dir=str(archive_dir))
 
 
 @app.errorhandler(403)
