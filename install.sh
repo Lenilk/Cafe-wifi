@@ -536,6 +536,13 @@ FAS_PORT=${FAS_BACKEND}
 ADMIN_PORT=${ADMIN_BACKEND}
 NDS_PORT=${NDS_PORT}
 GATEWAY_NAME=${GATEWAY_NAME}
+
+# N10 (CODING_BRIEF.md) -- bypass_detector.py (T17) ใช้ 3 ค่านี้เฝ้าวง uplink หา IP/MAC
+# แปลกปลอมที่ไม่ใช่ Pi เองหรือเราเตอร์ (ดู D19/§3.1.4) -- ก่อนหน้านี้ UPLINK_CIDR/UPLINK_GW
+# เป็นตัวแปรฝั่ง shell ของ install.sh ล้วน ๆ ไม่เคยถูกส่งต่อให้ฝั่ง Python เลย
+UPLINK_IP=${UPLINK_CIDR%%/*}
+UPLINK_GW=${UPLINK_GW}
+UPLINK_NETWORK=$(cidr_to_network "$UPLINK_CIDR")
 ETC_DIR=${ETC_DIR}
 LOG_DIR=${LOG_DIR}
 LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS}
@@ -640,6 +647,18 @@ SQL
     ok "โหลด schema แล้ว"
   else
     warn "ไม่พบ sql/001_schema.sql — ต้องโหลด schema เอง"
+  fi
+
+  # N10 (CODING_BRIEF.md): ตาราง bypass_alert สำหรับ logger/bypass_detector.py (T17) --
+  # 001_schema.sql apply ไปแล้วแก้ตรง ๆ ไม่ได้ (§5) จึงเพิ่มตารางใหม่ผ่าน migration แทน
+  # ใช้ CREATE TABLE IF NOT EXISTS รันซ้ำได้เสมอ ไม่ใช่ opt-in เหมือน partitions เพราะเป็นแค่
+  # ตารางใหม่เปล่า ๆ ไม่กระทบ/ล็อกตารางเดิมที่มีข้อมูลอยู่แล้ว
+  local bypasssql="${SCRIPT_DIR}/sql/005_bypass_alert.sql"
+  if [[ -f "$bypasssql" ]]; then
+    run_sh "mysql '${DB_NAME}' < '${bypasssql}'"
+    ok "สร้างตาราง bypass_alert แล้ว (N10 -- T17)"
+  else
+    warn "ไม่พบ sql/005_bypass_alert.sql — ข้าม (logger/bypass_detector.py จะบันทึกผลไม่ได้จนกว่าจะมีตารางนี้)"
   fi
 
   # N8 (CODING_BRIEF.md): ตัดสินใจถอด 2FA (TOTP) ออก เพราะ pyotp ค้างใน requirements.txt
@@ -1248,6 +1267,46 @@ OnUnitActiveSec=5min
 WantedBy=timers.target
 UNIT
 
+  # N10 (CODING_BRIEF.md): bypass_detector.py (T17) -- แค่อ่าน /proc/net/arp (world-readable
+  # ปกติ ไม่ต้อง CAP_NET_ADMIN/RAW) แล้วต่อ DB ผ่าน TCP ธรรมดา จึงรันเป็น ${APP_USER} พร้อม
+  # hardening ชุดเดียวกับ cafe-enforce ได้เลย -- รันถี่กว่า (ทุก 1 นาที) เพราะ ARP cache ของ
+  # เคอร์เนลหมดอายุเร็ว (ดู docstring ของไฟล์นั้นเรื่อง polling ที่พลาดอุปกรณ์เชื่อมต่อสั้น ๆ ได้)
+  write_file /etc/systemd/system/cafe-bypass-detect.service 0644 <<UNIT
+[Unit]
+Description=Cafe WiFi bypass detector (T17 -- เฝ้าวง uplink หา IP/MAC แปลกปลอม)
+After=network-online.target mariadb.service
+
+[Service]
+Type=oneshot
+User=${APP_USER}
+Group=${APP_USER}
+EnvironmentFile=${ETC_DIR}/secrets.env
+Environment=PYTHONPATH=${OPT_DIR}
+WorkingDirectory=${OPT_DIR}
+ExecStart=${VENV_DIR}/bin/python -m logger.bypass_detector
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+UNIT
+
+  write_file /etc/systemd/system/cafe-bypass-detect.timer 0644 <<'UNIT'
+[Unit]
+Description=Run cafe-wifi bypass detector every 1 minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+
+[Install]
+WantedBy=timers.target
+UNIT
+
   run systemctl daemon-reload
   ok "สร้าง systemd unit แล้ว"
 }
@@ -1388,6 +1447,9 @@ start_services() {
   if (( ! SKIP_NETWORK )); then
     run systemctl enable --now cafe-logger 2>/dev/null || warn "เปิด cafe-logger ไม่สำเร็จ"
     run systemctl enable --now opennds     2>/dev/null || warn "openNDS ยังไม่มี unit — เริ่มเองด้วยคำสั่ง: opennds"
+    # N10 (CODING_BRIEF.md): ต้องมี eth0/UPLINK_CIDR ตั้งค่าแล้วถึงจะมี ARP table ของวง uplink
+    # ให้เฝ้าจริง -- ผูกไว้กับเงื่อนไขเดียวกับ cafe-logger/opennds
+    run systemctl enable --now cafe-bypass-detect.timer 2>/dev/null || warn "เปิด cafe-bypass-detect.timer ไม่สำเร็จ"
   fi
   ok "เปิด service เรียบร้อย"
 }
@@ -1443,7 +1505,7 @@ final_summary() {
   printf '    Log             : %s\n' "$LOG_DIR"
   printf '    ฐานข้อมูล        : %s (localhost)\n\n' "$DB_NAME"
   printf '  คำสั่งที่ใช้บ่อย\n'
-  printf '    systemctl status cafe-admin cafe-fas cafe-logger cafe-enforce.timer\n'
+  printf '    systemctl status cafe-admin cafe-fas cafe-logger cafe-enforce.timer cafe-bypass-detect.timer\n'
   printf '    journalctl -u cafe-admin -f\n'
   printf '    chronyc tracking            # ความคลาดเคลื่อนนาฬิกา ต้อง < 10 ms\n'
   printf '    nft list ruleset            # ดู firewall\n'
@@ -1462,7 +1524,7 @@ uninstall() {
 
   local s
   for s in cafe-fas cafe-admin cafe-logger cafe-maintenance.timer cafe-maintenance \
-          cafe-enforce.timer cafe-enforce opennds; do
+          cafe-enforce.timer cafe-enforce cafe-bypass-detect.timer cafe-bypass-detect opennds; do
     svc disable "$s"
     run_sh "rm -f /etc/systemd/system/${s}.service /etc/systemd/system/${s}.timer"
   done
