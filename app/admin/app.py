@@ -22,6 +22,7 @@ from flask import (Flask, abort, flash, g, redirect, render_template,
 from common import audit, crypto
 from common.customer import PURGED_MARK, anonymize_customer
 from common.db import execute, get_conn, query_all, query_one
+from common.qr import voucher_qr_svg
 from logger.integrity import SqlManifestStore, verify_chain
 
 ETC_DIR = Path(os.environ.get("ETC_DIR", "/etc/cafe-wifi"))
@@ -357,16 +358,21 @@ def issue():
     return redirect(url_for("issue_result"))
 
 
+# N7 (CODING_BRIEF.md): KPI §14 ตั้งไว้ว่าออก voucher 1 ใบ ≤ 30 วินาที -- ถ้าพนักงานต้องอ่าน
+# รหัส 8 ตัวให้ลูกค้าฟังทีละตัวแล้วลูกค้าพิมพ์บนคีย์บอร์ดมือถือ เกิน 30 วินาทีแน่นอน เพิ่ม QR
+# ให้สแกนแทน (ดูข้อจำกัดว่าทำไมไม่ใช่ลิงก์ auto-login ใน docstring ของ common/qr.py)
 @app.get("/issue/result")
 @login_required
 def issue_result():
     data = session.pop("just_issued", None)
     if not data:
         return redirect(url_for("issue"))
+    qr_text = (f"{os.environ.get('GATEWAY_NAME', 'Cafe-Guest')}\n"
+              f"User: {data['code']}\nPass: {data['password']}")
     return render_template("issue_result.html", code=data["code"], password=data["password"],
                            masked=data["masked"],
                            valid_until=datetime.fromisoformat(data["valid_until"]),
-                           devices=data["devices"])
+                           devices=data["devices"], qr_svg=voucher_qr_svg(qr_text))
 
 
 # ---------------------------------------------------------------- ลูกค้า

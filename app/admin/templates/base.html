@@ -57,10 +57,13 @@
   .badge.ok{background:var(--ok-bg);color:var(--ok)}
   .badge.warn{background:var(--warn-bg);color:var(--warn)}
   .badge.err{background:var(--err-bg);color:var(--err)}
+  .qr-wrap{display:flex;justify-content:center;margin:1rem 0}
+  .qr-wrap svg{width:180px;height:180px}
   .cred{font-family:ui-monospace,monospace;font-size:2rem;letter-spacing:.12em;
         background:var(--bg);border:2px dashed var(--accent);border-radius:8px;
         padding:.8rem 1rem;text-align:center;margin:.5rem 0}
   footer{color:var(--muted);font-size:.82rem;text-align:center;padding:2rem 1rem}
+  @page{margin:8mm}
   @media print{ header,nav,footer,.noprint{display:none} .card{border:0} }
 </style>
 </head>
