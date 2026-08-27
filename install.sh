@@ -878,40 +878,59 @@ SYSCTL
   run_sh "ip addr add '${CLIENT_CIDR}' dev '${CLI_IFACE}' 2>/dev/null || true"
   run_sh "ip link set '${CLI_IFACE}' up 2>/dev/null || true"
 
-  if command -v nmcli >/dev/null 2>&1; then
-    info "พบ NetworkManager — ตั้ง connection ถาวรให้ ${NIC} (uplink) และ ${CLI_IFACE} (macvlan ฝั่งลูกค้า)"
-    run_sh "nmcli con delete '${APP_NAME}-nic' >/dev/null 2>&1 || true"
-    run_sh "nmcli con add type ethernet ifname '${NIC}' con-name '${APP_NAME}-nic' ipv4.method manual ipv4.addresses '${UPLINK_CIDR}' ipv4.gateway '${UPLINK_GW}' ipv6.method disabled autoconnect yes >/dev/null 2>&1 || true"
-    run_sh "nmcli con delete '${APP_NAME}-cli' >/dev/null 2>&1 || true"
-    run_sh "nmcli con add type macvlan dev '${NIC}' mode bridge ifname '${CLI_IFACE}' con-name '${APP_NAME}-cli' ipv4.method manual ipv4.addresses '${CLIENT_CIDR}' ipv6.method disabled autoconnect yes >/dev/null 2>&1 || true"
-  elif [[ -d /etc/systemd/network ]]; then
-    write_file "/etc/systemd/network/20-${APP_NAME}-nic.network" 0644 <<NETD
-[Match]
-Name=${NIC}
+  # ---------- ทำให้ IP + macvlan อยู่ถาวรข้ามรีบูต ----------
+  # *** แก้บั๊กร้ายแรง (พบจากไฟดับจริงทำให้ VM lab รีบูตกลางเซสชันทดสอบ 2026-08-28) ***
+  # เดิมเช็คแค่ `[[ -d /etc/systemd/network ]]` ว่ามีโฟลเดอร์อยู่ไหม ซึ่ง**มีอยู่แล้วแทบทุก
+  # distro ที่ใช้ systemd แม้จะไม่ได้เปิดใช้ systemd-networkd จริงเลยก็ตาม** (Debian netinst
+  # ใช้ ifupdown เป็นค่าเริ่มต้น มีโฟลเดอร์นี้อยู่เฉยๆ ไม่มีอะไรอ่านมันเลย) ทำให้เขียนไฟล์
+  # .network/.netdev ไปแล้วไม่มีผลอะไรจริง — รีบูตแล้ว macvlan หาย, CLIENT_CIDR ตกกลับไปอยู่
+  # บน ${NIC} ตรงๆ เหมือนก่อนแก้ R11 เลย (openNDS ล่มซ้ำด้วย "IP address aliasing forbidden"
+  # ตัวเดิม, restart loop ไม่จบ) **ไม่มีทางรู้แน่ชัดว่า networkd/NetworkManager "ใช้งานจริง"
+  # อยู่หรือเปล่าแค่ดูว่าไฟล์/โฟลเดอร์มันมีอยู่** — แก้ให้ไม่ต้องเดา network manager เลย
+  # สร้าง systemd oneshot service ของเราเองที่รันคำสั่ง `ip` ตรงๆ ทุกครั้งที่บูต (idempotent
+  # ปลอดภัยรันซ้ำได้เสมอ) ใช้ได้แน่นอนไม่ว่าเครื่องจะตั้งค่าเครือข่ายพื้นฐานด้วยอะไรอยู่ก่อน
+  # แล้วก็ตาม (NetworkManager/systemd-networkd/ifupdown/ไม่มีเลย)
+  write_file "${OPT_DIR}/netsetup.sh" 0755 <<NETSETUP
+#!/bin/sh
+# managed by ${APP_NAME} installer -- รันทุกครั้งที่บูตผ่าน ${APP_NAME}-netsetup.service
+# ให้ IP + macvlan ฝั่งลูกค้ากลับมาเหมือนเดิมเสมอ ไม่ว่าเครื่องใช้อะไรจัดการ ${NIC} อยู่ก่อน
+set -e
+tries=0
+while ! ip link show '${NIC}' >/dev/null 2>&1; do
+    tries=\$((tries + 1))
+    if [ "\$tries" -ge 30 ]; then
+        echo "netsetup: ไม่พบอินเทอร์เฟซ ${NIC} หลังรอ 30 วิ ยอมแพ้" >&2
+        exit 1
+    fi
+    sleep 1
+done
+ip addr add '${UPLINK_CIDR}' dev '${NIC}' 2>/dev/null || true
+ip link set '${NIC}' up 2>/dev/null || true
+ip link add '${CLI_IFACE}' link '${NIC}' type macvlan mode bridge 2>/dev/null || true
+ip addr add '${CLIENT_CIDR}' dev '${CLI_IFACE}' 2>/dev/null || true
+ip link set '${CLI_IFACE}' up 2>/dev/null || true
+ip route replace default via '${UPLINK_GW}' dev '${NIC}' 2>/dev/null || true
+exit 0
+NETSETUP
+  write_file "/etc/systemd/system/${APP_NAME}-netsetup.service" 0644 <<NETSVC
+[Unit]
+Description=${APP_NAME} network setup (uplink IP + client macvlan, idempotent, runs every boot)
+DefaultDependencies=no
+After=systemd-udevd.service local-fs.target
+Before=network-online.target dnsmasq.service nftables.service opennds.service
 
-[Network]
-Address=${UPLINK_CIDR}
-Gateway=${UPLINK_GW}
-IPForward=yes
-NETD
-    write_file "/etc/systemd/network/21-${APP_NAME}-cli0.netdev" 0644 <<NETDEV
-[NetDev]
-Name=${CLI_IFACE}
-Kind=macvlan
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${OPT_DIR}/netsetup.sh
 
-[MACVLAN]
-Mode=bridge
-NETDEV
-    write_file "/etc/systemd/network/21-${APP_NAME}-cli0.network" 0644 <<CLINET
-[Match]
-Name=${CLI_IFACE}
-
-[Network]
-Address=${CLIENT_CIDR}
-CLINET
-  else
-    warn "ไม่พบ NetworkManager/systemd-networkd — IP จะหายเมื่อรีบูต ให้ตั้งถาวรเองตาม distro"
-  fi
+[Install]
+WantedBy=multi-user.target
+NETSVC
+  run_sh "systemctl daemon-reload"
+  svc enable "${APP_NAME}-netsetup"
+  run_sh "systemctl start '${APP_NAME}-netsetup' 2>/dev/null || true"
+  ok "ตั้ง ${APP_NAME}-netsetup.service ให้ IP/macvlan กลับมาเองทุกครั้งที่บูต (ไม่พึ่ง network manager ตัวไหนโดยเฉพาะ)"
 
   # ---------- dnsmasq (ให้บริการ DHCP/DNS เฉพาะฝั่งลูกค้าเท่านั้น ผ่าน listen-address) ----------
   write_file "/etc/dnsmasq.d/${APP_NAME}.conf" 0644 <<DNSMASQ
@@ -928,7 +947,14 @@ dhcp-range=${DHCP_START},${DHCP_END},255.255.255.0,${DHCP_LEASE}
 dhcp-option=option:router,${client_ip}
 dhcp-option=option:dns-server,${client_ip}
 dhcp-authoritative
-dhcp-leasefile=/var/lib/misc/${APP_NAME}.leases
+# *** ห้ามเปลี่ยนชื่อไฟล์นี้เด็ดขาด *** (พบจาก VM lab 2026-08-28): openNDS เองมีเช็คความ
+# ปลอดภัยที่ดี -- ปฏิเสธ client ที่ IP ไม่ปรากฏใน DHCP lease จริง (กัน static-IP self-assign
+# บายพาส) แต่ libopennds.sh::dhcp_check() หา lease file จากรายชื่อ path ที่ hardcode ไว้แค่
+# 3 ที่เท่านั้น (/tmp/dhcp.leases, /var/lib/misc/dnsmasq.leases, /var/db/dnsmasq.leases) ไม่รู้จัก
+# ชื่อไฟล์กำหนดเองเลย -- ถ้าตั้งชื่ออื่น (เช่น ${APP_NAME}.leases เดิม) openNDS จะหา DHCP
+# database ไม่เจอแล้วปฏิเสธ**ลูกค้าจริงทุกคน**ด้วย "IP not allocated by dhcp" ทันที ทั้งที่
+# DHCP ทำงานถูกต้อง 100% ก็ตาม -- นี่คือบั๊กที่จะทำให้ระบบใช้งานไม่ได้เลยถ้าไม่จับได้ก่อน
+dhcp-leasefile=/var/lib/misc/dnsmasq.leases
 
 server=1.1.1.1
 server=8.8.8.8

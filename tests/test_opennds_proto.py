@@ -1,8 +1,12 @@
 """
 ทดสอบ fas/opennds_proto.py — โปรโตคอลคุยกับ openNDS (fas_secure_enabled = 2)
 
-ยืนยันด้วยตัวเองว่า encrypt<->decrypt สมมาตรกัน (เราคุมทั้งสองฝั่งของการทดสอบนี้เอง
-เพราะไม่มี openNDS binary จริงในสภาพแวดล้อมนี้ — ดูคำเตือนใน docstring ของโมดูล)
+ส่วนใหญ่ยืนยันด้วยตัวเองว่า encrypt<->decrypt สมมาตรกัน (เราคุมทั้งสองฝั่งของการทดสอบนี้เอง
+เพราะไม่มี openNDS binary จริงในสภาพแวดล้อมที่รัน pytest นี้) ยกเว้น
+test_decrypt_real_capture_from_live_opennds() ที่ใช้ payload จริงจาก openNDS 10.1.3 ตัวเป็นๆ
+(จับมาจาก VM lab, 2026-08-28) — เขียนเพิ่มหลังพบว่าการ round-trip กับตัวเองแบบข้างต้น
+"หลอก" ให้เทสต์ผ่านได้ทั้งที่ไม่ตรงกับ openNDS จริงเลย (บั๊ก double-base64 encoding
+ดูรายละเอียดที่ docstring ของเทสต์นั้น)
 """
 import pytest
 
@@ -34,6 +38,48 @@ def test_encrypt_decrypt_roundtrip():
     assert ctx.clientmac == "AA:BB:CC:DD:EE:FF"
     assert ctx.hid == "9f8e7d6c5b4a3f2e1d0c", "client_hid ต้อง map เป็น ctx.hid"
     assert ctx.gatewayaddress == "10.10.0.1"
+    assert ctx.is_complete()
+
+
+def test_decrypt_real_capture_from_live_opennds():
+    """
+    Regression test — กันบั๊ก double-base64 encoding กลับมาแบบเงียบๆ อีก (2026-08-28)
+
+    ทุกเคสอื่นในไฟล์นี้ round-trip กับ encrypt_fas_payload()/decrypt_fas_payload() ของเราเอง
+    ทั้งคู่ ซึ่ง "หลอก" เราได้แนบเนียนมาก่อนแล้วจริงๆ: openNDS จริง (PHP reference ใน
+    src/http_microhttpd.c) เรียก openssl_encrypt($string,$cipher,$key,0,$iv) โดย
+    $options=0 (ไม่ใส่ OPENSSL_RAW_DATA) ซึ่งทำให้ผลลัพธ์ถูก base64 encode มาให้เองอยู่แล้ว
+    ในตัว แล้วโค้ดยัง base64_encode() ครอบซ้ำอีกชั้น -- พารามิเตอร์ fas จริงคือ
+    base64(base64(ciphertext)) ไม่ใช่ base64(ciphertext) ชั้นเดียว โค้ดเดิม decode
+    ชั้นเดียวเลย "Invalid padding bytes." ทุกครั้งตอนเจอ openNDS จริง (ยืนยันบน VM lab
+    บน Debian 13 + openNDS 10.1.3 ตัวจริง ไม่ใช่ mock) ทั้งที่เทสต์ 14 เคสอื่นผ่านหมด
+
+    ค่าด้านล่างจับมาจาก openNDS จริงตัวเป็นๆ (VM lab, 2026-08-28) ห้ามแก้เป็นค่าที่สร้างเอง
+    เด็ดขาด — ต้องเป็นค่าจริงจาก binary เท่านั้นถึงจะจับบั๊กสายนี้ได้
+    """
+    fas_b64 = (
+        "NHo0ZzNWR0lrYjNraVk3Q3V3cGpuc1JwVkhvb095MFphV3FWZms3MlVEVlkreUt0dXNWSjZwWmxt"
+        "aENpcUdxdDBjWHZGZjJzZjNUcjBoZitaWDhJRC9Gc08rdnhwOXFtZFBsWWpISWFET1Rhb1RCU2Rk"
+        "TUswVnp2SW9jakJrMlYzMktoaEJ5TjdNUW1WL0R5dUo4RGdubWNuTjhPUFV2SmpQYnFVdWI1UFBy"
+        "RmF2Z1J1Ni9TdUQrMUZvU0JjS2xVblFrVEV2SHAvWTM5Wm5zblpwTFNXUDEwYmpLallWR1QzZTZ2"
+        "SW42N2dBOWRTcFRVYUR4Vi9yaEtxMXZkV2N1YktDSURZZGJ2eHUySWtvbFJtQk0rdmFwOHd4UzBU"
+        "bGtwb08zdFkwTDM5Zmo3RWttQnhsUkdiNGxsVEYzWjhBYnRCaXV6aVBHdVdZZ09FUEppZG9JMzZV"
+        "T0JUVlNlcG9yTWRWN1ZEd2dFSU0xejBFc0REelBLUHpyTW14aWZIeWszK3pVK1JKNFd2YWF2Zi9Q"
+        "a1NmcjFXd1VEOFB6U1JKUHdQdE5wdkMvbXdyZE9QSW1xYTJPYzRKNmNubVpTRFVxcVpldXpDaFNp"
+        "Wk5kb1hHRGF6V2FCcmtncVpCL2haSURXZmkxZmk2OS9vSmlLanFlbWtRUkdpU0YzMWNIeUd4OFBx"
+        "dWJXdzBqZ0NwYzh3NnhyeENIbnJ6eUFwS1VZY0lyMDdlcEZOemRLZ2cyZGorbHRVc0Mrblp5eXN0"
+        "a2RXVzdK"
+    )
+    iv = "ca6c3800c66deebc"
+    faskey = "205c091caa29eb5393173febfc660e60"
+
+    ctx = decrypt_fas_payload(fas_b64, iv, faskey)
+
+    assert ctx.clientip == "10.10.0.222"
+    assert ctx.clientmac == "aa:bb:db:36:03:d1"
+    assert ctx.gatewayaddress == "10.10.0.1:2050"
+    assert ctx.authdir == "opennds_auth"
+    assert ctx.clientif == "cafe-wifi-cli0"
     assert ctx.is_complete()
 
 

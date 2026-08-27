@@ -17,9 +17,15 @@ fas/opennds_proto.py — โปรโตคอลคุยกับ openNDS ท�
         http://<gatewayaddress>/<authdir>/?tok=<sha256(hid+faskey)>&redir=<originurl>
     เพื่อให้ openNDS อนุญาต MAC นั้นผ่าน nftables
 
-หมายเหตุความซื่อสัตย์ทางวิศวกรรม: โค้ดนี้เขียนตามเอกสาร/ซอร์สอ้างอิงของ openNDS
-แต่ *ยังไม่เคยทดสอบกับ openNDS binary จริงบนฮาร์ดแวร์* — ต้องยืนยันใน Phase 2
-บน Raspberry Pi จริงก่อนเชื่อว่าคุยกันได้ 100% (ดู PROJECT_PLAN.md §17)
+หมายเหตุความซื่อสัตย์ทางวิศวกรรม: ✅ ทดสอบกับ openNDS 10.1.3 binary จริงแล้วบน VM lab
+(2026-08-28) — login ผ่านครบวงจรจริง (decrypt → form → auth token → "state":"Authenticated")
+ระหว่างทางพบว่า reference PHP ของ openNDS เข้ารหัส 2 ชั้น (`base64_encode(openssl_encrypt(
+...,0,$iv))` — options=0 ทำให้ openssl_encrypt เองก็ base64-encode มาให้แล้วในตัว) ไม่ใช่
+ชั้นเดียวอย่างที่โค้ดนี้เข้าใจตอนแรก แก้แล้ว (ดู decrypt_fas_payload()/encrypt_fas_payload()
+และ tests/test_opennds_proto.py::test_decrypt_real_capture_from_live_opennds ที่ใช้
+payload จริงเป็น fixture) 🔶 ยังไม่เคยทดสอบบน Raspberry Pi จริง (แค่ VM) และยังไม่เคย
+ทดสอบกรณี login ผิด/หมดอายุ/ถูกระงับกับ openNDS จริง — ต้องยืนยันใน Phase 2 บนฮาร์ดแวร์จริง
+ก่อนเชื่อว่าคุยกันได้ 100% ในทุกกรณี (ดู PROJECT_PLAN.md §17)
 """
 from __future__ import annotations
 
@@ -102,13 +108,25 @@ def decrypt_fas_payload(fas_b64: str, iv: str, faskey: str) -> ClientContext:
         raise FasProtocolError("ขาดพารามิเตอร์ fas หรือ iv")
     key_bytes = _derive_key(faskey)
     iv_bytes = _coerce_iv(iv)
+    # *** พบจากทดสอบกับ openNDS binary จริงบน VM lab (2026-08-28) — เข้ารหัส 2 ชั้นจริง ***
+    # reference PHP ของ openNDS (src/http_microhttpd.c) เรียก
+    #   base64_encode( openssl_encrypt($string, $cipher, $key, 0, $iv) )
+    # ตัวเลข "0" คือ $options ที่ไม่ได้ตั้ง OPENSSL_RAW_DATA — PHP เอกสารระบุชัดว่าถ้าไม่ตั้ง
+    # flag นี้ ผลลัพธ์จาก openssl_encrypt() จะถูก base64 encode มาให้เองอยู่แล้วในตัว แล้วโค้ด
+    # ยัง base64_encode() ครอบซ้ำอีกชั้นด้านนอก -- แปลว่าพารามิเตอร์ `fas` ที่ได้จริงคือ
+    # base64(base64(ciphertext)) ไม่ใช่ base64(ciphertext) ชั้นเดียวอย่างที่โค้ดเดิมคิด
+    # (เทสต์เดิมผ่านเพราะ encrypt_fas_payload() ของเราเองก็ encode ชั้นเดียวเหมือนกัน เลย
+    # round-trip กับตัวเองได้ปกติ แต่ไม่ตรงกับ openNDS จริงเลย — ยืนยันด้วยการจับ query string
+    # จริงจาก openNDS แล้วลองถอดตรงๆ เจอ "Invalid padding bytes" ทุกครั้งจนกว่าจะ decode 2 รอบ)
     try:
-        ciphertext = base64.b64decode(fas_b64, validate=True)
+        outer = base64.b64decode(fas_b64, validate=True)
+        ciphertext = base64.b64decode(outer, validate=True)
     except Exception:
         # เผื่อ proxy/ตัวส่งบางตัวแปลง '+' เป็นช่องว่างตอน urlencode ไม่ครบ (พบได้จริงกับ
         # query string ที่ไม่ผ่าน percent-encoding อย่างเคร่งครัด) — ลองกู้คืนก่อนยอมแพ้
         try:
-            ciphertext = base64.b64decode(fas_b64.replace(" ", "+"), validate=True)
+            outer = base64.b64decode(fas_b64.replace(" ", "+"), validate=True)
+            ciphertext = base64.b64decode(outer, validate=True)
         except Exception as exc:
             raise FasProtocolError(f"base64 ของ fas ผิดรูปแบบ: {exc}") from exc
 
@@ -145,7 +163,10 @@ def encrypt_fas_payload(params: dict, faskey: str, iv: bytes | None = None) -> t
     padded = padder.update(plain) + padder.finalize()
     encryptor = Cipher(algorithms.AES(key_bytes), modes.CBC(iv)).encryptor()
     ciphertext = encryptor.update(padded) + encryptor.finalize()
-    return base64.b64encode(ciphertext).decode("ascii"), iv.decode("ascii")
+    # encode 2 ชั้นให้ตรงกับ openNDS จริง — ดูเหตุผลเต็มที่ decrypt_fas_payload() ด้านบน
+    outer = base64.b64encode(ciphertext)
+    double = base64.b64encode(outer)
+    return double.decode("ascii"), iv.decode("ascii")
 
 
 def auth_token(hid: str, faskey: str) -> str:
