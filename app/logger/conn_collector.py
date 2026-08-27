@@ -75,7 +75,17 @@ def parse_conntrack_line(line: str, now: float | None = None) -> ConnRecord | No
     body = _BRACKET_RE.sub(" ", line)
     tokens = body.split()
     proto = "other"
+    # *** แก้บั๊ก (พบจาก conntrack ตัวจริงบน VM lab, 2026-08-28) *** — เดิมเข้าใจว่า token
+    # ที่ไม่ใช่ตัวเลข/key=value ตัวแรกคือชื่อโปรโตคอล แต่ผลจริงจาก `conntrack -E -o
+    # timestamp,extended` ขึ้นต้นด้วย address family ("ipv4"/"ipv6") ก่อนเสมอ เช่น
+    # "ipv4     2 tcp      6 72 TIME_WAIT src=... dst=..." -- โค้ดเดิมเจอ "ipv4" เป็น
+    # token แรกที่เข้าเงื่อนไข แล้ว _proto_norm("ipv4") คืน "other" ทันทีแบบไม่ทันได้
+    # เห็น "tcp" ที่ตามมาเลย -- ผลคือ proto เป็น "other" 100% ของทุกแถวเสมอ (ยืนยันจาก
+    # conn_log จริงบน VM lab: 16/16 แถวเป็น "other" หมด ทั้งที่มี TCP/UDP จริงปนอยู่)
+    # ต้องข้าม "ipv4"/"ipv6" ไปก่อนถึงจะเจอ token ที่เป็นชื่อโปรโตคอลจริง
     for tok in tokens:
+        if tok.lower() in ("ipv4", "ipv6"):
+            continue
         if "=" not in tok and not tok.isdigit():
             proto = _proto_norm(tok)
             break

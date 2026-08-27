@@ -11,15 +11,30 @@ from logger.integrity import (MemoryManifestStore, sha256_file, seal_directory,
 from logger.netutil import MacCache, resolve_mac
 
 # ---------------------------------------------------------------- conntrack
-NEW_LINE = ("[1692702000.1] [NEW] tcp 6 120 SYN_SENT src=10.10.0.105 dst=93.184.216.34 "
+# หมายเหตุ (แก้บั๊ก 2026-08-28): ตัวอย่างเหล่านี้เคยไม่มี "ipv4     2 " นำหน้าชื่อโปรโตคอล
+# ซึ่งไม่ตรงกับ `conntrack -E -o timestamp,extended` ตัวจริงเลย (มี address family ขึ้นก่อน
+# ชื่อโปรโตคอลเสมอ) ทำให้เทสต์ผ่านหมดทั้งที่โค้ดจริงตีความ proto ผิด 100% เวลาเจอ conntrack
+# จริง (ยืนยันจาก VM lab: conn_log ทุกแถวเป็น "other" หมด) แก้ตัวอย่างให้ตรงกับที่ conntrack
+# จริงส่งมาแล้ว (ดู test_destroy_event_from_live_conntrack ด้านล่างที่ใช้บรรทัดจริงที่จับได้)
+NEW_LINE = ("[1692702000.1] [NEW] ipv4     2 tcp      6 120 SYN_SENT "
+           "src=10.10.0.105 dst=93.184.216.34 "
            "sport=51322 dport=443 [UNREPLIED] src=93.184.216.34 dst=10.10.0.105 "
            "sport=443 dport=51322")
-DESTROY_TCP = ("[1692702005.9] [DESTROY] tcp 6 src=10.10.0.105 dst=93.184.216.34 "
+DESTROY_TCP = ("[1692702005.9] [DESTROY] ipv4     2 tcp      6 TIME_WAIT "
+              "src=10.10.0.105 dst=93.184.216.34 "
               "sport=51322 dport=443 packets=12 bytes=1400 src=93.184.216.34 "
               "dst=10.10.0.105 sport=443 dport=51322 packets=9 bytes=8200 [ASSURED]")
-DESTROY_UDP = ("[1692702010.0] [DESTROY] udp 17 src=10.10.0.108 dst=8.8.8.8 "
+DESTROY_UDP = ("[1692702010.0] [DESTROY] ipv4     2 udp      17 "
+              "src=10.10.0.108 dst=8.8.8.8 "
               "sport=54000 dport=53 packets=1 bytes=60 src=8.8.8.8 dst=10.10.0.108 "
               "sport=53 dport=54000 packets=1 bytes=120")
+# บรรทัดจริง 100% ที่จับได้จาก `conntrack -E -o timestamp,extended -e DESTROY` บน VM lab
+# (2026-08-28) ตอนที่มี client จริง (macvlan+netns จำลอง) กำลังคุยผ่าน openNDS จริงอยู่
+DESTROY_TCP_REAL_CAPTURE = (
+    "[1787853886.670856]\t[DESTROY] ipv4     2 tcp      6 TIME_WAIT "
+    "src=10.10.0.222 dst=34.223.124.45 sport=44256 dport=80 "
+    "src=10.10.0.1 dst=10.10.0.222 sport=2050 dport=44256 [ASSURED]"
+)
 
 
 def test_new_event_is_ignored():
@@ -50,9 +65,24 @@ def test_garbage_and_empty_lines_ignored():
 
 
 def test_bytes_default_to_zero_without_extended_accounting():
-    line = "[1.0] [DESTROY] tcp 6 src=1.2.3.4 dst=5.6.7.8 sport=1 dport=2"
+    line = "[1.0] [DESTROY] ipv4     2 tcp      6 src=1.2.3.4 dst=5.6.7.8 sport=1 dport=2"
     r = parse_conntrack_line(line)
     assert r.bytes_out == 0 and r.bytes_in == 0
+
+
+def test_destroy_event_from_live_conntrack():
+    """
+    Regression test — กันบั๊ก "ipv4 prefix ทำให้ proto เป็น other เสมอ" กลับมาแบบเงียบๆ อีก
+    (2026-08-28) โค้ดเดิมเข้าใจว่า token แรกที่ไม่ใช่ตัวเลข/key=value คือชื่อโปรโตคอล แต่
+    conntrack ตัวจริงขึ้นต้นด้วย address family ("ipv4"/"ipv6") ก่อนชื่อโปรโตคอลเสมอ ทำให้
+    ทุกแถวถูกจัดเป็น "other" หมด 100% ทั้งที่มี TCP/UDP จริงปนอยู่ (ยืนยันจาก conn_log จริง
+    บน VM lab ก่อนแก้: 16/16 แถวเป็น "other") บรรทัดด้านล่างจับมาจาก conntrack ตัวจริง
+    ห้ามแก้เป็นค่าที่สร้างเอง
+    """
+    r = parse_conntrack_line(DESTROY_TCP_REAL_CAPTURE)
+    assert r.proto == "tcp", "ต้องอ่าน 'tcp' ที่อยู่หลัง 'ipv4     2' ได้ ไม่ใช่ตีความ 'ipv4' เป็นโปรโตคอล"
+    assert r.src_ip == "10.10.0.222" and r.dst_ip == "34.223.124.45"
+    assert r.src_port == 44256 and r.dst_port == 80
 
 
 # ---------------------------------------------------------------- dnsmasq

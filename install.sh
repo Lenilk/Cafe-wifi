@@ -1074,6 +1074,43 @@ NFT
   run_sh "nft -f /etc/nftables.conf"
   svc enable nftables
   ok "nftables โหลดแล้ว (NAT + client isolation + DNS redirect, อิงตาม subnet)"
+
+  # *** แก้บั๊ก (พบจาก VM lab 2026-08-28) *** conn_collector.py เขียน docstring ไว้เองว่า
+  # ต้อง `sysctl -w net.netfilter.nf_conntrack_acct=1` ก่อนถึงจะได้ตัวเลข bytes จาก
+  # conntrack แต่ install.sh ไม่เคยตั้งค่านี้ให้เลยจริงๆ สักจุด -- ผลคือ bytes_out/bytes_in
+  # ใน conn_log เป็น 0 เสมอ (ยืนยันจาก conntrack -L จริงบน VM lab: ไม่มี packets=/bytes=
+  # โผล่มาเลยสักแถว) ซึ่งทำให้ quota_mb (mark_used_up_vouchers() ที่รวมยอด bytes จาก
+  # conn_log) ไม่มีทางตัดสิทธิ์ลูกค้าได้จริงเลยไม่ว่าลูกค้าจะโหลดไปเท่าไหร่ก็ตาม -- ต้อง
+  # ทำหลัง nftables โหลดเสร็จเท่านั้น เพราะ net.netfilter.nf_conntrack_acct เป็น sysctl key
+  # ที่ถูกสร้างแบบ dynamic ตอนโมดูล nf_conntrack ถูกโหลดเข้าเคอร์เนล (ปกติจะโหลดตอนกฎ
+  # `ct state ...` ใน nftables.conf ถูก apply) ถ้าตั้งก่อนหน้านั้น (เช่นรวมไปกับ sysctl.d
+  # ตัวอื่นตอนต้นฟังก์ชัน) จะไม่มี key นี้ให้ตั้งเลย เงียบๆ ไม่มี error ให้เห็นด้วย (--quiet)
+  run_sh "modprobe nf_conntrack 2>/dev/null || true"
+  run_sh "sysctl -w net.netfilter.nf_conntrack_acct=1 >/dev/null 2>&1 || warn \"ตั้ง nf_conntrack_acct ไม่สำเร็จ — bytes ใน conn_log จะเป็น 0 เสมอ, quota_mb จะไม่ตัดสิทธิ์ลูกค้าได้จริง\""
+
+  # ตั้งค่านี้ตอน install อย่างเดียวไม่พอ -- ต้องทำซ้ำทุกครั้งที่บูตด้วย เพราะ
+  # net.netfilter.nf_conntrack_acct เป็น sysctl key แบบ dynamic ที่มีก็ต่อเมื่อโมดูล
+  # nf_conntrack ถูกโหลดแล้วเท่านั้น (โหลดตอน nftables.service เริ่มทำงาน ซึ่งเกิดขึ้น
+  # หลังจาก /etc/sysctl.d/*.conf ถูก apply โดย systemd-sysctl.service ไปแล้วเสมอทุกบูต
+  # ทำให้ค่าที่ตั้งไว้ใน sysctl.d เฉยๆ ไม่มีทางมีผลจริงตั้งแต่บูตครั้งที่สองเป็นต้นไป)
+  write_file "/etc/systemd/system/${APP_NAME}-conntrack-acct.service" 0644 <<CTACCT
+[Unit]
+Description=${APP_NAME} — enable nf_conntrack byte accounting (must run after nftables loads nf_conntrack)
+After=nftables.service
+Requires=nftables.service
+Before=cafe-logger.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'modprobe nf_conntrack 2>/dev/null; sysctl -w net.netfilter.nf_conntrack_acct=1'
+
+[Install]
+WantedBy=multi-user.target
+CTACCT
+  run_sh "systemctl daemon-reload"
+  svc enable "${APP_NAME}-conntrack-acct"
+  ok "ตั้ง nf_conntrack_acct=1 ให้เอง (ทั้งตอนนี้และทุกครั้งที่บูต) — ไม่งั้น bytes ใน conn_log จะเป็น 0 เสมอ"
   return 0
 }
 
@@ -1250,7 +1287,8 @@ UNIT
   write_file /etc/systemd/system/cafe-logger.service 0644 <<UNIT
 [Unit]
 Description=Cafe WiFi connection/DNS log collector
-After=network-online.target mariadb.service dnsmasq.service
+After=network-online.target mariadb.service dnsmasq.service cafe-wifi-conntrack-acct.service
+Wants=cafe-wifi-conntrack-acct.service
 
 [Service]
 Type=simple
