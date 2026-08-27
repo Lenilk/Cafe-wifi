@@ -20,6 +20,14 @@ conn_log/dns_log เลย** (Pi ไม่ได้อยู่บนเส้�
 (5 นาที) เพราะ ARP cache ของเคอร์เนลหมดอายุเร็ว (โดยทั่วไป ~60-300 วินาทีขึ้นกับระบบ) การเช็คแบบ
 สุ่มตัวอย่างเป็นช่วง ๆ (polling) แบบนี้**มีโอกาสพลาดอุปกรณ์ที่เชื่อมต่อสั้นมาก**ระหว่างรอบตรวจ —
 เป็นข้อจำกัดของวิธีนี้ที่ต้องบันทึกไว้ตรง ๆ เช่นกัน ไม่ใช่การเฝ้าแบบ real-time
+
+**ข้อจำกัดร้ายแรงที่พบจาก VM lab (2026-08-28) — แก้แล้ว**: เดิม `run()` อ่าน `/proc/net/arp`
+แบบ passive ล้วน ๆ ซึ่งเก็บเฉพาะ IP ที่ **Pi เอง** เคยคุยด้วยตรง ๆ เท่านั้น — อุปกรณ์ bypass ที่
+คุยแต่กับเราเตอร์อย่างเดียว (พฤติกรรมทั่วไปของการ bypass จริงตามที่ §3.1.4 อธิบาย) จะไม่มี
+ARP entry ให้ Pi เห็นเลย ต่อให้ bypass สำเร็จอยู่จริงก็ตาม (ยืนยันจากการทดสอบจริง: จำลอง
+อุปกรณ์ bypass ที่ ping ผ่านเราเตอร์ได้จริง แต่ ARP cache ของ Pi ไม่มีแถวนั้นเลย) แก้ด้วย
+`netutil.active_arp_refresh()` — ยิง ping แบบขนานทุก host ในวงก่อนอ่าน ARP cache ทุกครั้ง
+บังคับให้เคอร์เนลต้องทำ ARP resolution กับทุกอุปกรณ์ที่ออนไลน์อยู่จริงก่อนเสมอ
 """
 from __future__ import annotations
 
@@ -66,7 +74,7 @@ def run(uplink_network: str | None = None, known_ips: set[str] | None = None,
     (ตามแบบ tools/check_disk.py::run() ที่ loop เขียน audit ทีละรายการต่อความผิดปกติ 1 ครั้ง)"""
     from common import audit
     from common.db import execute as db_execute
-    from logger.netutil import read_arp_table
+    from logger.netutil import active_arp_refresh, read_arp_table
 
     uplink_network = uplink_network or os.environ.get("UPLINK_NETWORK", "")
     if not uplink_network:
@@ -77,6 +85,10 @@ def run(uplink_network: str | None = None, known_ips: set[str] | None = None,
     if known_ips is None:
         known_ips = {ip for ip in (os.environ.get("UPLINK_IP"), os.environ.get("UPLINK_GW")) if ip}
 
+    # *** สำคัญ (แก้ข้อจำกัดที่พบจาก VM lab 2026-08-28) *** — ต้อง active-scan ก่อนอ่าน ARP
+    # cache เสมอ ไม่งั้นจะพลาดอุปกรณ์ bypass ที่คุยแต่กับเราเตอร์อย่างเดียว (Pi ไม่เคยคุยด้วย
+    # โดยตรงเลย เคอร์เนลเลยไม่มี ARP entry ให้อ่าน) ดู docstring ของ active_arp_refresh()
+    active_arp_refresh(uplink_network)
     arp_table = read_arp_table(arp_path)
     events = find_bypass_devices(arp_table, uplink_network, known_ips)
 

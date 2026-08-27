@@ -1,8 +1,12 @@
 """logger/netutil.py — เครื่องมือช่วยเล็ก ๆ ที่ใช้ร่วมกันในตัวเก็บ log"""
 from __future__ import annotations
 
+import ipaddress
+import logging
 import re
 from pathlib import Path
+
+log = logging.getLogger("cafe-wifi.netutil")
 
 _ARP_LINE = re.compile(
     r"^(?P<ip>\d{1,3}(?:\.\d{1,3}){3})\s+\S+\s+\S+\s+(?P<mac>[0-9a-fA-F:]{17})\s"
@@ -43,6 +47,58 @@ def read_arp_table(arp_path: str | Path = "/proc/net/arp") -> dict[str, str]:
     หา IP/MAC แปลกปลอมที่ไม่ใช่ Pi/เราเตอร์) ถ้า IP เดียวกันมีหลายแถว (ไม่ควรเกิดจริงในทางปฏิบัติ)
     จะเหลือแค่แถวสุดท้ายที่อ่านเจอ"""
     return dict(_iter_arp_entries(arp_path))
+
+
+def active_arp_refresh(network: str, timeout: float = 1.0) -> None:
+    """
+    *** เพิ่มหลังพบข้อจำกัดร้ายแรงของ T17 จาก VM lab (2026-08-28) ***
+
+    ARP cache ของเคอร์เนล (/proc/net/arp) เก็บเฉพาะ IP ที่ **ตัว Pi เอง** เคยคุยด้วยโดยตรง
+    เท่านั้น -- ถ้าอุปกรณ์ bypass คุยแต่กับเราเตอร์อย่างเดียว (ซึ่งเป็นพฤติกรรมปกติของการ
+    bypass จริงตามที่ §3.1.4 อธิบายไว้ Pi ไม่ได้อยู่บนเส้นทางบังคับ) Pi จะ**ไม่มีทางเห็น
+    ARP entry ของอุปกรณ์นั้นเลย** ต่อให้อุปกรณ์นั้นออนไลน์อยู่จริงและ bypass สำเร็จอยู่ก็ตาม
+    ยืนยันจากการทดสอบจริงบน VM lab: จำลองอุปกรณ์ bypass ที่ ping ผ่านเราเตอร์ได้จริง แต่
+    `/proc/net/arp` ของ Pi ไม่มีแถวของมันเลยแม้แต่แถวเดียว -- bypass_detector.py เดิม
+    (อ่าน ARP cache แบบ passive ล้วน ๆ) จะ**ตรวจจับไม่ได้เลย**ในสถานการณ์แบบนี้ ซึ่งเป็น
+    สถานการณ์หลักที่ T17 ควรจะตรวจจับได้ด้วยซ้ำ
+
+    ฟังก์ชันนี้บังคับให้ Pi ยิง ARP request ไปหาทุก IP ในวงก่อนอ่าน ARP cache จริง (ping
+    แบบขนานทุก host ในวง ใช้ ping เองเพราะมีติดมากับทุก distro อยู่แล้วไม่ต้องเพิ่ม
+    package ใหม่ -- ไม่สนใจว่า ping จะได้รับ reply กลับมาไหม สนใจแค่ว่า ARP request/reply
+    เกิดขึ้นแล้วเคอร์เนลบันทึกไว้ใน cache) ยิงพร้อมกันทั้งวงไม่ใช่ทีละตัว เพราะรอบละ 1 นาที
+    (cafe-bypass-detect.timer) ไม่พอให้ยิงทีละตัวได้ครบ /24 ทัน
+
+    🔶 หมายเหตุการทดสอบบน VM lab (2026-08-28): ยืนยันว่า active scan บังคับให้เกิด ARP
+    resolution กับอุปกรณ์ภายนอกจริงได้สำเร็จ (เจอ host adapter ของเครื่อง Windows และ
+    อุปกรณ์อื่นบนวงเดียวกันที่ไม่เคยอยู่ใน ARP cache มาก่อนหน้านี้เลย) แต่**ทดสอบกับอุปกรณ์
+    bypass ที่จำลองด้วย macvlan บนเครื่องเดียวกับ Pi เองไม่ได้จริง** เพราะ Linux macvlan
+    (โหมด bridge) มีข้อจำกัดที่รู้กันอยู่แล้วว่า parent namespace คุยกับ macvlan child ของ
+    ตัวเองโดยตรงไม่ได้ทั้งสองทิศทาง (ตรงกับที่ PROJECT_PLAN.md §3.1.6 เตือนไว้ล่วงหน้าแล้ว)
+    — เป็นข้อจำกัดของ "วิธีจำลอง" ใน VM lab เท่านั้น ไม่ใช่ข้อจำกัดของโค้ดนี้หรือฮาร์ดแวร์จริง
+    (Raspberry Pi ที่ต่อกับอุปกรณ์ bypass จริงแยกเครื่องกันทางกายภาพจะไม่เจอข้อจำกัดนี้เลย)
+    **T17 เต็มรูปแบบ ("bypass 20 ครั้ง ตรวจจับได้กี่ %") ยังต้องรอทดสอบบน Pi จริงกับอุปกรณ์
+    แยกเครื่องจริงถึงจะได้ตัวเลขที่เชื่อถือได้**
+    """
+    import subprocess
+
+    net = ipaddress.ip_network(network, strict=False)
+    procs = []
+    for host in net.hosts():
+        try:
+            p = subprocess.Popen(
+                ["ping", "-c", "1", "-W", "1", str(host)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            procs.append(p)
+        except OSError:
+            log.warning("ยิง ping ไป %s ไม่สำเร็จ (ไม่มีคำสั่ง ping?) — ข้าม active ARP refresh", host)
+            return
+    deadline = timeout + 1.0
+    for p in procs:
+        try:
+            p.wait(timeout=max(0.05, deadline))
+        except subprocess.TimeoutExpired:
+            p.kill()
 
 
 class MacCache:
