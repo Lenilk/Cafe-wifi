@@ -27,6 +27,9 @@ readonly ETC_DIR="/etc/${APP_NAME}"
 readonly OPT_DIR="/opt/${APP_NAME}"
 readonly LOG_DIR="/var/log/${APP_NAME}"
 readonly BACKUP_DIR="/var/backups/${APP_NAME}"  # แก้บั๊ก H4 (เดิมไม่มี backup DB เลยในระบบ)
+# macvlan ฝั่งลูกค้า ซ้อนบน $NIC -- ดูเหตุผลเต็มๆ ที่ configure_network() (R11/§3.1.6 Plan B
+# ที่พิสูจน์แล้วจาก VM lab ว่าเป็นทางเดียวที่ openNDS ยอมทำงานบนโหมดสายเดียว)
+readonly CLI_IFACE="${APP_NAME}-cli0"
 readonly VENV_DIR="${OPT_DIR}/venv"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
@@ -243,6 +246,16 @@ pkg_map() {
     microhttpd:zypper)             echo "libmicrohttpd-devel" ;;
     microhttpd:apk)                echo "libmicrohttpd-dev" ;;
 
+    # ทดสอบบน VM lab (2026-08-27) พบว่า openNDS exit ทันทีตอนสตาร์ทถ้า fas_secure_enabled
+    # ตั้งแต่ระดับ 2 ขึ้นไปแล้วไม่มี php-cli + module openssl ของ php (มันเข้ารหัส query
+    # string เองฝั่ง openNDS ก่อนส่งไป FAS แม้ FAS จะเป็น Flask ของเราเองก็ตาม ไม่ใช่แค่
+    # ตัวอย่างสคริปต์ FAS ที่แถมมาเฉยๆ) -- php-cli บน Debian มี ext-openssl ติดมาให้แล้วในตัว
+    php:apt)                echo "php-cli" ;;
+    php:dnf|php:yum)        echo "php-cli php-openssl" ;;
+    php:pacman)             echo "php" ;;
+    php:zypper)             echo "php-cli" ;;
+    php:apk)                echo "php-cli php-openssl" ;;
+
     conntrack:apt)                echo "conntrack" ;;
     conntrack:dnf|conntrack:yum)  echo "conntrack-tools" ;;
     conntrack:pacman)             echo "conntrack-tools" ;;
@@ -368,7 +381,13 @@ preflight() {
     ok "พื้นที่ว่าง ${free_mb} MB"
   fi
 
-  if curl -fsS --max-time 8 -o /dev/null https://pypi.org 2>/dev/null; then
+  # แก้บั๊ก (พบจากรัน dry-run เต็มรูปแบบบน Debian netinst จริง): เครื่องขั้นต่ำที่เพิ่ง
+  # bootstrap ยังไม่มี curl ติดตั้งมาแต่แรก (จะเพิ่งถูกติดตั้งทีหลังใน install_packages())
+  # เหมือนกรณี ip/ss (M4) -- ถ้าไม่มี curl ให้ข้ามการเช็คแทนที่จะรายงาน false-negative ว่า
+  # "อินเทอร์เน็ตไม่ผ่าน" ทั้งที่จริงแล้วแค่ยังไม่มีเครื่องมือเช็คต่างหาก
+  if ! command -v curl >/dev/null 2>&1; then
+    info "ยังไม่มี curl ให้ตรวจอินเทอร์เน็ต — ข้ามไปก่อน (จะติดตั้งแพ็กเกจแล้วค่อยเจอปัญหาเน็ตตรงนั้นแทนถ้ามี)"
+  elif curl -fsS --max-time 8 -o /dev/null https://pypi.org 2>/dev/null; then
     ok "เชื่อมต่ออินเทอร์เน็ตได้"
   else
     warn "ตรวจอินเทอร์เน็ตไม่ผ่าน — การติดตั้งแพ็กเกจอาจล้มเหลว"
@@ -563,7 +582,7 @@ install_packages() {
   pkg_refresh
   local pkgs=(python buildtools git curl openssl mariadb nginx chrony iproute)
   (( SKIP_NETWORK )) || pkgs+=(dnsmasq nftables conntrack tcpdump)
-  (( SKIP_OPENNDS )) || pkgs+=(microhttpd)
+  (( SKIP_OPENNDS )) || pkgs+=(microhttpd php)
   pkg_install "${pkgs[@]}"
   ok "ติดตั้งแพ็กเกจเสร็จ"
 }
@@ -840,19 +859,31 @@ SYSCTL
   # คุมด้วย nftables (ip saddr/daddr ตาม subnet) แทนอยู่แล้ว ไม่ได้พึ่ง rp_filter
   run sysctl -q --system
 
-  # ---------- IP บนอินเทอร์เฟซเดียว: uplink (ต่อเราเตอร์) เป็น primary, client เป็น secondary
+  # ---------- IP บนอินเทอร์เฟซเดียว: uplink (ต่อเราเตอร์) อยู่บน ${NIC} ตรงๆ
   # ***ห้ามใช้ `ip addr replace` กับ uplink เด็ดขาด — ถ้าผู้ติดตั้งกำลัง SSH ผ่าน IP นี้อยู่
   # จะทำให้หลุดการเชื่อมต่อทันที (ดู PROJECT_PLAN.md §3.1.7)*** ใช้ `ip addr add` แบบ
   # idempotent (เพิกเฉยถ้ามี IP นี้อยู่แล้ว) แทน
   run_sh "ip addr add '${UPLINK_CIDR}' dev '${NIC}' 2>/dev/null || true"
-  run_sh "ip addr add '${CLIENT_CIDR}' dev '${NIC}' 2>/dev/null || true"
   run_sh "ip link set '${NIC}' up 2>/dev/null || true"
   run_sh "ip route replace default via '${UPLINK_GW}' dev '${NIC}' 2>/dev/null || true"
 
+  # *** Plan B ของ R11 (§3.1.6) — ตอนนี้ยืนยันแล้วว่าเป็น**ทางเดียวที่ใช้งานได้จริง** ***
+  # ทดสอบบน VM lab (2026-08-27) พบว่า openNDS 10.1.3 ปฏิเสธ interface ที่มี IP มากกว่า 1
+  # ตัวแบบ hard-code ไม่มี config เลี่ยงได้ (ดู check_gw_ip() ใน libopennds.sh -- error
+  # "IP address aliasing forbidden. Configure a VLAN instead.") แปลว่าเอา CLIENT_CIDR
+  # ไปแปะบน ${NIC} ตรงๆ (แบบที่แผนเดิมตั้งใจไว้) ใช้กับ openNDS ไม่ได้เลย -- ต้องสร้าง
+  # macvlan ซ้อนแยกออกมาให้ openNDS เห็นเป็นอินเทอร์เฟซคนละตัวกับ uplink เสมอ ถึงจะใช้สาย
+  # กายภาพเส้นเดียวได้จริงตามเจตนาของ D17
+  run_sh "ip link add '${CLI_IFACE}' link '${NIC}' type macvlan mode bridge 2>/dev/null || true"
+  run_sh "ip addr add '${CLIENT_CIDR}' dev '${CLI_IFACE}' 2>/dev/null || true"
+  run_sh "ip link set '${CLI_IFACE}' up 2>/dev/null || true"
+
   if command -v nmcli >/dev/null 2>&1; then
-    info "พบ NetworkManager — ตั้ง connection ถาวรให้ ${NIC} (2 IP บนอินเทอร์เฟซเดียว)"
+    info "พบ NetworkManager — ตั้ง connection ถาวรให้ ${NIC} (uplink) และ ${CLI_IFACE} (macvlan ฝั่งลูกค้า)"
     run_sh "nmcli con delete '${APP_NAME}-nic' >/dev/null 2>&1 || true"
-    run_sh "nmcli con add type ethernet ifname '${NIC}' con-name '${APP_NAME}-nic' ipv4.method manual ipv4.addresses '${UPLINK_CIDR} ${CLIENT_CIDR}' ipv4.gateway '${UPLINK_GW}' ipv6.method disabled autoconnect yes >/dev/null 2>&1 || true"
+    run_sh "nmcli con add type ethernet ifname '${NIC}' con-name '${APP_NAME}-nic' ipv4.method manual ipv4.addresses '${UPLINK_CIDR}' ipv4.gateway '${UPLINK_GW}' ipv6.method disabled autoconnect yes >/dev/null 2>&1 || true"
+    run_sh "nmcli con delete '${APP_NAME}-cli' >/dev/null 2>&1 || true"
+    run_sh "nmcli con add type macvlan dev '${NIC}' mode bridge ifname '${CLI_IFACE}' con-name '${APP_NAME}-cli' ipv4.method manual ipv4.addresses '${CLIENT_CIDR}' ipv6.method disabled autoconnect yes >/dev/null 2>&1 || true"
   elif [[ -d /etc/systemd/network ]]; then
     write_file "/etc/systemd/network/20-${APP_NAME}-nic.network" 0644 <<NETD
 [Match]
@@ -860,10 +891,24 @@ Name=${NIC}
 
 [Network]
 Address=${UPLINK_CIDR}
-Address=${CLIENT_CIDR}
 Gateway=${UPLINK_GW}
 IPForward=yes
 NETD
+    write_file "/etc/systemd/network/21-${APP_NAME}-cli0.netdev" 0644 <<NETDEV
+[NetDev]
+Name=${CLI_IFACE}
+Kind=macvlan
+
+[MACVLAN]
+Mode=bridge
+NETDEV
+    write_file "/etc/systemd/network/21-${APP_NAME}-cli0.network" 0644 <<CLINET
+[Match]
+Name=${CLI_IFACE}
+
+[Network]
+Address=${CLIENT_CIDR}
+CLINET
   else
     warn "ไม่พบ NetworkManager/systemd-networkd — IP จะหายเมื่อรีบูต ให้ตั้งถาวรเองตาม distro"
   fi
@@ -871,8 +916,10 @@ NETD
   # ---------- dnsmasq (ให้บริการ DHCP/DNS เฉพาะฝั่งลูกค้าเท่านั้น ผ่าน listen-address) ----------
   write_file "/etc/dnsmasq.d/${APP_NAME}.conf" 0644 <<DNSMASQ
 # managed by ${APP_NAME} installer -- DHCP + DNS + query logging
-# โหมดสาย LAN เส้นเดียว: อินเทอร์เฟซเดียวกับ uplink แต่ผูก DHCP/DNS ไว้ที่ IP ฝั่งลูกค้าเท่านั้น
-interface=${NIC}
+# โหมดสาย LAN เส้นเดียว: ผูกกับ ${CLI_IFACE} (macvlan ฝั่งลูกค้า) ไม่ใช่ ${NIC} เอง -- ต้อง
+# ให้ตรงกับอินเทอร์เฟซจริงที่รับ broadcast (DHCP) ของลูกค้า ไม่งั้น DHCP จะไม่ทำงาน แม้ DNS
+# จะยังพอผ่านได้เพราะ listen-address ผูก IP ตรงๆ (ทดสอบยืนยันบน VM lab แล้วว่าต้องเป็นแบบนี้)
+interface=${CLI_IFACE}
 bind-interfaces
 except-interface=lo
 listen-address=${client_ip}
@@ -1008,8 +1055,18 @@ build_opennds() {
   if (( SKIP_OPENNDS )) || (( SKIP_NETWORK )); then info "ข้าม openNDS"; return 0; fi
   step "ติดตั้ง openNDS (captive portal engine)"
 
-  if command -v opennds >/dev/null 2>&1; then
-    info "พบ openNDS ติดตั้งอยู่แล้ว"
+  # แก้บั๊ก (พบจากรัน uninstall แล้ว reinstall ซ้ำบน VM lab 2026-08-27): เดิมเช็คแค่ว่ามี
+  # binary opennds อยู่แล้วหรือยัง ถ้ามีก็ข้าม clone+build+`make install` ทั้งดุ้น -- แต่
+  # `make install` เป็นตัวที่ copy resources/opennds.service ไปที่ /etc/systemd/system/ ด้วย
+  # (ไม่ใช่แค่ binary) ถ้า unit ไฟล์นี้หายไป (เช่นจาก `--uninstall` รอบก่อน) ทั้งที่ binary
+  # ยังอยู่ จะกลายเป็น "systemctl enable opennds" หา unit ไม่เจอเงียบๆ แล้ว service ไม่ขึ้น
+  # เลยแม้ install.sh จะรายงานว่าเสร็จสมบูรณ์ก็ตาม -- ต้องเช็ค unit file ควบคู่ไปด้วยเสมอ
+  if command -v opennds >/dev/null 2>&1 && [[ -f /etc/systemd/system/opennds.service ]]; then
+    info "พบ openNDS ติดตั้งอยู่แล้ว (พร้อม systemd unit)"
+  elif command -v opennds >/dev/null 2>&1 && [[ -f /usr/local/src/opennds/resources/opennds.service ]]; then
+    info "พบ openNDS ติดตั้งอยู่แล้วแต่ systemd unit หาย — คัดลอกกลับจาก source cache เดิม"
+    run_sh "install -d -m 0755 /etc/systemd/system"
+    run_sh "cp /usr/local/src/opennds/resources/opennds.service /etc/systemd/system/opennds.service"
   else
     local src="/usr/local/src/opennds"
     run_sh "rm -rf '${src}'"
@@ -1042,48 +1099,61 @@ build_opennds() {
     faskey="$(grep -E '^FAS_KEY=' "${ETC_DIR}/secrets.env" | cut -d= -f2-)"
   fi
 
-  # โหมดสาย LAN เส้นเดียว (D17): eth0 เดียวมี 2 IP -- ต้องระบุ GatewayAddress ให้ชัด
-  # ไม่งั้น openNDS อาจหยิบ IP ผิดตัว (เอา uplink ip แทนที่จะเป็น client ip) เพราะมีมากกว่า
-  # 1 IP บนอินเทอร์เฟซเดียวกัน (§3.1.6 ข้อ 9) -- 🔶 ยังไม่เคยทดสอบกับ hardware จริงว่า
-  # openNDS ทำงานถูกต้องบนโหมดนี้หรือไม่ (R11 ความเสี่ยงอันดับ 1) ถ้าไม่ได้ ให้ลอง Plan B
-  # (macvlan ซ้อนบน ${NIC}) ตามที่บันทึกไว้ใน PROJECT_PLAN.md §3.1.6
-  local client_ip_nds="${CLIENT_CIDR%%/*}"
-  # mode 0640 root:root (แก้บั๊ก H1: เดิม 0644 = ทุกคนบนเครื่องอ่าน FaskeyOverride ได้ตรง ๆ
-  # ทั้งที่กุญแจตัวเดียวกันถูกป้องกันไว้อย่างดีที่ secrets.env อยู่แล้ว -- openNDS รันเป็น
-  # root เองอยู่แล้วจึงยังอ่านไฟล์นี้ได้ปกติ ไม่กระทบการทำงาน)
-  write_file /etc/opennds/opennds.conf 0640 <<NDS
-# managed by ${APP_NAME} installer
-GatewayInterface ${NIC}
-GatewayAddress ${client_ip_nds}
-GatewayName '${GATEWAY_NAME}'
-GatewayPort ${NDS_PORT}
+  # โหมดสาย LAN เส้นเดียว (D17): eth0 เดียวมี 2 IP -- GatewayAddress ไม่ต้องตั้งเอง openNDS
+  # จะอ่าน IP จริงของ GatewayInterface ให้เองเสมอ (ดู get_iface_ip ใน src/conf.c)
+  #
+  # *** บั๊กใหญ่ที่พบจากการรัน install.sh จริงครั้งแรกบน VM lab (2026-08-27, ปิด R11/A1) ***
+  # เดิมสคริปต์นี้เขียน config แบบ flat text (NoDogSplash-style) ไปที่ /etc/opennds/opennds.conf
+  # แต่ openNDS รุ่นนี้ (10.1.3) **ไม่เคยอ่านไฟล์นั้นเลยแม้แต่บรรทัดเดียว** -- ทุก option
+  # (รวม debuglevel) โหลดผ่าน get_option_from_config() ใน src/util.c ซึ่ง shell out ไปเรียก
+  # /usr/lib/opennds/libopennds.sh เสมอ และสคริปต์นั้น "ไม่มี uci บน Debian" เลยอ่านจาก
+  # /etc/config/opennds (รูปแบบ UCI ของ OpenWrt) แทน -- ผลคือค่าที่เราตั้งไว้ทั้งหมดถูกเมิน
+  # เงียบๆ ทุกตัว แล้ว openNDS ใช้ค่า default ที่ compile ไว้แทนหมด (เช่น GatewayInterface
+  # กลายเป็น "br-lan" ที่ hardcode ไว้ใน src/conf.h ทำให้ bind อินเทอร์เฟซผิดตัวแล้ว exit
+  # ทันที -- เป็นสาเหตุที่แท้จริงของทั้งปัญหา "openNDS ทำงานบนอินเทอร์เฟซเดียวไม่ได้" ที่
+  # กลัวกันไว้ใน R11 -- ทางแก้คือเขียนเป็น UCI format ไปที่ /etc/config/opennds ตรงๆ แทน
+  # (parser ของ libopennds.sh อ่านแบบ plain grep/awk จากไฟล์นี้ได้โดยไม่ต้องมี uci บินารีจริง
+  # ก็ได้ -- ดู get_option_from_config()/get_list_from_config() ใน libopennds.sh)
+  # mode 0640 root:root (แก้บั๊ก H1: ป้องกันไม่ให้ทุกคนบนเครื่องอ่าน faskey ตรงๆ ได้)
+  write_file /etc/config/opennds 0640 <<NDS
+config opennds
+	option enabled '1'
+	option debuglevel '1'
+	# ต้องเป็น macvlan (${CLI_IFACE}) ไม่ใช่ ${NIC} ตรงๆ -- openNDS ปฏิเสธอินเทอร์เฟซที่มี
+	# IP มากกว่า 1 ตัว ("IP address aliasing forbidden") ดู configure_network() สำหรับที่มา
+	option gatewayinterface '${CLI_IFACE}'
+	option gatewayname '${GATEWAY_NAME}'
+	option gatewayport '${NDS_PORT}'
+	# แก้บั๊กเทียบเวอร์ชันของ openNDS เอง (src/main.c): logic "else if (minor < MIN_MHD_MINOR)"
+	# ไม่เช็คว่า major version สูงกว่าแล้วหรือยัง ทำให้ libmicrohttpd 1.x (Debian/Ubuntu ปัจจุบัน
+	# แจกมาให้เป็นค่าเริ่มต้น) ถูกเข้าใจผิดว่า "เก่ากว่า 0.9.71" ทั้งที่จริงใหม่กว่ามาก -- ยืนยัน
+	# จาก VM lab ว่าใช้ 1.0.1 ได้จริงไม่มีปัญหา ไม่ใช่การใช้เวอร์ชันเก่าจริงๆ ตามที่ option นี้เตือน
+	option use_outdated_mhd '1'
 
-# Forwarding Authentication Service -> Flask app ของเรา
-FasPort ${FAS_PORT}
-FasPath /login
-FasSecureEnabled 2
-FaskeyOverride ${faskey}
+	# Forwarding Authentication Service -> Flask app ของเรา
+	option fasport '${FAS_PORT}'
+	option faspath '/login'
+	option fas_secure_enabled '2'
+	option faskey '${faskey}'
 
-# แก้บั๊ก H3: เดิมตั้งตายตัวที่ 240 นาที (4 ชม.) แม้หน้า /issue ให้พนักงานเลือกอายุ
-# voucher ได้ 1-24 ชม. -- voucher 1 ชม. เคยใช้ได้จริงยาวกว่าที่จ่าย (4 ชม.) ส่วน voucher
-# 24 ชม. เคยถูกตัดสั้นกว่าที่จ่าย (แค่ 4 ชม.) ตั้งเป็น 1440 (=24 ชม., ค่าสูงสุดที่ /issue
-# อนุญาต) กัน "ตัดเร็วเกินไป" ไว้ก่อน แล้วให้ cafe-enforce.timer (tools/enforce_voucher_
-# expiry.py ทุก 5 นาที) เป็นตัวบังคับเวลาที่แท้จริงตาม valid_until ในฐานข้อมูลแทน
-SessionTimeout 1440
-PreAuthIdleTimeout 10
-AuthIdleTimeout 30
-CheckInterval 60
+	# แก้บั๊ก H3: เดิมตั้งตายตัวที่ 240 นาที (4 ชม.) แม้หน้า /issue ให้พนักงานเลือกอายุ
+	# voucher ได้ 1-24 ชม. -- voucher 1 ชม. เคยใช้ได้จริงยาวกว่าที่จ่าย (4 ชม.) ส่วน voucher
+	# 24 ชม. เคยถูกตัดสั้นกว่าที่จ่าย (แค่ 4 ชม.) ตั้งเป็น 1440 (=24 ชม., ค่าสูงสุดที่ /issue
+	# อนุญาต) กัน "ตัดเร็วเกินไป" ไว้ก่อน แล้วให้ cafe-enforce.timer (tools/enforce_voucher_
+	# expiry.py ทุก 5 นาที) เป็นตัวบังคับเวลาที่แท้จริงตาม valid_until ในฐานข้อมูลแทน
+	option sessiontimeout '1440'
+	option preauthidletimeout '10'
+	option authidletimeout '30'
+	option checkinterval '60'
 
-# walled garden: ต้องเปิดให้ OS ตรวจเจอ captive portal
-WalledGarden captive.apple.com
-WalledGarden connectivitycheck.gstatic.com
-WalledGarden www.msftconnecttest.com
-WalledGarden detectportal.firefox.com
-WalledGarden nmcheck.gnome.org
-
-DebugLevel 1
+	# walled garden: ต้องเปิดให้ OS ตรวจเจอ captive portal
+	list walledgarden_fqdn_list 'captive.apple.com'
+	list walledgarden_fqdn_list 'connectivitycheck.gstatic.com'
+	list walledgarden_fqdn_list 'www.msftconnecttest.com'
+	list walledgarden_fqdn_list 'detectportal.firefox.com'
+	list walledgarden_fqdn_list 'nmcheck.gnome.org'
 NDS
-  ok "เขียน /etc/opennds/opennds.conf"
+  ok "เขียน /etc/config/opennds (รูปแบบ UCI — ตัวที่ openNDS อ่านจริง)"
 }
 
 install_services() {
@@ -1430,7 +1500,7 @@ ${LOG_DIR}/*.log {
     endscript
     # หมายเหตุ (แก้บั๊ก M5): เดิมเรียก logger.integrity ตรงนี้ด้วย แต่ไม่มี PYTHONPATH/
     # EnvironmentFile ให้เลย (logrotate รันเอง ไม่ผ่าน systemd unit) ทำให้ import โมดูล
-    # หรือต่อ DB ไม่ได้เสมอ แล้วก็ถูก `|| true` กลบ error ไว้เงียบ ๆ -- cafe-maintenance.timer
+    # หรือต่อ DB ไม่ได้เสมอ แล้วก็ถูก \`|| true\` กลบ error ไว้เงียบ ๆ -- cafe-maintenance.timer
     # (03:30 ทุกคืน) เรียก logger.integrity พร้อม env ที่ครบอยู่แล้ว ไม่ต้องเรียกซ้ำที่นี่
 }
 ROT
