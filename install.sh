@@ -1155,6 +1155,14 @@ build_opennds() {
       return 0
     fi
     ok "build + ติดตั้ง openNDS สำเร็จ"
+    # แก้บั๊ก (พบจากรัน install.sh สดใหม่ทั้งหมดบน VM lab, 2026-08-28): `make install` ของ
+    # openNDS เขียน /etc/systemd/system/opennds.service ตรงๆ ด้วย cp เอง (ไม่ผ่าน write_file()
+    # ของเรา) install_services() ที่รันถัดไปมี `systemctl daemon-reload` ท้ายฟังก์ชันอยู่แล้ว
+    # ตามลำดับควรจะพอ แต่จากการทดสอบจริงพบว่า start_services() ยัง enable opennds ไม่เจอ unit
+    # อยู่ดีเป็นครั้งคราว (เจอ WARN "ยังไม่มี unit" ทั้งที่ unit file มีอยู่จริงและใช้งานได้ปกติ
+    # ถ้า enable มือเอง) -- ไม่ยืนยันสาเหตุ race condition ที่แท้จริง แต่ daemon-reload ซ้ำ
+    # ทันทีตรงนี้ (ก่อนจะรอ install_services() อีกที) ปลอดภัยเสมอและปิดช่องว่างนี้ได้ชัวร์กว่า
+    run_sh "systemctl daemon-reload"
   fi
 
   local faskey="CHANGEME"
@@ -1580,7 +1588,12 @@ start_services() {
   done
   if (( ! SKIP_NETWORK )); then
     run systemctl enable --now cafe-logger 2>/dev/null || warn "เปิด cafe-logger ไม่สำเร็จ"
-    run systemctl enable --now opennds     2>/dev/null || warn "openNDS ยังไม่มี unit — เริ่มเองด้วยคำสั่ง: opennds"
+    # ไม่ปิด stderr แล้ว (เดิม 2>/dev/null ซ่อนเหตุผลจริงไว้ ทำให้ debug ไม่ได้เวลา enable ล้ม)
+    run systemctl enable --now opennds || {
+      warn "เปิด opennds ไม่สำเร็จในรอบแรก — daemon-reload ซ้ำแล้วลองใหม่อีกครั้ง"
+      run_sh "systemctl daemon-reload"
+      run systemctl enable --now opennds || warn "เปิด opennds ไม่สำเร็จ — เริ่มเองด้วยคำสั่ง: systemctl start opennds"
+    }
     # N10 (CODING_BRIEF.md): ต้องมี eth0/UPLINK_CIDR ตั้งค่าแล้วถึงจะมี ARP table ของวง uplink
     # ให้เฝ้าจริง -- ผูกไว้กับเงื่อนไขเดียวกับ cafe-logger/opennds
     run systemctl enable --now cafe-bypass-detect.timer 2>/dev/null || warn "เปิด cafe-bypass-detect.timer ไม่สำเร็จ"
