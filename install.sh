@@ -974,6 +974,23 @@ DNSMASQ
   run_sh "touch '${LOG_DIR}/dnsmasq.log'"
   run_sh "chown dnsmasq:'${APP_USER}' '${LOG_DIR}/dnsmasq.log' 2>/dev/null || chown root:'${APP_USER}' '${LOG_DIR}/dnsmasq.log'"
   run_sh "chmod 0640 '${LOG_DIR}/dnsmasq.log'"
+
+  # แก้บั๊ก (พบจากรัน install.sh จริงบน Raspberry Pi, 2026-08-28): แพ็กเกจ dnsmasq ของ Debian
+  # (/usr/share/dnsmasq/init-system-common) ใส่ `--local-service` ให้ทุกครั้งแบบไม่มีเงื่อนไข
+  # ("DNSMASQ_OPTS=\"\${DNSMASQ_OPTS} --local-service\"") ทั้งที่เราตั้ง interface=/bind-interfaces/
+  # listen-address= เจาะจงเองแล้วใน ${APP_NAME}.conf ด้านบน -- ผลคือ dnsmasq เงียบๆ ปฏิเสธ DHCP
+  # request บางส่วนจากฝั่งลูกค้า (ทดสอบยืนยันจริงว่า DHCPDISCOVER ไปถึง dnsmasq แต่ไม่มี DHCPOFFER
+  # ตอบกลับเลย) ไม่มี flag ให้ปิด --local-service ตรงๆ ใน dnsmasq เอง ต้อง patch ไฟล์ของแพ็กเกจ
+  # -- ใช้ pattern match แทน hardcode เลขบรรทัด (กัน Debian เปลี่ยนไฟล์ระหว่างเวอร์ชัน) และเช็คก่อน
+  # ว่ายัง patch ไม่ได้ทำ เพื่อให้รันซ้ำได้ปลอดภัย (idempotent)
+  local dnsmasq_helper="/usr/share/dnsmasq/init-system-common"
+  if [[ -f "$dnsmasq_helper" ]] && grep -q '^DNSMASQ_OPTS=.*--local-service' "$dnsmasq_helper" 2>/dev/null; then
+    # ตัดแค่ส่วน " --local-service" ออกจากบรรทัดนั้น (ไม่ไปแตะส่วนอื่นของบรรทัด/ไฟล์เลย
+    # -- ปลอดภัยกว่าการ reconstruct ทั้งบรรทัดใหม่ และรันซ้ำได้เรื่อยๆ เพราะ grep เช็คก่อนทุกครั้ง)
+    run_sh "sed -i '/^DNSMASQ_OPTS=/ s/ --local-service//' '${dnsmasq_helper}'"
+    ok "แก้บั๊ก dnsmasq --local-service แล้ว (เดิมบล็อก DHCP ฝั่งลูกค้าเงียบๆ)"
+  fi
+
   svc enable dnsmasq
   svc restart dnsmasq
   ok "dnsmasq พร้อม (DHCP ${DHCP_START}-${DHCP_END}, ผูกเฉพาะ ${client_ip})"
@@ -1124,10 +1141,30 @@ build_opennds() {
   # (ไม่ใช่แค่ binary) ถ้า unit ไฟล์นี้หายไป (เช่นจาก `--uninstall` รอบก่อน) ทั้งที่ binary
   # ยังอยู่ จะกลายเป็น "systemctl enable opennds" หา unit ไม่เจอเงียบๆ แล้ว service ไม่ขึ้น
   # เลยแม้ install.sh จะรายงานว่าเสร็จสมบูรณ์ก็ตาม -- ต้องเช็ค unit file ควบคู่ไปด้วยเสมอ
-  if command -v opennds >/dev/null 2>&1 && [[ -f /etc/systemd/system/opennds.service ]]; then
-    info "พบ openNDS ติดตั้งอยู่แล้ว (พร้อม systemd unit)"
-  elif command -v opennds >/dev/null 2>&1 && [[ -f /usr/local/src/opennds/resources/opennds.service ]]; then
-    info "พบ openNDS ติดตั้งอยู่แล้วแต่ systemd unit หาย — คัดลอกกลับจาก source cache เดิม"
+  #
+  # แก้บั๊กเพิ่ม (พบจากรัน install.sh จริงครั้งแรกบน Raspberry Pi จริง, 2026-08-28): เช็คแค่
+  # "มี binary + unit อยู่แล้ว" ยังไม่พอ -- ถ้า binary เดิมถูก build จาก tag คนละตัวกับที่ pin
+  # ไว้ตอนนี้ (${OPENNDS_REF}) เช่น เครื่องนี้เคยมีคนรัน install.sh เก่าตอนที่ OPENNDS_REF ยังไม่
+  # ได้ pin หรือ pin เป็นคนละ tag ได้ openNDS v11.0.0 มาแทน v10.1.3 ที่ทดสอบบน VM lab จริง --
+  # พอ uninstall แล้ว reinstall ใหม่ branch นี้เจอ "มี binary อยู่" ก็ copy service file เดิม
+  # กลับมาเฉยๆ โดยไม่ build ใหม่ ทำให้ config format ที่เขียนด้านล่าง (validate กับ 10.1.3)
+  # ไปชนกับพฤติกรรมจริงของ libopennds.sh ใน v11.0.0 (เช็ครูปแบบ `config opennds 'setup'`
+  # เข้มกว่า 10.1.3 -- ไม่มี 'setup' ต่อท้ายชื่อ section แล้ว exit 1 ทันทีตั้งแต่บรรทัดแรกที่
+  # เรียก get_option_from_config เลย, error message ที่เห็นจริงคือ "Failed to get option
+  # [11.0.0] Bad library or invalid config format" ซึ่งเป็นบั๊ก log ของ openNDS เองอีกที
+  # (src/util.c ใส่ VERSION แทนชื่อ option จริงที่ fail ผิด) -- ต้องเช็ค version ให้ตรง pin
+  # ด้วยเสมอ ไม่ใช่แค่เช็คว่ามี binary อยู่หรือไม่
+  local nds_installed_ver="" nds_pinned_ver="${OPENNDS_REF#v}"
+  if command -v opennds >/dev/null 2>&1; then
+    nds_installed_ver="$(opennds -v 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+  fi
+  if [[ -n "$nds_installed_ver" && "$nds_installed_ver" != "$nds_pinned_ver" ]]; then
+    warn "พบ openNDS ${nds_installed_ver} ติดตั้งอยู่ แต่ตอนนี้ pin ไว้ที่ ${OPENNDS_REF} (${nds_pinned_ver}) -- บิลด์ใหม่ให้ตรง pin เสมอ (ข้ามการ reuse binary เดิม)"
+  fi
+  if [[ -n "$nds_installed_ver" && "$nds_installed_ver" == "$nds_pinned_ver" ]] && [[ -f /etc/systemd/system/opennds.service ]]; then
+    info "พบ openNDS ${nds_installed_ver} ติดตั้งอยู่แล้ว (พร้อม systemd unit, ตรงกับ pin ${OPENNDS_REF})"
+  elif [[ -n "$nds_installed_ver" && "$nds_installed_ver" == "$nds_pinned_ver" ]] && [[ -f /usr/local/src/opennds/resources/opennds.service ]]; then
+    info "พบ openNDS ${nds_installed_ver} ติดตั้งอยู่แล้วแต่ systemd unit หาย — คัดลอกกลับจาก source cache เดิม (ตรงกับ pin)"
     run_sh "install -d -m 0755 /etc/systemd/system"
     run_sh "cp /usr/local/src/opennds/resources/opennds.service /etc/systemd/system/opennds.service"
   else
