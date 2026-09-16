@@ -1211,6 +1211,24 @@ build_opennds() {
     run_sh "systemctl daemon-reload"
   fi
 
+  # *** แก้บั๊กที่เจอซ้ำ 3 ครั้ง (VM lab 2026-08-28, Pi จริง 2026-09-16 x2) ***
+  # openNDS เช็คตอนสตาร์ทด้วย check_heartbeat() (src/commandline.c) ซึ่งอ่านไฟล์
+  # /tmp/ndscids/heartbeat -- ถ้าค่ายังไม่หมดอายุมันจะถือว่า "มีตัวเองรันอยู่แล้ว" แล้ว exit 1
+  # ทันทีพร้อมข้อความ "openNDS is already running, status [ 1 ]. Retry later..."
+  # ไฟล์นี้ค้างทุกครั้งที่ openNDS หยุดแบบไม่สะอาด (ไฟดับ, kill -9, หยุดกลางคัน) ทำให้ service
+  # สตาร์ทกลับไม่ได้เองจนกว่า heartbeat จะหมดอายุ -- ร้ายแรงสำหรับระบบที่ต้องรอดไฟดับ
+  # แก้ด้วย systemd drop-in (ไม่ใช่แก้ไฟล์ unit ตรง ๆ เพราะ `make install` ของ openNDS
+  # เขียนทับ unit ทุกครั้งที่ build ใหม่ แต่ drop-in อยู่คนละไฟล์จึงรอด)
+  # ลบ heartbeat เฉพาะตอนที่ไม่มี process opennds จริงเหลืออยู่เท่านั้น จึงไม่ไปฆ่า instance
+  # ที่กำลังทำงานอยู่จริง
+  write_file /etc/systemd/system/opennds.service.d/cafe-wifi-heartbeat.conf 0644 <<'NDSDROPIN'
+# managed by cafe-wifi installer -- ห้ามแก้มือ
+# ล้าง heartbeat ที่ค้างจากการหยุดแบบไม่สะอาด ก่อนสตาร์ททุกครั้ง (เฉพาะเมื่อไม่มี process จริง)
+[Service]
+ExecStartPre=-/bin/sh -c 'pgrep -x opennds >/dev/null || rm -f /tmp/ndscids/heartbeat'
+NDSDROPIN
+  run_sh "systemctl daemon-reload"
+
   local faskey="CHANGEME"
   if [[ -f "${ETC_DIR}/secrets.env" ]] && (( ! DRY_RUN )); then
     faskey="$(grep -E '^FAS_KEY=' "${ETC_DIR}/secrets.env" | cut -d= -f2-)"
