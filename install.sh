@@ -1018,6 +1018,15 @@ table inet filter {
 
     ip protocol icmp icmp type { echo-request, destination-unreachable, time-exceeded } limit rate 10/second accept
 
+    # *** บั๊กใหญ่ที่พบจากการทดสอบ DHCP จริงบน Pi จริงครั้งแรก (2026-09-16) ***
+    # DHCP client ที่ยังไม่มี IP ต้องส่ง DHCPDISCOVER จาก source 0.0.0.0 -> 255.255.255.255
+    # เสมอตามมาตรฐาน (RFC 2131) จึงไม่มีทางเข้าเงื่อนไข "ip saddr \$CLIENT_NET" ด้านล่างได้เลย
+    # -- เดิมแพ็กเก็ตจึงตกไปโดน policy drop ทิ้งทุกครั้ง กลายเป็นไก่กับไข่: ลูกค้าต้องมี IP ในวง
+    # ลูกค้าก่อนถึงจะขอ IP ได้ ผลคือ **ลูกค้าจริงไม่มีทางเชื่อมต่อได้เลยสักคน** ทั้งที่ dnsmasq
+    # ทำงานถูกต้อง 100% (ยืนยันด้วย tcpdump: DHCPDISCOVER มาถึง NIC ทุกครั้ง แต่ไม่เคยถึง socket)
+    # ที่ผ่านมาไม่เจอเพราะทดสอบด้วย static IP ในวง 10.10.0.0/24 มาตลอด ซึ่งข้ามขั้นตอนนี้ไป
+    udp sport 68 udp dport 67 accept
+
     # จากฝั่งลูกค้า อนุญาตเฉพาะบริการที่จำเป็น
     ip saddr \$CLIENT_NET udp dport { 53, 67 } accept
     ip saddr \$CLIENT_NET tcp dport 53 accept
