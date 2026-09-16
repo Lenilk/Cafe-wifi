@@ -106,6 +106,7 @@ def test_run_writes_bypass_alert_row_and_audit_log_per_event(monkeypatch, arp_fi
     calls = []
     import common.db as db
     monkeypatch.setattr(db, "execute", lambda sql, args=(): calls.append((sql, args)) or 1)
+    monkeypatch.setattr(db, "query_one", lambda sql, args=(): None)  # ยังไม่เคยแจ้งเตือนมาก่อน
 
     events = bypass_detector.run(
         uplink_network="192.168.1.0/24",
@@ -138,6 +139,7 @@ def test_run_writes_nothing_when_no_bypass_found(monkeypatch, tmp_path):
     calls = []
     import common.db as db
     monkeypatch.setattr(db, "execute", lambda sql, args=(): calls.append((sql, args)) or 1)
+    monkeypatch.setattr(db, "query_one", lambda sql, args=(): None)  # ยังไม่เคยแจ้งเตือนมาก่อน
 
     events = bypass_detector.run(uplink_network="192.168.1.0/24",
                                  known_ips={"192.168.1.2", "192.168.1.1"},
@@ -152,6 +154,72 @@ def test_run_reads_known_ips_from_env_when_not_passed(monkeypatch, arp_file):
     calls = []
     import common.db as db
     monkeypatch.setattr(db, "execute", lambda sql, args=(): calls.append((sql, args)) or 1)
+    monkeypatch.setattr(db, "query_one", lambda sql, args=(): None)  # ยังไม่เคยแจ้งเตือนมาก่อน
 
     events = bypass_detector.run(uplink_network="192.168.1.0/24", arp_path=str(arp_file))
     assert events == [BypassEvent(ip="192.168.1.50", mac="11:22:33:44:55:66")]
+
+
+# ============================================== ส่วนที่ 4: cooldown กันแถวซ้ำ (บั๊กที่เจอบน Pi จริง)
+def test_run_skips_insert_when_same_device_alerted_within_cooldown(monkeypatch, arp_file):
+    """อุปกรณ์เดิมที่ยังเสียบอยู่ต้องไม่ถูกบันทึกซ้ำทุกนาที -- ไม่งั้น audit_log (หลักฐานตาม
+    กฎหมาย) ถูกถมด้วยแถวซ้ำจนหาเหตุการณ์จริงไม่เจอ"""
+    calls = []
+    import common.db as db
+    monkeypatch.setattr(db, "execute", lambda sql, args=(): calls.append((sql, args)) or 1)
+    monkeypatch.setattr(db, "query_one", lambda sql, args=(): {"id": 1})  # เพิ่งแจ้งเตือนไป
+
+    events = bypass_detector.run(uplink_network="192.168.1.0/24",
+                                 known_ips={"192.168.1.2", "192.168.1.1"},
+                                 arp_path=str(arp_file))
+
+    assert events == [BypassEvent(ip="192.168.1.50", mac="11:22:33:44:55:66")],         "ยังต้องคืนค่าว่าตรวจเจอ -- cooldown กันแค่การเขียนซ้ำ ไม่ใช่กันการตรวจจับ"
+    assert calls == [], "ห้ามเขียน bypass_alert หรือ audit_log ซ้ำระหว่าง cooldown"
+
+
+def test_cooldown_query_uses_both_ip_and_mac(monkeypatch, arp_file):
+    """ต้องกันซ้ำต่อคู่ (ip, mac) ไม่ใช่ต่อ ip อย่างเดียว -- ถ้าเครื่องใหม่มาใช้ IP เดิม
+    (อุปกรณ์คนละตัว) ต้องถือเป็นเหตุการณ์ใหม่ที่ต้องบันทึก"""
+    seen = []
+    import common.db as db
+    monkeypatch.setattr(db, "execute", lambda sql, args=(): 1)
+    monkeypatch.setattr(db, "query_one", lambda sql, args=(): seen.append((sql, args)) or None)
+
+    bypass_detector.run(uplink_network="192.168.1.0/24",
+                       known_ips={"192.168.1.2", "192.168.1.1"},
+                       arp_path=str(arp_file), cooldown_minutes=30)
+
+    assert len(seen) == 1
+    sql, args = seen[0]
+    assert "bypass_alert" in sql.lower()
+    assert args == ("192.168.1.50", "11:22:33:44:55:66", 30)
+
+
+def test_cooldown_zero_disables_dedupe(monkeypatch, arp_file):
+    """ตั้ง 0 = ปิด cooldown บันทึกทุกรอบเหมือนเดิม (เผื่ออยากเก็บ raw ตอนทำการทดลองในเล่ม)"""
+    calls = []
+    queries = []
+    import common.db as db
+    monkeypatch.setattr(db, "execute", lambda sql, args=(): calls.append((sql, args)) or 1)
+    monkeypatch.setattr(db, "query_one", lambda sql, args=(): queries.append(sql) or {"id": 1})
+
+    bypass_detector.run(uplink_network="192.168.1.0/24",
+                       known_ips={"192.168.1.2", "192.168.1.1"},
+                       arp_path=str(arp_file), cooldown_minutes=0)
+
+    assert queries == [], "cooldown=0 ต้องไม่ query หา alert เดิมเลย"
+    assert len(calls) == 2, "ต้องเขียนทั้ง bypass_alert และ audit_log ตามปกติ"
+
+
+def test_cooldown_minutes_defaults_from_env(monkeypatch, arp_file):
+    seen = []
+    import common.db as db
+    monkeypatch.setenv("BYPASS_ALERT_COOLDOWN_MIN", "15")
+    monkeypatch.setattr(db, "execute", lambda sql, args=(): 1)
+    monkeypatch.setattr(db, "query_one", lambda sql, args=(): seen.append(args) or None)
+
+    bypass_detector.run(uplink_network="192.168.1.0/24",
+                       known_ips={"192.168.1.2", "192.168.1.1"},
+                       arp_path=str(arp_file))
+
+    assert seen[0][2] == 15

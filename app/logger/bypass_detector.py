@@ -16,6 +16,14 @@ conn_log/dns_log เลย** (Pi ไม่ได้อยู่บนเส้�
 "ทดลอง bypass 20 ครั้ง ตรวจจับได้ 18 ครั้ง (90%)") การป้องกันจริงต้องพึ่ง Access Control ที่
 เราเตอร์เป็นหลัก (ชั้นที่ 1-2 ใน §3.1.4) ไฟล์นี้เป็นแค่ชั้นที่ 4 (ชั้นสุดท้าย)
 
+**บั๊กที่เจอบน Pi จริง (2026-09-16) — แก้แล้ว**: เดิม `run()` INSERT ทุกอุปกรณ์ที่เจอ *ทุกรอบ*
+โดยไม่มีการกันซ้ำ พอเอาไปต่อวง uplink จริงที่มีอุปกรณ์อื่นอยู่ด้วย (แล็บมหาวิทยาลัย 9 เครื่อง)
+กลายเป็น 9 แถวทุกนาที = 12,960 แถว/วัน ลงทั้ง `bypass_alert` และ `audit_log` ซึ่ง `audit_log`
+เป็นหลักฐานตามกฎหมาย การถมด้วยแถวซ้ำทำให้หาเหตุการณ์จริงไม่เจอและตารางโตไม่มีที่สิ้นสุด
+แก้ด้วย cooldown ต่อคู่ (ip, mac): ถ้าเพิ่งแจ้งเตือนไปภายใน `BYPASS_ALERT_COOLDOWN_MIN` นาที
+(ค่าเริ่มต้น 60) จะไม่บันทึกซ้ำ แต่ยังคืนค่าใน `events` ตามเดิม — ยังนับ "ตรวจจับได้กี่ครั้ง"
+ได้ครบ และยังเห็นว่าอุปกรณ์นั้นยังอยู่ต่อเนื่อง จากจำนวนแถวที่ห่างกันชั่วโมงละแถว
+
 รันถี่ผ่าน `cafe-bypass-detect.timer` (ทุก 1 นาที ตั้งโดย install.sh) — ถี่กว่า cafe-enforce.timer
 (5 นาที) เพราะ ARP cache ของเคอร์เนลหมดอายุเร็ว (โดยทั่วไป ~60-300 วินาทีขึ้นกับระบบ) การเช็คแบบ
 สุ่มตัวอย่างเป็นช่วง ๆ (polling) แบบนี้**มีโอกาสพลาดอุปกรณ์ที่เชื่อมต่อสั้นมาก**ระหว่างรอบตรวจ —
@@ -69,11 +77,12 @@ def find_bypass_devices(arp_table: dict[str, str], uplink_network: str,
 
 
 def run(uplink_network: str | None = None, known_ips: set[str] | None = None,
-       arp_path: str = "/proc/net/arp") -> list[BypassEvent]:
+       arp_path: str = "/proc/net/arp", cooldown_minutes: int | None = None) -> list[BypassEvent]:
     """อ่าน ARP table จริง หา bypass แล้วบันทึกลงตาราง bypass_alert + audit_log ทุกรายการที่เจอ
     (ตามแบบ tools/check_disk.py::run() ที่ loop เขียน audit ทีละรายการต่อความผิดปกติ 1 ครั้ง)"""
     from common import audit
     from common.db import execute as db_execute
+    from common.db import query_one as db_query_one
     from logger.netutil import active_arp_refresh, read_arp_table
 
     uplink_network = uplink_network or os.environ.get("UPLINK_NETWORK", "")
@@ -82,6 +91,8 @@ def run(uplink_network: str | None = None, known_ips: set[str] | None = None,
             "UPLINK_NETWORK ไม่ได้ตั้งค่า -- ต้องรัน install.sh ให้เขียน secrets.env ก่อน "
             "หรือระบุพารามิเตอร์ uplink_network เอง"
         )
+    if cooldown_minutes is None:
+        cooldown_minutes = int(os.environ.get("BYPASS_ALERT_COOLDOWN_MIN", "60"))
     if known_ips is None:
         known_ips = {ip for ip in (os.environ.get("UPLINK_IP"), os.environ.get("UPLINK_GW")) if ip}
 
@@ -93,6 +104,15 @@ def run(uplink_network: str | None = None, known_ips: set[str] | None = None,
     events = find_bypass_devices(arp_table, uplink_network, known_ips)
 
     for ev in events:
+        if cooldown_minutes > 0 and db_query_one(
+            "SELECT id FROM bypass_alert WHERE ip=%s AND mac=%s "
+            "AND detected_at > (NOW() - INTERVAL %s MINUTE) LIMIT 1",
+            (ev.ip, ev.mac, cooldown_minutes),
+        ):
+            # เจออุปกรณ์เดิมที่ยังอยู่ — แจ้งเตือนไปแล้วในรอบ cooldown ไม่บันทึกซ้ำ
+            log.info("อุปกรณ์แปลกปลอมเดิมยังอยู่ (อยู่ในช่วง cooldown %d นาที): ip=%s mac=%s",
+                    cooldown_minutes, ev.ip, ev.mac)
+            continue
         db_execute("INSERT INTO bypass_alert (ip, mac) VALUES (%s, %s)", (ev.ip, ev.mac))
         audit.log(audit.BYPASS_DETECTED, target=ev.ip,
                  detail=f"mac={ev.mac} network={uplink_network}")
