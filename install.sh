@@ -1427,16 +1427,17 @@ UNIT
   # แก้บั๊ก H3/M1: บังคับอายุ voucher จริง + ปิด session ค้าง -- ต้องรันถี่กว่างาน
   # maintenance รายคืนมาก เพราะเป็นการบังคับสิทธิ์การเข้าถึงเครือข่าย ไม่ใช่แค่ housekeeping
   # (ทุก 5 นาที คือ ความคลาดเคลื่อนสูงสุดที่ลูกค้าจะใช้เน็ตเกินเวลาที่จ่ายไว้ได้)
-  # แก้บั๊ก (พบตอนตรวจทานรอบ 2): เพิ่ง hardening cafe-logger ไปเอง (M3) แล้วสร้าง unit ใหม่
-  # ตัวนี้ทิ้งปัญหาเดียวกันไว้ -- ไม่มี User=/hardening สักบรรทัด รันเป็น root โดยปริยาย
-  # ไม่ต้องการ CAP_NET_ADMIN/CAP_NET_RAW (ไม่แตะ raw socket เอง แค่ shell ออกไปเรียก `ndsctl`
-  # ซึ่งคุยกับ openNDS ผ่าน unix socket ของมันเอง และต่อ DB ผ่าน TCP ธรรมดา) จึงรันเป็น
-  # ${APP_USER} พร้อม hardening ชุดเดียวกับ cafe-admin/cafe-fas ได้เลย
-  # 🔶 หมายเหตุยังไม่ยืนยันบนฮาร์ดแวร์จริง: ถ้า openNDS จำกัดสิทธิ์ unix socket ควบคุมไว้ที่
-  # root เท่านั้น (ยังไม่เคยตรวจสอบ) `ndsctl deauth` อาจ permission denied ใต้ ${APP_USER} --
-  # deauth_mac() ใน enforce_voucher_expiry.py ดักกรณีนี้ไว้แล้ว (log warning + คืน False
-  # ไม่ throw) ระบบจะยังปิด session ในฐานข้อมูลถูกต้อง เพียงแต่ไม่ตัดเน็ตที่ openNDS จริง --
-  # ถ้าเจอปัญหานี้บนเครื่องจริง ให้เปลี่ยนเป็น User=root เฉพาะ unit นี้
+  # ✅ ยืนยันบน Pi จริงแล้ว (2026-09-16) ว่าข้อกังวลที่เคยเขียนเตือนไว้ตรงนี้เป็นจริง และ
+  # ร้ายแรงกว่าที่คิด: unit นี้เคยรันเป็น ${APP_USER} + NoNewPrivileges + PrivateTmp แล้ว
+  # `ndsctl deauth` ล้มเหลวทุกครั้ง ด้วยสองสาเหตุพร้อมกัน
+  #   1. อ่าน /etc/config/opennds ไม่ได้ (0640 root:root) -> "Permission denied"
+  #   2. PrivateTmp=yes ทำให้ service มี /tmp ของตัวเอง มองไม่เห็น /tmp/ndsctl.sock ของ
+  #      openNDS -> "opennds probably not yet started (No such file or directory)"
+  # ผลจริงคือ **เพิกถอน/หมดอายุ voucher แล้วตัดลูกค้าไม่ออก** ฐานข้อมูลบันทึกว่าปิด session
+  # แล้ว แต่ลูกค้ายังออกเน็ตได้ปกติ แถมทราฟฟิกหลังจากนั้นถูกนับเข้า session ที่ปิดไปแล้ว
+  # (NoNewPrivileges=yes ยังปิดทางแก้ด้วย sudo ไปด้วยอีกชั้น) จึงต้องรันเป็น root +
+  # PrivateTmp=no -- ยังคง ProtectSystem=strict/ProtectHome ไว้ตามเดิม งานนี้อ่าน /etc
+  # อย่างเดียวและเขียนแค่ DB ผ่าน TCP
   write_file /etc/systemd/system/cafe-enforce.service 0644 <<UNIT
 [Unit]
 Description=Cafe WiFi voucher expiry enforcement (deauth + close stale sessions)
@@ -1444,16 +1445,18 @@ After=network-online.target mariadb.service
 
 [Service]
 Type=oneshot
-User=${APP_USER}
-Group=${APP_USER}
 EnvironmentFile=${ETC_DIR}/secrets.env
 Environment=PYTHONPATH=${OPT_DIR}
 WorkingDirectory=${OPT_DIR}
 ExecStart=${VENV_DIR}/bin/python -m tools.enforce_voucher_expiry
 
 NoNewPrivileges=yes
-PrivateTmp=yes
+PrivateTmp=no
 ProtectSystem=strict
+# ต้องเปิด /tmp ให้เขียนได้ ไม่งั้นต่อ unix socket /tmp/ndsctl.sock ไม่ได้ (ProtectSystem=strict
+# ทำให้ทั้งระบบไฟล์เป็น read-only ซึ่งรวม /tmp ด้วย และ connect() ต้องมีสิทธิ์เขียนที่ socket)
+# ยืนยันบน Pi จริง: strict เปล่า ๆ -> ndsctl ตายพร้อม "Unable to open [/etc/localtime]" exit 5
+ReadWritePaths=/tmp
 ProtectHome=yes
 ProtectKernelTunables=yes
 ProtectControlGroups=yes

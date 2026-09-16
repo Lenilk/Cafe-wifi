@@ -11,9 +11,16 @@ tools/enforce_voucher_expiry.py — บังคับอายุ voucher จ�
        1 ชม. ใช้ได้จริง 4 ชม. (ยาวกว่าที่จ่าย) ส่วน voucher 24 ชม. ถูกตัดที่ 4 ชม. (สั้นกว่า
        ที่จ่าย) -- install.sh แก้ SessionTimeout เป็น 1440 (ค่าสูงสุดที่ /issue อนุญาต) เพื่อไม่
        ให้ใครถูกตัดเร็วเกินที่จ่ายไว้ แล้วให้สคริปต์นี้เป็นตัวบังคับเวลาที่แท้จริงแทนด้วย
-       `ndsctl deauth` -- 🔶 คำสั่งนี้ยังไม่เคยทดสอบกับ openNDS binary จริงบนฮาร์ดแวร์ (เหมือน
-       ส่วนอื่นของโปรโตคอลนี้ที่บันทึกไว้ใน opennds_proto.py) ถ้า ndsctl ใช้ไม่ได้จริง อย่างน้อย
-       ระบบยังปิด session ในฐานข้อมูลให้ถูกต้อง (online_now จะไม่ค้างเป็นเท็จ)
+       `ndsctl deauth` -- ✅ ทดสอบกับ openNDS 10.1.3 บน Pi จริงแล้ว (2026-09-16) และเจอว่า
+       **เดิมใช้ไม่ได้จริงเลย**: service นี้รันเป็นผู้ใช้ `cafewifi` แต่ `ndsctl` ต้องอ่าน
+       `/etc/config/opennds` (0640 root:root) และต้องเขียน `/tmp/ndsctl.sock`
+       (srwxr-xr-x root:root -- others ไม่มีสิทธิ์ write จึง connect ไม่ได้) ผลคือ deauth
+       ล้มเหลวทุกครั้งเงียบ ๆ (exit 3) ฐานข้อมูลบันทึกว่าปิด session แล้วแต่ลูกค้ายังออกเน็ต
+       ได้ตามปกติ = เพิกถอน voucher แล้วตัดคนไม่ออกจริง ซ้ำยังมีชั้นที่สอง: unit ตั้ง
+       `PrivateTmp=yes` ทำให้ service มี /tmp เป็นของตัวเอง มองไม่เห็น /tmp/ndsctl.sock
+       ของ openNDS เลย (ขึ้น "opennds probably not yet started") และ `NoNewPrivileges=yes`
+       ก็ปิดทาง sudo ไปด้วย -- install.sh จึงเปลี่ยน unit นี้เป็นรันด้วย root + PrivateTmp=no
+       ตามที่คอมเมนต์ในตัว install.sh เองเคยเขียนเตือนไว้ว่าอาจต้องทำ
 
   M1 — portal_session ไม่เคยถูกปิดเมื่อลูกค้าเดินออกจากร้านไปเฉย ๆ (ปิดเฉพาะตอน MAC เดิม
        login ซ้ำ) ทำให้ "กำลังใช้งานอยู่ตอนนี้" ในหน้า dashboard มีแต่เพิ่มไม่มีวันลด --
@@ -34,6 +41,7 @@ tools/enforce_voucher_expiry.py — บังคับอายุ voucher จ�
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -90,23 +98,45 @@ def find_sessions_to_close(query_all_fn) -> list[dict]:
     """)
 
 
+def _running_as_root() -> bool:
+    """เช็คว่ารันด้วยสิทธิ์ root อยู่แล้วไหม -- แยกเป็นฟังก์ชันเพราะ Windows (เครื่องพัฒนา)
+    ไม่มี os.geteuid เลย ถ้าเรียกตรง ๆ จะ AttributeError และเทสต์ก็ mock ตรงนี้ได้ง่ายกว่า"""
+    geteuid = getattr(os, "geteuid", None)
+    return geteuid is None or geteuid() == 0
+
+
 def deauth_mac(mac: str, ndsctl_bin: str = "ndsctl") -> bool:
     """
     เรียก `ndsctl deauth <mac>` สั่ง openNDS ตัดการเชื่อมต่อทันที
-    🔶 ยังไม่เคยทดสอบกับ openNDS binary จริงบนฮาร์ดแวร์ -- ถ้าเรียกไม่สำเร็จไม่ throw
-    (แค่ log แล้วให้ผู้เรียกปิด session ในฐานข้อมูลต่อไป อย่างน้อยเลิกนับว่า "online" ผิด)
+
+    ต้องรันด้วยสิทธิ์ root เสมอ -- `ndsctl` อ่าน /etc/config/opennds (0640 root:root) และ
+    ต่อ unix socket /tmp/ndsctl.sock ที่ others ไม่มีสิทธิ์ write ถ้ารันเป็น `cafewifi`
+    ตรง ๆ จะได้ exit 3 ทุกครั้ง cafe-enforce.service จึงรันเป็น root -- แต่ยังเติม `sudo -n`
+    ให้อัตโนมัติเมื่อถูกเรียกแบบไม่ใช่ root (เช่นรันมือจาก shell ของ ras) เพื่อให้ยังใช้ได้
+
+    ถ้าเรียกไม่สำเร็จไม่ throw (แค่ log แล้วให้ผู้เรียกปิด session ในฐานข้อมูลต่อไป) แต่ต้อง
+    log ระดับ error เพราะแปลว่า **ลูกค้าที่ถูกเพิกถอนสิทธิ์ยังใช้เน็ตต่อได้จริง** ไม่ใช่แค่
+    ตัวเลขในฐานข้อมูลเพี้ยน
     """
     if shutil.which(ndsctl_bin) is None:
         log.warning("ไม่พบ %s บนเครื่องนี้ -- ข้ามการตัดที่ openNDS (ปิดแค่ session ใน DB)", ndsctl_bin)
         return False
+    # openNDS เทียบ MAC แบบตรงตัวอักษร (case-sensitive) และเก็บเป็นตัวพิมพ์เล็กเสมอ แต่เรา
+    # เก็บใน portal_session.mac เป็นตัวพิมพ์ใหญ่ (C8:A3:...) ถ้าส่งไปตรง ๆ จะได้
+    # "Client ... not found." exit 1 ทุกครั้ง -- ยืนยันบน Pi จริง 2026-09-16 ว่าตัวพิมพ์เล็ก
+    # ตัดได้จริง ตัวพิมพ์ใหญ่ไม่เจอ
+    cmd = [ndsctl_bin, "deauth", mac.lower()]
+    if not _running_as_root():
+        cmd = ["sudo", "-n", *cmd]
     try:
-        r = subprocess.run([ndsctl_bin, "deauth", mac], capture_output=True, timeout=10)
+        r = subprocess.run(cmd, capture_output=True, timeout=10)
         if r.returncode != 0:
-            log.warning("ndsctl deauth %s exit code %d: %s", mac, r.returncode,
-                       r.stderr.decode(errors="replace")[:200])
+            log.error("ndsctl deauth %s ไม่สำเร็จ (exit %d): %s -- ลูกค้ารายนี้ยังออกเน็ตได้อยู่ "
+                     "ทั้งที่ voucher ถูกตัดสิทธิ์แล้ว ต้องแก้สิทธิ์ sudo ของ ndsctl",
+                     mac, r.returncode, r.stderr.decode(errors="replace")[:200])
         return r.returncode == 0
     except Exception as exc:  # noqa: BLE001
-        log.warning("ndsctl deauth %s ล้มเหลว: %s", mac, exc)
+        log.error("ndsctl deauth %s ล้มเหลว: %s -- ลูกค้ารายนี้ยังออกเน็ตได้อยู่", mac, exc)
         return False
 
 
@@ -144,18 +174,27 @@ def run(deauth: bool = True) -> EnforceSummary:
         to_close = find_sessions_to_close(_query_all)
 
         deauth_ok = deauth_failed = 0
+        closed = 0
         for row in to_close:
             if deauth:
                 ok = deauth_mac(row["mac"])
                 deauth_ok += int(ok)
                 deauth_failed += int(not ok)
+                if not ok:
+                    # ตัดที่ openNDS ไม่สำเร็จ = ลูกค้ายังต่อเน็ตอยู่จริง ห้ามปิด session
+                    # ในฐานข้อมูล ไม่งั้นรอบถัดไปจะมองไม่เห็นแถวนี้อีกเลย (คิวรีหาเฉพาะ
+                    # ended_at IS NULL) แล้วลูกค้ารายนั้นจะใช้เน็ตต่อได้ตลอดไปโดยไม่มีการ
+                    # ลองตัดซ้ำ -- พบจากการทดสอบบน Pi จริง 2026-09-16 การปล่อยให้แถวเปิดค้าง
+                    # ไว้ยังตรงความจริงมากกว่าด้วย เพราะเขา "ออนไลน์อยู่" จริง ๆ
+                    continue
             bo, bi = sum_session_traffic_bytes(_query_one, row["mac"], row["started_at"])
             close_session(_exec, row["id"], row["voucher_id"], bo, bi, row["voucher_status"])
+            closed += 1
 
         n_used_up = mark_used_up_vouchers(_exec)
 
     summary = EnforceSummary(expired_vouchers=n_expired, used_up_vouchers=n_used_up,
-                             sessions_closed=len(to_close),
+                             sessions_closed=closed,
                              deauth_ok=deauth_ok, deauth_failed=deauth_failed)
     log.info("enforce เสร็จ: voucher expired %d, used_up %d, session ปิด %d "
             "(deauth สำเร็จ %d, ล้มเหลว/ข้าม %d)",

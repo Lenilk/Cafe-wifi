@@ -185,3 +185,92 @@ def test_run_end_to_end_closes_expired_sessions_and_skips_deauth_when_disabled(m
         "deauth=False ต้องไม่เรียก ndsctl เลย"
     assert len(state["closed"]) == 1
     assert len(state["used_mb_bumped"]) == 1
+
+
+# ============== N22: ndsctl ต้องรันด้วยสิทธิ์ root ไม่งั้นเพิกถอน voucher แล้วตัดคนไม่ออกจริง
+def _fake_run(captured, returncode=0):
+    class FakeResult:
+        pass
+    FakeResult.returncode = returncode
+    FakeResult.stderr = b""
+
+    def run(cmd, **kw):
+        captured.append(cmd)
+        return FakeResult()
+    return run
+
+
+def test_deauth_mac_runs_ndsctl_directly_when_already_root(monkeypatch):
+    monkeypatch.setattr(ev.shutil, "which", lambda _: "/usr/bin/ndsctl")
+    monkeypatch.setattr(ev, "_running_as_root", lambda: True)
+    captured = []
+    monkeypatch.setattr(ev.subprocess, "run", _fake_run(captured))
+
+    assert ev.deauth_mac("AA:BB:CC:DD:EE:01") is True
+    assert captured == [["ndsctl", "deauth", "aa:bb:cc:dd:ee:01"]],         "openNDS เทียบ MAC แบบ case-sensitive และใช้ตัวพิมพ์เล็กเสมอ"
+
+
+def test_deauth_mac_adds_sudo_when_not_root(monkeypatch):
+    """รันเป็น cafewifi ตรง ๆ จะอ่าน /etc/config/opennds ไม่ได้และต่อ /tmp/ndsctl.sock ไม่ได้
+    (ยืนยันบน Pi จริง 2026-09-16: exit 3 ทุกครั้ง) จึงต้องยกสิทธิ์ก่อนเสมอ"""
+    monkeypatch.setattr(ev.shutil, "which", lambda _: "/usr/bin/ndsctl")
+    monkeypatch.setattr(ev, "_running_as_root", lambda: False)
+    captured = []
+    monkeypatch.setattr(ev.subprocess, "run", _fake_run(captured))
+
+    assert ev.deauth_mac("AA:BB:CC:DD:EE:01") is True
+    assert captured == [["sudo", "-n", "ndsctl", "deauth", "aa:bb:cc:dd:ee:01"]]
+
+
+def test_deauth_failure_is_logged_as_error_not_warning(monkeypatch, caplog):
+    """deauth ล้มเหลว = ลูกค้าที่ถูกตัดสิทธิ์ยังใช้เน็ตได้จริง ไม่ใช่แค่ตัวเลขใน DB เพี้ยน
+    ระดับ log จึงต้องเป็น ERROR ให้เห็นชัด (ของเดิมเป็น warning เลยถูกมองข้าม)"""
+    import logging
+    monkeypatch.setattr(ev.shutil, "which", lambda _: "/usr/bin/ndsctl")
+    monkeypatch.setattr(ev, "_running_as_root", lambda: True)
+    monkeypatch.setattr(ev.subprocess, "run", _fake_run([], returncode=3))
+
+    with caplog.at_level(logging.DEBUG):
+        assert ev.deauth_mac("AA:BB:CC:DD:EE:01") is False
+
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors, "ต้อง log ระดับ ERROR อย่างน้อยหนึ่งรายการ"
+    assert "ยังออกเน็ตได้อยู่" in errors[0].getMessage()
+
+
+def _run_with_fake_db(monkeypatch, deauth_succeeds: bool):
+    state = dict(
+        expire_count=0,
+        to_close=[{"id": 1, "mac": "AA:BB:CC:DD:EE:01", "voucher_id": 10,
+                  "started_at": datetime.now() - timedelta(hours=1),
+                  "voucher_status": "revoked"}],
+        closed=[], used_mb_bumped=[], used_up_count=0,
+    )
+
+    class FakeConn:
+        def cursor(self):
+            return _FakeCursor(state)
+
+    import common.db as db
+    monkeypatch.setattr(db, "get_conn", lambda: contextlib.nullcontext(FakeConn()))
+    monkeypatch.setattr(ev, "deauth_mac", lambda mac: deauth_succeeds)
+    return ev.run(deauth=True), state
+
+
+def test_run_keeps_session_open_when_deauth_fails_so_next_run_retries(monkeypatch):
+    """ถ้าตัดที่ openNDS ไม่สำเร็จ ลูกค้ายังต่อเน็ตอยู่จริง ห้ามปิดแถวในฐานข้อมูล ไม่งั้น
+    คิวรีรอบถัดไป (หาเฉพาะ ended_at IS NULL) จะมองไม่เห็นแถวนี้อีกเลย = ใช้เน็ตต่อได้ตลอดไป
+    โดยไม่มีการลองตัดซ้ำ -- พบจากการทดสอบบน Pi จริง 2026-09-16"""
+    summary, state = _run_with_fake_db(monkeypatch, deauth_succeeds=False)
+
+    assert summary.deauth_failed == 1
+    assert summary.sessions_closed == 0, "นับเฉพาะที่ปิดจริง ไม่ใช่จำนวนที่ตั้งใจจะปิด"
+    assert state["closed"] == [], "ห้ามปิด session ที่ยังตัดไม่ออกจริง"
+
+
+def test_run_closes_session_when_deauth_succeeds(monkeypatch):
+    summary, state = _run_with_fake_db(monkeypatch, deauth_succeeds=True)
+
+    assert summary.deauth_ok == 1
+    assert summary.sessions_closed == 1
+    assert len(state["closed"]) == 1
