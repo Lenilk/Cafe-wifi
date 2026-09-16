@@ -186,8 +186,18 @@ def main() -> int:  # pragma: no cover
 
     issues = verify_chain(store, archive_dir)
     if issues:
+        # N21: ต้องบันทึกลง audit_log ในฐานข้อมูลด้วย ไม่ใช่แค่ log ไฟล์ -- ถ้าคนร้ายแก้ไฟล์
+        # log ได้ ก็ย่อมลบบรรทัด ERROR ในไฟล์ log ทิ้งได้เหมือนกัน หลักฐานว่า "ตรวจพบการแก้ไข"
+        # จึงต้องอยู่คนละที่กับสิ่งที่ถูกแก้ และ ExecStart= ของ cafe-maintenance ใช้ `-` นำหน้า
+        # (ยอมให้ fail ได้) exit code 1 จึงถูกกลืน ไม่มีใครรู้เรื่องเลยถ้าไม่บันทึกตรงนี้
         for i in issues:
             log.error("[%s] %s: %s", i.kind, i.filename, i.detail)
+            try:
+                from common import audit
+                audit.log(audit.INTEGRITY_FAILED, target=i.filename,
+                         detail=f"kind={i.kind} {i.detail}")
+            except Exception:  # DB ล่มก็ยังต้องรายงานผ่าน log ไฟล์ให้ได้ ห้าม crash ทิ้ง
+                log.exception("บันทึก audit_log ไม่สำเร็จ — ยังเหลือร่องรอยแค่ใน log ไฟล์เท่านั้น")
         return 1
     log.info("ตรวจสาย hash chain ผ่านทั้งหมด (%d ไฟล์)", len(store.all_entries()))
     return 0

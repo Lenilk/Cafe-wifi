@@ -6,6 +6,7 @@ import pytest
 
 from logger.conn_collector import ConnRecord, parse_conntrack_line
 from logger.dns_collector import DnsCorrelator, parse_dnsmasq_line, parse_syslog_timestamp
+from logger import integrity
 from logger.integrity import (MemoryManifestStore, sha256_file, seal_directory,
                               verify_chain)
 from logger.netutil import MacCache, resolve_mac
@@ -253,3 +254,67 @@ def test_mac_cache_reuses_within_ttl(tmp_path, monkeypatch):
     cache.get("10.10.0.105", now=105.0)  # ยังอยู่ใน TTL -> ไม่ควรอ่านไฟล์ซ้ำ
     cache.get("10.10.0.105", now=115.0)  # เกิน TTL -> อ่านใหม่
     assert calls["n"] == 2
+
+
+# =================================== N21: ตรวจพบ log ถูกแก้ ต้องทิ้งหลักฐานไว้ในฐานข้อมูลด้วย
+@pytest.fixture
+def sealed_archive(tmp_path, monkeypatch):
+    """ไดเรกทอรี archive ที่ผนึกเรียบร้อยแล้ว + ผูก main() เข้ากับ store ในหน่วยความจำ"""
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    (archive / "portal-access.log-2026-09-16").write_text("บรรทัดของจริง\n", encoding="utf-8")
+    store = MemoryManifestStore()
+    monkeypatch.setattr(integrity, "SqlManifestStore", lambda: store)
+    monkeypatch.setenv("LOG_DIR", str(tmp_path))
+    assert integrity.main() == 0, "รอบแรกต้องผนึกแล้วผ่าน"
+    return archive
+
+
+def test_main_writes_audit_row_when_log_was_tampered(sealed_archive, monkeypatch):
+    """ถ้าคนร้ายแก้ไฟล์ log ได้ ก็ย่อมลบบรรทัด ERROR ในไฟล์ log ทิ้งได้ด้วย -- หลักฐานว่า
+    'ตรวจพบการแก้ไข' จึงต้องถูกบันทึกไว้คนละที่กับสิ่งที่ถูกแก้ (audit_log ในฐานข้อมูล)"""
+    (sealed_archive / "portal-access.log-2026-09-16").write_text("โดนแก้แล้ว\n", encoding="utf-8")
+
+    logged = []
+    import common.audit as audit
+    monkeypatch.setattr(audit, "log", lambda action, **kw: logged.append((action, kw)))
+
+    assert integrity.main() == 1, "ตรวจเจอความผิดปกติต้องคืน exit code 1"
+    assert len(logged) == 1
+    action, kw = logged[0]
+    assert action == "integrity_failed"
+    assert kw["target"] == "portal-access.log-2026-09-16"
+    assert "hash_mismatch" in kw["detail"]
+
+
+def test_main_writes_audit_row_when_sealed_log_was_deleted(sealed_archive, monkeypatch):
+    (sealed_archive / "portal-access.log-2026-09-16").unlink()
+
+    logged = []
+    import common.audit as audit
+    monkeypatch.setattr(audit, "log", lambda action, **kw: logged.append((action, kw)))
+
+    assert integrity.main() == 1
+    assert logged[0][0] == "integrity_failed"
+    assert "missing_file" in logged[0][1]["detail"]
+
+
+def test_main_writes_no_audit_row_when_chain_is_clean(sealed_archive, monkeypatch):
+    logged = []
+    import common.audit as audit
+    monkeypatch.setattr(audit, "log", lambda action, **kw: logged.append((action, kw)))
+
+    assert integrity.main() == 0
+    assert logged == [], "ผ่านปกติต้องไม่ถมแถวลง audit_log"
+
+
+def test_main_still_reports_when_audit_write_fails(sealed_archive, monkeypatch):
+    """DB ล่มไม่ควรทำให้ตัวตรวจ crash จนไม่เหลือรายงานอะไรเลย -- ยังต้องคืน 1 ตามเดิม"""
+    (sealed_archive / "portal-access.log-2026-09-16").write_text("โดนแก้แล้ว\n", encoding="utf-8")
+
+    import common.audit as audit
+    def boom(*a, **kw):
+        raise RuntimeError("DB ล่ม")
+    monkeypatch.setattr(audit, "log", boom)
+
+    assert integrity.main() == 1
