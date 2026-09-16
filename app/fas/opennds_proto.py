@@ -32,7 +32,7 @@ from __future__ import annotations
 import base64
 import hashlib
 from dataclasses import dataclass, fields
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 from cryptography.hazmat.primitives import padding as sym_padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -182,7 +182,16 @@ def build_auth_action_url(ctx: ClientContext, faskey: str, redir: str | None = N
     if not ctx.is_complete():
         raise FasProtocolError("ClientContext ไม่ครบ (ต้องมี clientmac, hid, gatewayaddress, authdir)")
     tok = auth_token(ctx.hid, faskey)
-    target = redir or ctx.originurl or ""
+    # *** บั๊ก double-encoding (พบจากทดสอบ login จริงบน Pi จริง 2026-09-16) ***
+    # openNDS ส่ง originurl มาใน payload แบบ percent-encoded อยู่แล้ว (uh_urlencode ใน
+    # src/ ใช้ตัวพิมพ์เล็ก เช่น "http%3a%2f%2fneverssl.com%2f") -- เดิมเราเอามา quote() ซ้ำ
+    # อีกชั้นกลายเป็น %253a%252f%252f พอ openNDS (MHD) ถอด query กลับ 1 ชั้นจึงเหลือ
+    # "http%3a%2f%2f..." ซึ่งยังไม่ใช่ URL ที่ใช้ได้ (ไม่มี ://) แล้วมันเอาไปใส่ Location:
+    # ตรง ๆ (authenticate_client() -> send_redirect_temp()) -- เบราว์เซอร์จึงตีความเป็น
+    # path สัมพัทธ์ ต่อท้าย /opennds_auth/ กลายเป็น 404 ให้ลูกค้าเห็นทุกครั้งหลัง login สำเร็จ
+    # (auth ผ่านจริงเบื้องหลัง แต่ผู้ใช้เห็นหน้า error) -- ต้อง unquote ก่อนเสมอ
+    # unquote() ปลอดภัยกับ URL ที่ยังไม่ได้เข้ารหัสอยู่แล้ว (ไม่เปลี่ยนค่า)
+    target = unquote(redir or ctx.originurl or "")
     authdir = ctx.authdir.strip("/")
     url = f"http://{ctx.gatewayaddress}/{authdir}/?tok={tok}"
     if target:
