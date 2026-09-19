@@ -1674,6 +1674,11 @@ ${LOG_DIR}/*.log {
     postrotate
         systemctl reload nginx    >/dev/null 2>&1 || true
         systemctl restart dnsmasq >/dev/null 2>&1 || true
+        # N26: gunicorn เขียน log ลงไฟล์ตรง ๆ (--access-logfile/--error-logfile) ถ้าไม่สั่งให้
+        # เปิดไฟล์ใหม่ มันจะเขียนต่อลงไฟล์เก่าที่ถูกย้ายไป archive และผนึกไปแล้ว (เจอจริงบน Pi:
+        # hash_mismatch) และถ้าไฟล์นั้นถูกบีบอัด+ลบในรอบถัดไป log ที่เขียนต่อจะหายถาวร
+        # USR1 = วิธีมาตรฐานของ gunicorn ในการเปิดไฟล์ log ใหม่ ไม่ตัดการเชื่อมต่อของลูกค้า
+        systemctl kill -s USR1 --kill-whom=main cafe-fas.service cafe-admin.service >/dev/null 2>&1 || true
         chattr +a ${LOG_DIR}/archive/*.log-* 2>/dev/null || echo "warning: chattr +a ไม่สำเร็จ (filesystem อาจไม่รองรับ) — log ที่หมุนแล้วจะไม่ใช่ append-only" >&2
     endscript
     # หมายเหตุ (แก้บั๊ก M5): เดิมเรียก logger.integrity ตรงนี้ด้วย แต่ไม่มี PYTHONPATH/
