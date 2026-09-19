@@ -318,3 +318,71 @@ def test_main_still_reports_when_audit_write_fails(sealed_archive, monkeypatch):
     monkeypatch.setattr(audit, "log", boom)
 
     assert integrity.main() == 1
+
+
+# ===================== N25: logrotate (delaycompress) บีบอัดไฟล์ที่ผนึกแล้วเป็น .gz ในรอบถัดไป
+def _compress_like_logrotate(path):
+    """จำลอง logrotate รอบที่สอง: บีบอัด X เป็น X.gz แล้วลบ X ทิ้ง"""
+    gz = path.with_name(path.name + ".gz")
+    with open(path, "rb") as src, gzip.open(gz, "wb") as dst:
+        dst.write(src.read())
+    path.unlink()
+    return gz
+
+
+def test_verify_follows_file_renamed_to_gz_by_logrotate(tmp_path):
+    """พบจริงบน Pi 2026-09-19: ทุกไฟล์ที่ผนึกถูกฟ้อง missing_file หลัง logrotate รอบที่สอง
+    ทั้งที่เนื้อหาไม่เปลี่ยนเลย แค่ถูกบีบอัดเปลี่ยนชื่อเป็น .gz"""
+    f = tmp_path / "dnsmasq.log-2026-09-16"
+    f.write_text("query 1\nquery 2\n", encoding="utf-8")
+    store = MemoryManifestStore()
+    seal_directory(tmp_path, store)
+    _compress_like_logrotate(f)
+
+    assert verify_chain(store, tmp_path) == []
+
+
+def test_verify_still_catches_tampering_inside_the_gz(tmp_path):
+    f = tmp_path / "dnsmasq.log-2026-09-16"
+    f.write_text("query 1\n", encoding="utf-8")
+    store = MemoryManifestStore()
+    seal_directory(tmp_path, store)
+    f.write_text("query 1\nแทรกย้อนหลัง\n", encoding="utf-8")
+    _compress_like_logrotate(f)
+
+    issues = verify_chain(store, tmp_path)
+    assert [i.kind for i in issues] == ["hash_mismatch"]
+
+
+def test_verify_reports_missing_when_neither_file_nor_gz_exists(tmp_path):
+    f = tmp_path / "dnsmasq.log-2026-09-16"
+    f.write_text("x", encoding="utf-8")
+    store = MemoryManifestStore()
+    seal_directory(tmp_path, store)
+    f.unlink()
+
+    assert [i.kind for i in verify_chain(store, tmp_path)] == ["missing_file"]
+
+
+def test_seal_does_not_reseal_gz_of_unchanged_file(tmp_path):
+    """เดิมผนึก .gz ซ้ำเป็นรายการใหม่ทุกไฟล์ (manifest บน Pi มีแถวซ้ำ 6 คู่ hash เดียวกัน)"""
+    f = tmp_path / "dnsmasq.log-2026-09-16"
+    f.write_text("query 1\n", encoding="utf-8")
+    store = MemoryManifestStore()
+    seal_directory(tmp_path, store)
+    _compress_like_logrotate(f)
+
+    assert seal_directory(tmp_path, store) == []
+    assert len(store.all_entries()) == 1
+
+
+def test_seal_records_gz_whose_content_differs_from_the_sealed_original(tmp_path):
+    f = tmp_path / "dnsmasq.log-2026-09-16"
+    f.write_text("query 1\n", encoding="utf-8")
+    store = MemoryManifestStore()
+    seal_directory(tmp_path, store)
+    f.write_text("query 1\nเพิ่มหลังผนึก\n", encoding="utf-8")
+    _compress_like_logrotate(f)
+
+    sealed = seal_directory(tmp_path, store)
+    assert [e.filename for e in sealed] == ["dnsmasq.log-2026-09-16.gz"]

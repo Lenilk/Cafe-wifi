@@ -120,11 +120,18 @@ def seal_directory(
     sealed: list[ManifestEntry] = []
     prev = store.last_entry()
     prev_hash = prev.sha256 if prev else None
+    sealed_hash = {e.filename: e.sha256 for e in store.all_entries()}
 
     for path in candidates:
         if store.has(path.name):
             continue
         digest = sha256_file(path)
+        # N25: logrotate ตั้ง delaycompress ไว้ ไฟล์ที่หมุนรอบก่อน (X.log-DATE) จะถูกบีบอัดเป็น
+        # X.log-DATE.gz ในรอบถัดไป ถ้าเนื้อหาเหมือนตอนผนึกทุกไบต์ (sha256_file hash เนื้อหาที่
+        # decompress แล้ว) ก็คือไฟล์เดิมที่แค่เปลี่ยนชื่อ ไม่ต้องผนึกซ้ำ -- verify_chain() ตาม
+        # ชื่อ .gz ให้เอง ถ้าเนื้อหาต่างไปจะผนึกเป็นรายการใหม่ และชื่อเดิมจะถูกฟ้อง hash_mismatch
+        if path.name.endswith(".gz") and sealed_hash.get(path.name[:-3]) == digest:
+            continue
         entry = ManifestEntry(filename=path.name, sha256=digest,
                               prev_sha256=prev_hash, size_bytes=path.stat().st_size)
         store.add(entry)
@@ -157,6 +164,11 @@ def verify_chain(store: ManifestStore, directory: Path) -> list[IntegrityIssue]:
                 f"คาดว่า prev_sha256={prev_hash!r} แต่บันทึกไว้เป็น {entry.prev_sha256!r}"))
 
         path = directory / entry.filename
+        if not path.exists() and (directory / (entry.filename + ".gz")).exists():
+            # N25: logrotate (delaycompress) บีบอัดไฟล์ที่ผนึกไว้แล้วเปลี่ยนชื่อเป็น .gz -- ไม่ใช่
+            # ไฟล์หาย ตรวจ hash ของเนื้อหาข้างในต่อ (sha256_file decompress ให้เอง) ถ้าถูกแก้ก็ยัง
+            # ฟ้อง hash_mismatch ได้เหมือนเดิม เดิมฟ้อง missing_file ผิดทุกไฟล์หลังการหมุนรอบที่สอง
+            path = directory / (entry.filename + ".gz")
         if not path.exists():
             issues.append(IntegrityIssue(entry.filename, "missing_file",
                                          f"ไม่พบไฟล์ {path} — อาจถูกลบทิ้งนอกกระบวนการปกติ"))
