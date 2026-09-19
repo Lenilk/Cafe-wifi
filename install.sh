@@ -422,10 +422,21 @@ preflight() {
   if ! command -v ss >/dev/null 2>&1; then
     warn "ไม่พบคำสั่ง 'ss' (iproute2) — ข้ามการตรวจพอร์ตชนกันตอนนี้"
   fi
+  # N24 (พบตอนรันซ้ำบน Pi จริง 2026-09-19): เดิมเจอใครใช้พอร์ตก็ FAIL ทันที รวมถึงบริการของเรา
+  # เองจากการติดตั้งครั้งก่อน -> รันทับเพื่ออัปเดตเครื่องที่ติดตั้งแล้วไม่ได้เลย (ที่ยืนยันว่าผ่านใน
+  # N15 คือการติดตั้งจากเครื่องเปล่า ไม่เคยทดสอบการรันทับ) ตอนนี้ถ้าเจ้าของพอร์ตเป็นบริการของเรา
+  # (nginx/opennds/gunicorn) และมี secrets.env จากการติดตั้งเดิมอยู่ ถือเป็นการอัปเดต ขั้นตอน
+  # ถัดไปจะรีสตาร์ทให้เอง -- ถ้าเป็นโปรแกรมอื่นแย่งพอร์ตยังต้อง FAIL เหมือนเดิม
+  local owner
   for p in "$ADMIN_PORT" "$FAS_PORT" "$NDS_PORT" "$ADMIN_BACKEND" "$FAS_BACKEND"; do
     command -v ss >/dev/null 2>&1 || continue
     if ss -Hltn "sport = :${p}" 2>/dev/null | grep -q .; then
-      err "พอร์ต ${p} ถูกใช้งานอยู่แล้ว"; fail=1
+      owner="$(ss -Hltnp "sport = :${p}" 2>/dev/null | grep -oE 'users:\(\("[^"]+"' | head -1 | cut -d'"' -f2)"
+      if [[ -f "${ETC_DIR}/secrets.env" && "$owner" =~ ^(nginx|opennds|gunicorn)$ ]]; then
+        info "พอร์ต ${p} ใช้โดย ${owner} ของการติดตั้งเดิม — รันทับเพื่ออัปเดต จะรีสตาร์ทให้เอง"
+      else
+        err "พอร์ต ${p} ถูกใช้งานอยู่แล้ว${owner:+ (โดย ${owner})}"; fail=1
+      fi
     fi
   done
 
@@ -1180,7 +1191,10 @@ build_opennds() {
   # ด้วยเสมอ ไม่ใช่แค่เช็คว่ามี binary อยู่หรือไม่
   local nds_installed_ver="" nds_pinned_ver="${OPENNDS_REF#v}"
   if command -v opennds >/dev/null 2>&1; then
-    nds_installed_ver="$(opennds -v 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+    # N24: `opennds -v` พิมพ์เวอร์ชันถูกต้องแต่คืน exit 1 เสมอ (ยืนยันกับ 10.1.3 บน Pi จริง) ภายใต้
+    # set -e -o pipefail การกำหนดค่าบรรทัดนี้จึงล้มทั้งสคริปต์ทุกครั้งที่รันทับเครื่องที่ติดตั้ง
+    # openNDS แล้ว -- `|| true` ยังได้ค่าเวอร์ชันที่พิมพ์ออกมาครบ แค่ไม่ปล่อยให้ exit code ฆ่าสคริปต์
+    nds_installed_ver="$(opennds -v 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)" || true
   fi
   if [[ -n "$nds_installed_ver" && "$nds_installed_ver" != "$nds_pinned_ver" ]]; then
     warn "พบ openNDS ${nds_installed_ver} ติดตั้งอยู่ แต่ตอนนี้ pin ไว้ที่ ${OPENNDS_REF} (${nds_pinned_ver}) -- บิลด์ใหม่ให้ตรง pin เสมอ (ข้ามการ reuse binary เดิม)"
