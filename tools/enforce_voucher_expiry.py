@@ -130,6 +130,15 @@ def deauth_mac(mac: str, ndsctl_bin: str = "ndsctl") -> bool:
         cmd = ["sudo", "-n", *cmd]
     try:
         r = subprocess.run(cmd, capture_output=True, timeout=10)
+        out = (getattr(r, "stdout", b"") or b"").decode(errors="replace") + (r.stderr or b"").decode(errors="replace")
+        if r.returncode != 0 and "not found" in out.lower():
+            # N28: openNDS ไม่มีเครื่องนี้อยู่แล้ว (ลูกค้าเดินออกไป หลุดเพราะ idle timeout หรือยังไม่
+            # เคย login) -- ยืนยันบน Pi จริงว่าได้ "Client ... not found." exit 1 แบบนี้ เป้าหมาย
+            # "ไม่ให้ออกเน็ตได้อีก" สำเร็จอยู่แล้ว ต้องนับเป็นสำเร็จ ไม่งั้น N22 จะเว้น session ไว้
+            # ให้ลองใหม่ทุก 5 นาทีไปตลอดกาล (ERROR ถม log + "กำลังใช้งาน" บนแดชบอร์ดค้าง)
+            # ซึ่งเป็นกรณีที่เกิดบ่อยที่สุดในร้านจริง
+            log.info("ndsctl deauth %s: ไม่อยู่ใน openNDS แล้ว ถือว่าตัดสำเร็จ", mac)
+            return True
         if r.returncode != 0:
             log.error("ndsctl deauth %s ไม่สำเร็จ (exit %d): %s -- ลูกค้ารายนี้ยังออกเน็ตได้อยู่ "
                      "ทั้งที่ voucher ถูกตัดสิทธิ์แล้ว ต้องแก้สิทธิ์ sudo ของ ndsctl",

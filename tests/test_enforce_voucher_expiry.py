@@ -274,3 +274,33 @@ def test_run_closes_session_when_deauth_succeeds(monkeypatch):
     assert summary.deauth_ok == 1
     assert summary.sessions_closed == 1
     assert len(state["closed"]) == 1
+
+
+# ============== N28: ลูกค้าไม่อยู่ใน openNDS แล้ว (เดินออกไป / idle timeout) ต้องนับว่าตัดสำเร็จ
+def test_deauth_counts_client_already_gone_as_success(monkeypatch):
+    """ยืนยันบน Pi จริง: `ndsctl deauth <mac>` ของเครื่องที่ไม่อยู่แล้วได้ stdout
+    "Client ... not found." exit 1 -- ถ้านับเป็นล้มเหลว N22 จะเว้น session ไว้ตลอดกาล"""
+    monkeypatch.setattr(ev.shutil, "which", lambda _: "/usr/bin/ndsctl")
+    monkeypatch.setattr(ev, "_running_as_root", lambda: True)
+
+    class FakeResult:
+        returncode = 1
+        stdout = b"Client aa:bb:cc:dd:ee:01 not found."
+        stderr = b""
+
+    monkeypatch.setattr(ev.subprocess, "run", lambda *a, **kw: FakeResult())
+    assert ev.deauth_mac("AA:BB:CC:DD:EE:01") is True
+
+
+def test_deauth_other_failures_still_count_as_failure(monkeypatch):
+    """ต้องไม่กลืนความล้มเหลวจริง เช่น permission denied แบบที่เจอใน N22"""
+    monkeypatch.setattr(ev.shutil, "which", lambda _: "/usr/bin/ndsctl")
+    monkeypatch.setattr(ev, "_running_as_root", lambda: True)
+
+    class FakeResult:
+        returncode = 3
+        stdout = b""
+        stderr = b"cat: /etc/config/opennds: Permission denied"
+
+    monkeypatch.setattr(ev.subprocess, "run", lambda *a, **kw: FakeResult())
+    assert ev.deauth_mac("AA:BB:CC:DD:EE:01") is False
