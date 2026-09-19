@@ -777,6 +777,21 @@ configure_time() {
 
   svc enable chronyd 2>/dev/null || svc enable chrony 2>/dev/null || warn "เปิด chrony อัตโนมัติไม่สำเร็จ"
 
+  # *** N23 (พบจากการทดสอบไฟดับบน Pi จริง 2026-09-19) *** Pi 4 ไม่มีนาฬิกา RTC ตอนบูตนาฬิกา
+  # เริ่มจากเวลาเก่าที่บันทึกไว้ (รอบนั้นผิดไป 2.98 วัน) แล้วค่อยกระโดดเมื่อ chrony sync ได้
+  # ซึ่งเกิดช้ากว่า openNDS พร้อมรับลูกค้าถึง ~106 วินาที -- ระหว่างนั้นลูกค้า login และใช้เน็ต
+  # ได้แล้ว แต่ log ทุกแถวติดวันที่ผิด ปนกับข้อมูลจริงของวันนั้นจนแยกไม่ออก (ขัด ม.26 ตรง ๆ)
+  # chrony-wait.service (มากับแพ็กเกจ chrony อยู่แล้ว แต่ปิดไว้โดย default) จะกั้น
+  # time-sync.target ไว้จนกว่านาฬิกาจะ sync -- openNDS/cafe-logger ผูก After=time-sync.target
+  # ไว้ (ดู drop-in ข้างล่างและ unit ของ cafe-logger) จึงไม่มีลูกค้าออกเน็ตได้ตอนนาฬิกายังผิด
+  # มีเพดาน TimeoutStartSec=180 ของตัว unit เอง: ถ้า NTP ไม่มาภายใน 3 นาที unit จะ fail แต่
+  # time-sync.target ยังถูกนับว่าถึงแล้ว (เป็นแค่ Wants) ร้านจึงไม่ล่มยาวเพราะเน็ตมีปัญหา
+  if systemctl cat chrony-wait.service >/dev/null 2>&1; then
+    svc enable chrony-wait 2>/dev/null || warn "เปิด chrony-wait ไม่สำเร็จ -- หลังไฟดับลูกค้าอาจใช้เน็ตได้ก่อนนาฬิกาถูก"
+  else
+    warn "ไม่พบ chrony-wait.service -- หลังไฟดับลูกค้าอาจใช้เน็ตได้ก่อนนาฬิกา sync (log จะติดเวลาผิด)"
+  fi
+
   # แก้บั๊ก (พบตอนตรวจทานรอบ 2) 2 จุดพร้อมกันเพราะเป็นสาเหตุ-ผลกันตรง ๆ:
   #   (1) เดิมมี `set -e` ครอบทั้งสคริปต์ แต่ chronyc ล้มได้ (เช่น chronyd ยังไม่พร้อม) และ
   #       pipefail ทำให้ทั้ง pipeline คืน exit code ที่ไม่ใช่ 0 -- ตัวแปร `off="$(...)"`
@@ -1227,6 +1242,15 @@ build_opennds() {
 [Service]
 ExecStartPre=-/bin/sh -c 'pgrep -x opennds >/dev/null || rm -f /tmp/ndscids/heartbeat'
 NDSDROPIN
+
+  # N23: openNDS คือประตูที่ปล่อยลูกค้าออกเน็ต ต้องไม่เปิดก่อนนาฬิกาถูก (ดูเหตุผลที่ configure_time)
+  write_file /etc/systemd/system/opennds.service.d/cafe-wifi-time-sync.conf 0644 <<'NDSDROPIN'
+# managed by cafe-wifi installer -- ห้ามแก้มือ
+# ห้ามปล่อยลูกค้าออกเน็ตก่อนนาฬิกา sync ไม่งั้น log ตาม ม.26 จะติดเวลาผิด (Pi 4 ไม่มี RTC)
+[Unit]
+Wants=time-sync.target
+After=time-sync.target
+NDSDROPIN
   run_sh "systemctl daemon-reload"
 
   local faskey="CHANGEME"
@@ -1359,8 +1383,9 @@ UNIT
   write_file /etc/systemd/system/cafe-logger.service 0644 <<UNIT
 [Unit]
 Description=Cafe WiFi connection/DNS log collector
-After=network-online.target mariadb.service dnsmasq.service cafe-wifi-conntrack-acct.service
-Wants=cafe-wifi-conntrack-acct.service
+# N23: time-sync.target -- ห้ามเขียน log ก่อนนาฬิกา sync (Pi 4 ไม่มี RTC บูตมาเวลาผิดได้หลายวัน)
+After=network-online.target mariadb.service dnsmasq.service cafe-wifi-conntrack-acct.service time-sync.target
+Wants=cafe-wifi-conntrack-acct.service time-sync.target
 
 [Service]
 Type=simple
