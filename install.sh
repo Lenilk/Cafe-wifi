@@ -1417,6 +1417,9 @@ After=network-online.target mariadb.service dnsmasq.service cafe-wifi-conntrack-
 Wants=cafe-wifi-conntrack-acct.service time-sync.target
 
 [Service]
+# N31 (รอบสอง 2026-09-20): ตัวอ่านเหตุการณ์ conntrack ต้องได้ CPU ก่อนงานอื่น ถ้าอ่านช้าบัฟเฟอร์
+# netlink จะล้นแล้วเคอร์เนลทิ้งเหตุการณ์ทิ้ง = หลักฐานขาดโดยไม่มีใครรู้ (ENOBUFS)
+Nice=-5
 Type=simple
 User=${APP_USER}
 Group=${APP_USER}
