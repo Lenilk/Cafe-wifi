@@ -11,12 +11,12 @@ tests/test_logs_verify.py (N2) รวมผลข้างเคียงที�
 from __future__ import annotations
 
 import contextlib
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 
 from common import crypto
-from common.customer import PURGED_MARK, anonymize_customer
+from common.customer import PURGED_MARK, anonymize_customer, retention_hold_until
 
 # ================================================================== ส่วนที่ 1: common/customer.py ตรง ๆ
 
@@ -56,6 +56,7 @@ AUDIT: list[tuple] = []
 
 
 def _reset():
+    LAST_ACTIVITY[0] = datetime.now() - timedelta(days=400)
     CUSTOMERS.clear()
     CUSTOMERS.append({
         "id": 1, "natid_hash": "hash-of-real-id", "natid_enc": b"x" * 40,
@@ -68,6 +69,9 @@ def _reset():
         "last_seen": datetime(2026, 7, 1), "visit_count": 1, "is_blocked": 0,
     })
     AUDIT.clear()
+
+
+LAST_ACTIVITY = [datetime.now() - timedelta(days=400)]  # N33: ค่าเริ่มต้น = พ้นระยะเก็บแล้ว
 
 
 class FakeCursor:
@@ -101,6 +105,10 @@ class FakeCursor:
                 self.rowcount = 1
             else:
                 self.rowcount = 0
+        elif s.startswith("select greatest("):
+            # N33: กิจกรรมล่าสุดของลูกค้า -- ค่าเริ่มต้นตั้งให้เก่ากว่าระยะเก็บ (ลบได้) เทสต์ที่
+            # ต้องการกรณี "ยังลบไม่ได้" จะเซ็ต LAST_ACTIVITY ให้เป็นวันที่ใกล้ ๆ เอง
+            self._rows = [{"last_activity": LAST_ACTIVITY[0]}]
         elif s.startswith("insert into audit_log"):
             AUDIT.append(args)
             self.rowcount = 1
@@ -238,3 +246,40 @@ def test_reveal_on_purged_customer_returns_410_not_crash(client):
     html = r.get_data(as_text=True)
     assert "ถูกลบข้อมูล" in html
     assert len(AUDIT) == 0, "ไม่ควรลง audit_log เปิดเผย เพราะไม่มีอะไรให้เปิดเผยจริง"
+
+
+# ============ N33: ม.26 บังคับเก็บข้อมูลผู้ใช้บริการ -- ลบตามคำขอก่อนครบกำหนดไม่ได้
+def test_retention_hold_blocks_while_inside_window():
+    now = datetime(2026, 9, 20, 12, 0, 0)
+    q = lambda sql, args=(): {"last_activity": datetime(2026, 9, 1, 10, 0, 0)}
+
+    hold = retention_hold_until(q, 1, retention_days=90, now=now)
+
+    assert hold == datetime(2026, 11, 30, 10, 0, 0)
+
+
+def test_retention_hold_is_none_after_window():
+    now = datetime(2026, 9, 20, 12, 0, 0)
+    q = lambda sql, args=(): {"last_activity": datetime(2026, 1, 1, 10, 0, 0)}
+
+    assert retention_hold_until(q, 1, retention_days=90, now=now) is None
+
+
+def test_retention_hold_is_none_when_customer_has_no_activity():
+    assert retention_hold_until(lambda sql, args=(): None, 1, retention_days=90) is None
+
+
+def test_erase_is_refused_while_customer_data_must_be_kept(client):
+    """สิทธิ์ขอลบตาม PDPA ใช้ไม่ได้กับข้อมูลที่กฎหมายอื่นบังคับให้เก็บ -- ต้องปฏิเสธ แต่ต้อง
+    บันทึกคำขอไว้เป็นหลักฐานว่าได้รับเรื่องแล้ว (ไม่ใช่เงียบหาย)"""
+    LAST_ACTIVITY[0] = datetime.now() - timedelta(days=3)
+    _login_as(client, "admin")
+
+    r = client.post("/customers/1/erase", data={"reason": "ลูกค้าขอใช้สิทธิ์ลบข้อมูลตาม PDPA"},
+                    follow_redirects=False)
+
+    assert r.status_code == 302
+    assert CUSTOMERS[0]["natid_masked"] != PURGED_MARK, "ห้ามลบระหว่างช่วงเก็บบังคับ"
+    assert len(AUDIT) == 1
+    assert AUDIT[0][1] == "erase_refused"
+    assert "ยังอยู่ในช่วงเก็บบังคับถึง" in AUDIT[0][4]

@@ -20,7 +20,7 @@ from flask import (Flask, abort, flash, g, redirect, render_template,
                    request, session, url_for)
 
 from common import audit, crypto
-from common.customer import PURGED_MARK, anonymize_customer
+from common.customer import PURGED_MARK, anonymize_customer, retention_hold_until
 from common.db import execute, get_conn, query_all, query_one
 from common.qr import voucher_qr_svg
 from logger.integrity import SqlManifestStore, verify_chain
@@ -487,6 +487,19 @@ def erase_customer(cid: int):
         abort(404)
     if row["natid_masked"] == PURGED_MARK:
         flash("ลูกค้ารายนี้ถูกลบข้อมูลระบุตัวตนไปแล้ว", "warn")
+        return redirect(url_for("customers"))
+
+    # N33: ม.26 บังคับให้เก็บข้อมูลผู้ใช้บริการไว้ตามกำหนด ลบก่อนครบ = log ที่เหลือชี้กลับไปหา
+    # บุคคลไม่ได้ ซึ่งผิดกฎหมาย -- PDPA เองยกเว้นสิทธิ์ขอลบไว้ในกรณีที่มีกฎหมายอื่นบังคับให้เก็บ
+    # สิทธิ์ของเจ้าของข้อมูลไม่ได้หายไป แค่เลื่อน และ purge_old_data จะลบให้เองเมื่อพ้นกำหนด
+    hold_until = retention_hold_until(query_one, cid)
+    if hold_until:
+        audit.log(audit.ERASE_REFUSED, staff_id=session["staff_id"], target=f"customer:{cid}",
+                  client_ip=g.client_ip,
+                  detail=f"ยังอยู่ในช่วงเก็บบังคับถึง {hold_until:%Y-%m-%d} — คำขอ: {reason}")
+        flash(f"ยังลบข้อมูลระบุตัวตนไม่ได้ ต้องเก็บไว้ถึง {hold_until:%d/%m/%Y} "
+              "ตาม พ.ร.บ.คอมพิวเตอร์ ม.26 (ระบบจะลบให้อัตโนมัติเมื่อพ้นกำหนด) "
+              "คำขอของเจ้าของข้อมูลถูกบันทึกไว้แล้ว", "warn")
         return redirect(url_for("customers"))
 
     n = anonymize_customer(execute, cid)
