@@ -886,6 +886,29 @@ configure_network() {
   upl_ip="${UPLINK_CIDR%%/*}"
   upl_net="$(cidr_to_network "$UPLINK_CIDR")"
 
+  # ---------- N34: ปลด NIC ฝั่งลูกค้าออกจาก NetworkManager ก่อนตั้ง IP เอง ----------
+  # Raspberry Pi OS / Debian รุ่นใหม่ใช้ NetworkManager คุมทุกอินเทอร์เฟซโดยปริยาย ถ้าไม่ปลด
+  # มันจะแย่งตั้งค่า ${NIC} กับเรา (ขอ DHCP ทับ static IP ที่เราตั้ง, ลบ IP ทิ้งตอน renew)
+  # ทำให้ลูกค้าหลุดเป็นช่วง ๆ แบบหาสาเหตุยาก -- เจอจริงตอนติดตั้งบน Pi ครั้งแรก 2026-09-16
+  # แล้วแก้ด้วยมือ ซึ่งแปลว่าติดตั้งเครื่องใหม่จะเจอซ้ำ จึงต้องอยู่ในตัวติดตั้ง
+  #
+  # แตะเฉพาะ ${NIC} เท่านั้น ห้ามแตะอินเทอร์เฟซอื่น (เช่น wlan0 ที่ใช้ SSH เข้ามาดูแลเครื่อง)
+  # ถ้าเครื่องไม่ได้ใช้ NetworkManager ก็ข้ามไปเงียบ ๆ (ifupdown/systemd-networkd ไม่มีปัญหานี้)
+  if command -v nmcli >/dev/null 2>&1 && systemctl is-active --quiet NetworkManager 2>/dev/null; then
+    write_file "/etc/NetworkManager/conf.d/99-${APP_NAME}-unmanage-${NIC}.conf" 0644 <<NMCONF
+# managed by ${APP_NAME} installer -- ห้ามแก้มือ
+# ${NIC} ถูกตั้งค่าโดย ${APP_NAME}-netsetup.service (static IP + macvlan ฝั่งลูกค้า)
+# ปล่อยให้ NetworkManager คุมด้วยจะแย่งกันจนลูกค้าหลุดเป็นช่วง ๆ
+[keyfile]
+unmanaged-devices=interface-name:${NIC}
+NMCONF
+    run_sh "nmcli general reload 2>/dev/null || systemctl reload NetworkManager 2>/dev/null || true"
+    run_sh "nmcli device set '${NIC}' managed no 2>/dev/null || true"
+    ok "ปลด ${NIC} ออกจาก NetworkManager แล้ว (อินเทอร์เฟซอื่นไม่ถูกแตะ)"
+  else
+    info "ไม่ได้ใช้ NetworkManager — ข้ามขั้นตอนปลด ${NIC}"
+  fi
+
   write_file "/etc/sysctl.d/99-${APP_NAME}.conf" 0644 <<'SYSCTL'
 net.ipv4.ip_forward = 1
 net.ipv4.conf.all.rp_filter = 0
