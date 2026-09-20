@@ -10,6 +10,14 @@ metadata:
 
 Built a 15-slide `.pptx` presentation for the cafe-wifi project (Thai academic senior-project deck, coffee/teal palette, Tahoma font) via `pptxgenjs`. Several environment-specific problems came up that will recur on this machine for any future pptx work:
 
+**UPDATE 2026-09-21: Microsoft Office is NO LONGER installed on this machine.** Verified absent: no
+`PowerPoint.Application`/`Word.Application` ProgIDs in HKLM Classes, no App Paths entry for `POWERPNT.EXE`/
+`WINWORD.EXE`, no `C:\Program Files\Microsoft Office`, no ClickToRun config (only a leftover "Teams Meeting
+Add-in for Microsoft Office" uninstall entry). The PowerPoint COM workaround in item 1 below **will not work
+here any more** — do not retry it. There is also still no LibreOffice, so this machine currently has *no* way
+to render .pptx/.docx for visual QA. The user's other machine does have Word + PowerPoint; do rendering/QA
+work there. Everything else below (pip deps, PYTHONUTF8, Thai charSpacing, Tahoma) is still valid.
+
 1. **No LibreOffice installed on this machine.** The pptx skill's `scripts/office/soffice.py` wrapper also fails outright here — it's written for a Linux sandbox and calls `socket.AF_UNIX`, which doesn't exist on native Windows Python, so it throws `AttributeError` before even checking for soffice.
    **Workaround:** Microsoft PowerPoint (Office ProPlus 2021) *is* installed. Use PowerShell COM automation instead to render slides to PNG for visual QA:
    ```powershell

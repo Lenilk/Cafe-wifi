@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: project
   originSessionId: 1cd1dc59-ab98-4dfa-9713-54278da60398
-  modified: 2026-08-27T18:43:54.502Z
+  modified: 2026-08-28T06:49:31.203Z
 ---
 
 **สถานะ lab ปัจจุบัน (2026-08-27):** VM `OpenWrt-Router` (x86, 256MB) จำลองเราเตอร์บ้านตาม
@@ -106,5 +106,12 @@ install.sh เดิมเข้าใจผิดสาเหตุนี้ �
 - **ยังเหลือที่ต้องทำบน Pi จริงเท่านั้น**: T13 (จับเวลา Wi-Fi จริงกับ OS 4 ตัว), T14 (load test
   20 client จริง), T16/T17 เต็มรูปแบบกับอุปกรณ์แยกเครื่องจริง, T16 กรณีเปิด Access Control,
   throughput วัดจริง, ความร้อน/SD card endurance
+
+**อัปเดต (2026-08-28): เริ่มทดสอบบน Raspberry Pi จริงแล้ว** — VM lab ปิดงานครบตามที่ทำได้แล้ว
+ผู้ใช้ย้ายไปทดสอบต่อบนฮาร์ดแวร์จริง เช็คลิสต์กับดักที่เจอใน VM lab ที่ยังใช้ได้กับ Pi จริง:
+1. แก้โค้ดใน `app/` แล้ว sync ให้ครบทั้ง source tree กับที่ deploy จริงเสมอ (ดู [[r11-opennds-macvlan-resolved]] กับดักตอนแก้บั๊ก double-base64)
+2. cleanup opennds ด้วย `systemctl stop opennds` เสมอ ห้าม `pkill -9` (กับดักที่ 4 ข้างบน)
+3. ระวังบั๊ก backtick-in-heredoc ซ้ำเวลาเขียนคอมเมนต์ไทยใหม่ใน install.sh
+4. ตรวจ `dhcp-leasefile` ให้ตรง `/var/lib/misc/dnsmasq.leases` ตามที่ openNDS คาดหวัง
 
 ดู [[cafe-wifi-source-of-truth]]
