@@ -1,0 +1,52 @@
+#!/bin/sh
+# ซิงก์ความจำของ Claude Code เข้า memory/ ในรีโปอัตโนมัติทุกครั้งที่ commit
+#
+# ทำไมต้องมี: ความจำจริงของ Claude อยู่นอกโปรเจกต์ (~/.claude/projects/<slug>/memory)
+# git จึงไม่เห็น ถ้าลืม cp เข้ามา เครื่องอื่นที่ pull ไปจะได้ของค้างเก่า -- เคยค้างมาแล้ว
+# เกือบเดือน (แก้ใน commit 512e412) hook นี้ปิดช่องนั้นให้ ไม่ต้องพึ่งความจำของใคร
+#
+# เปิดใช้ครั้งเดียวต่อเครื่อง:  git config core.hooksPath .githooks
+# ข้ามชั่วคราว:                 git commit --no-verify
+
+set -e
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+# ชื่อโฟลเดอร์ memory ของ Claude Code อิงจาก path เต็มของโปรเจกต์
+# C:/Users/lenul/Desktop/cafe-wifi  ->  C--Users-lenul-Desktop-cafe-wifi
+win_path=$(pwd -W 2>/dev/null || pwd)
+slug=$(printf '%s' "$win_path" | tr '/\:' '---')
+mem_dir="$HOME/.claude/projects/$slug/memory"
+
+# เครื่องที่ไม่มีความจำ (เช่น เครื่องที่เอาไว้ทำเอกสารอย่างเดียว) -> ข้ามเงียบ ๆ
+[ -d "$mem_dir" ] || exit 0
+ls "$mem_dir"/*.md >/dev/null 2>&1 || exit 0
+
+mkdir -p memory
+synced=""
+for src in "$mem_dir"/*.md; do
+  base=$(basename "$src")
+  if [ ! -f "memory/$base" ] || ! cmp -s "$src" "memory/$base"; then
+    cp -f "$src" "memory/$base"
+    synced="$synced $base"
+  fi
+done
+
+# ไฟล์ที่อยู่ในรีโปแต่หายไปจากความจำจริงแล้ว -- เตือนอย่างเดียว ไม่ลบให้เอง
+# (ความจำที่ผิดควรถูกลบ แต่การลบไฟล์อัตโนมัติเสี่ยงเกินไปสำหรับ hook)
+orphans=""
+for dst in memory/*.md; do
+  [ -e "$dst" ] || continue
+  base=$(basename "$dst")
+  [ -f "$mem_dir/$base" ] || orphans="$orphans $base"
+done
+
+if [ -n "$synced" ]; then
+  git add memory/
+  echo "pre-commit: ซิงก์ความจำเข้า memory/ แล้ว ->$synced"
+fi
+if [ -n "$orphans" ]; then
+  echo "pre-commit: เตือน -- memory/ มีไฟล์ที่ไม่มีในความจำจริงแล้ว:$orphans"
+  echo "            ถ้าตั้งใจลบ ให้ 'git rm' เอง"
+fi
+exit 0
