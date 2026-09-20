@@ -4,7 +4,8 @@ from datetime import datetime
 
 import pytest
 
-from logger.conn_collector import ConnRecord, parse_conntrack_line
+from logger import conn_collector
+from logger.conn_collector import ConnRecord, flush_buffer, parse_conntrack_line
 from logger.dns_collector import DnsCorrelator, parse_dnsmasq_line, parse_syslog_timestamp
 from logger import integrity
 from logger.integrity import (MemoryManifestStore, sha256_file, seal_directory,
@@ -386,3 +387,56 @@ def test_seal_records_gz_whose_content_differs_from_the_sealed_original(tmp_path
 
     sealed = seal_directory(tmp_path, store)
     assert [e.filename for e in sealed] == ["dnsmasq.log-2026-09-16.gz"]
+
+
+# ================== N31: เหตุการณ์จราจรหายตอนทราฟฟิกหนัก (ENOBUFS) และหายตอน DB สะดุด
+def _rec(port=1234):
+    return ConnRecord(ts=1789000000.0, src_ip="10.10.0.5", src_port=port, dst_ip="1.1.1.1",
+                     dst_port=443, proto="tcp", bytes_out=100, bytes_in=200)
+
+
+class _Cache:
+    def get(self, ip, now=None):
+        return "AA:BB:CC:DD:EE:01"
+
+
+def test_flush_keeps_records_when_db_fails(monkeypatch):
+    """คอมเมนต์เดิมบอกว่า 'จะลองใหม่รอบถัดไป' แต่โค้ดเดิม clear() ทิ้งทันที -- DB สะดุดครู่เดียว
+    (MariaDB ถูกรีสตาร์ทตอนติดตั้ง) ข้อมูลจราจรช่วงนั้นหายถาวร"""
+    monkeypatch.setattr(conn_collector, "insert_conn_records",
+                       lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("DB ล่ม")))
+    buf = [_rec(1), _rec(2)]
+
+    assert flush_buffer(buf, _Cache()) == 0
+    assert len(buf) == 2, "ต้องเก็บไว้ลองใหม่ ไม่ใช่ทิ้ง"
+
+
+def test_flush_clears_only_after_success(monkeypatch):
+    monkeypatch.setattr(conn_collector, "insert_conn_records", lambda recs, cache: len(recs))
+    buf = [_rec(1), _rec(2)]
+
+    assert flush_buffer(buf, _Cache()) == 2
+    assert buf == []
+
+
+def test_flush_drops_oldest_when_db_down_too_long(monkeypatch):
+    """DB ล่มยาวต้องไม่ทำให้หน่วยความจำบวมไม่มีที่สิ้นสุด แต่การทิ้งต้องถูกบันทึกไว้"""
+    monkeypatch.setattr(conn_collector, "insert_conn_records",
+                       lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("DB ล่ม")))
+    buf = [_rec(i) for i in range(10)]
+
+    flush_buffer(buf, _Cache(), max_pending=6)
+
+    assert len(buf) == 6
+    assert buf[0].src_port == 4, "ต้องทิ้งของเก่าสุดก่อน เก็บของใหม่ไว้"
+
+
+def test_stderr_drain_flags_enobufs_as_evidence_loss():
+    """ENOBUFS = เคอร์เนลทิ้งเหตุการณ์ = หลักฐานไม่ครบ ต้องดังพอให้เห็น ไม่ใช่เงียบแบบเดิม
+    (ของเดิมไม่เคยอ่าน stderr เลย ถ้าท่อเต็ม conntrack ก็ค้างไปทั้งระบบ)"""
+    seen = []
+    conn_collector._drain_stderr(
+        iter(["WARNING: We have hit ENOBUFS! We are losing events.", "", "NOTICE: buffer set"]),
+        on_event_loss=seen.append)
+
+    assert len(seen) == 1 and "ENOBUFS" in seen[0]

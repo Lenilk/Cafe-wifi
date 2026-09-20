@@ -12,15 +12,29 @@ logger/conn_collector.py — เก็บข้อมูลจราจร (meta
 from __future__ import annotations
 
 import logging
+import queue
 import re
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 
 from .netutil import MacCache
 
 log = logging.getLogger("cafe-wifi.conn_collector")
+
+# N31 (พบบน Pi จริง 2026-09-20 ขณะทดสอบโควตาด้วยการโหลดไฟล์ 100 MB หลายรอบ):
+# `conntrack -E` พ่น "WARNING: We have hit ENOBUFS! We are losing events." ออก stderr
+# แปลว่าเคอร์เนลทิ้งเหตุการณ์เพราะบัฟเฟอร์ netlink เต็ม -> conn_log ขาดหายจริง (วัดได้: โหลด
+# 5 ไฟล์ บันทึกได้ 2) ซึ่งร้ายแรงมากสำหรับหลักฐานตาม ม.26 เพราะช่วงที่ร้านคนเยอะคือช่วงที่
+# log ต้องครบที่สุด · ของเดิมยังไม่เคยอ่าน stderr เลย คำเตือนจึงไม่มีใครเห็น และถ้าท่อ stderr
+# เต็ม (64 KB) conntrack จะค้าง = หยุดเก็บ log ทั้งระบบแบบเงียบ ๆ
+NETLINK_BUFFER_BYTES = 8 * 1024 * 1024
+# คิวกันการอ่านช้าเพราะรอเขียน DB -- ตัวอ่านต้องว่างตลอดเพื่อไม่ให้ท่อจากเคอร์เนลตัน
+EVENT_QUEUE_MAX = 20000
+# เพดานเรคคอร์ดที่ค้างรอเขียนตอน DB ล่ม (กันหน่วยความจำบวมไม่มีที่สิ้นสุด)
+MAX_PENDING_RECORDS = 20000
 
 _BRACKET_RE = re.compile(r"\[([^\]]*)\]")
 _KV_RE = re.compile(r"(\w+)=(\S+)")
@@ -145,35 +159,113 @@ def insert_conn_records(records: list[ConnRecord], mac_cache: MacCache) -> int:
     return len(rows)
 
 
+def flush_buffer(buffer: list[ConnRecord], mac_cache: MacCache,
+                 max_pending: int = MAX_PENDING_RECORDS) -> int:
+    """
+    พยายามเขียน buffer ลง DB -- คืนจำนวนแถวที่เขียนสำเร็จ (0 ถ้าล้มเหลว)
+
+    N31: ของเดิมเรียก insert แล้ว `buffer.clear()` นอก try ทั้งที่คอมเมนต์เขียนว่า "จะลองใหม่
+    รอบถัดไป" -> DB สะดุดแค่ครู่เดียว (เช่น MariaDB ถูกรีสตาร์ทตอนติดตั้ง ซึ่งเกิดขึ้นจริงเมื่อ
+    2026-09-19) ข้อมูลจราจรช่วงนั้นหายถาวรโดยไม่มีใครรู้ ตอนนี้เก็บไว้ลองใหม่จริง ๆ และถ้า DB
+    ล่มยาวจนเกินเพดาน จะทิ้งของเก่าสุดพร้อม **บันทึกไว้ว่าทิ้งไปกี่รายการ** ไม่ใช่หายเงียบ
+    """
+    if not buffer:
+        return 0
+    try:
+        n = insert_conn_records(buffer, mac_cache)
+    except Exception:
+        log.exception("เขียน conn_log ไม่สำเร็จ — เก็บ %d รายการไว้ลองใหม่รอบถัดไป", len(buffer))
+        if len(buffer) > max_pending:
+            dropped = len(buffer) - max_pending
+            del buffer[:dropped]
+            log.error("DB ล่มนานจนคิวเกิน %d รายการ — ทิ้งรายการเก่าสุด %d รายการ "
+                     "(หลักฐานช่วงนั้นจะไม่ครบ)", max_pending, dropped)
+        return 0
+    buffer.clear()
+    return n
+
+
+def _drain_stderr(stream, on_event_loss=None) -> None:  # pragma: no cover (thread I/O)
+    """
+    N31: อ่าน stderr ของ conntrack ตลอดเวลา 2 เหตุผล: (1) ถ้าไม่อ่าน ท่อจะเต็มแล้ว conntrack
+    ค้าง = หยุดเก็บ log ทั้งระบบ (2) ข้อความ ENOBUFS คือสัญญาณว่าหลักฐานขาดหาย ต้องดังให้ได้ยิน
+    """
+    for line in stream:
+        line = line.strip()
+        if not line:
+            continue
+        if "ENOBUFS" in line:
+            log.error("conntrack: %s -- เหตุการณ์บางส่วนถูกทิ้ง conn_log ช่วงนี้ไม่ครบ", line)
+            if on_event_loss:
+                on_event_loss(line)
+        else:
+            log.warning("conntrack: %s", line)
+
+
+def _record_event_loss(detail: str, cooldown_seconds: int = 300,
+                       _last: list[float] = []) -> None:  # pragma: no cover (ต้องมี DB)
+    """บันทึกลง audit_log ว่ามีช่วงที่เก็บ log ได้ไม่ครบ -- หลักฐานความซื่อสัตย์ของระบบเอง
+    ตาม ม.26 ดีกว่าปล่อยให้ข้อมูลขาดไปเงียบ ๆ · จำกัดความถี่กันถม audit_log"""
+    now = time.time()
+    if _last and now - _last[-1] < cooldown_seconds:
+        return
+    _last.append(now)
+    try:
+        from common import audit
+        audit.log(audit.LOG_GAP, target="conn_log", detail=detail[:200])
+    except Exception:
+        log.exception("บันทึก audit_log เรื่องเหตุการณ์ที่หายไม่สำเร็จ")
+
+
 def run_forever(batch_size: int = 100, flush_interval: float = 5.0) -> None:  # pragma: no cover
     """
-    รันจริงบน gateway: เปิด `conntrack -E` เป็น subprocess แบบ stream แล้วอ่านทีละบรรทัด
-    ฟังก์ชันนี้ไม่มี unit test ตรง ๆ (ต้องมี conntrack-tools + สิทธิ์ root) แต่ตรรกะการ
-    parse/insert ด้านบนถูกทดสอบแยกแล้วอย่างละเอียด
+    รันจริงบน gateway: เปิด `conntrack -E` เป็น subprocess แล้วแยกเป็น 3 ส่วนที่ไม่บล็อกกัน
+    (N31) -- เดิมอ่านและเขียน DB อยู่ในลูปเดียวกัน ระหว่างที่รอ DB ท่อจากเคอร์เนลจะตันจนเกิด
+    ENOBUFS และเหตุการณ์ถูกทิ้ง:
+      1. เธรดอ่าน stdout  -> โยนเข้าคิว (ต้องว่างตลอด)
+      2. เธรดอ่าน stderr  -> log คำเตือน ENOBUFS + บันทึกลง audit_log
+      3. ลูปหลัก          -> ดึงจากคิวมาเขียน DB เป็น batch
     """
     mac_cache = MacCache()
     buffer: list[ConnRecord] = []
+    events: queue.Queue = queue.Queue(maxsize=EVENT_QUEUE_MAX)
     last_flush = time.time()
 
-    cmd = ["conntrack", "-E", "-o", "timestamp,extended", "-e", "DESTROY"]
+    cmd = ["conntrack", "-E", "-o", "timestamp,extended", "-e", "DESTROY",
+           "--buffer-size", str(NETLINK_BUFFER_BYTES)]
     log.info("เริ่ม conn_collector: %s", " ".join(cmd))
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
-    try:
+    def _read_stdout() -> None:
         for line in proc.stdout:  # type: ignore[union-attr]
             rec = parse_conntrack_line(line)
-            if rec:
-                buffer.append(rec)
+            if not rec:
+                continue
+            try:
+                events.put_nowait(rec)
+            except queue.Full:
+                log.error("คิวเหตุการณ์เต็ม (%d) — ทิ้งรายการนี้ conn_log ช่วงนี้จะไม่ครบ",
+                         EVENT_QUEUE_MAX)
+
+    threading.Thread(target=_read_stdout, daemon=True, name="conntrack-stdout").start()
+    threading.Thread(target=_drain_stderr, args=(proc.stderr, _record_event_loss),
+                    daemon=True, name="conntrack-stderr").start()
+
+    try:
+        while proc.poll() is None:
+            try:
+                buffer.append(events.get(timeout=flush_interval))
+            except queue.Empty:
+                pass
             now = time.time()
             if len(buffer) >= batch_size or (buffer and now - last_flush >= flush_interval):
-                try:
-                    n = insert_conn_records(buffer, mac_cache)
-                    log.debug("บันทึก conn_log %d แถว", n)
-                except Exception:
-                    log.exception("เขียน conn_log ไม่สำเร็จ — จะลองใหม่รอบถัดไป")
-                buffer.clear()
+                n = flush_buffer(buffer, mac_cache)
+                log.debug("บันทึก conn_log %d แถว", n)
                 last_flush = now
+        log.error("conntrack หยุดทำงาน (exit %s) — cafe-logger จะถูก systemd รีสตาร์ทให้",
+                 proc.returncode)
     finally:
+        flush_buffer(buffer, mac_cache)
         proc.terminate()
 
 
