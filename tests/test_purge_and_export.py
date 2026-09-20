@@ -198,3 +198,23 @@ def test_export_rejects_invalid_date_range(tmp_path):
     with pytest.raises(ValueError):
         export_evidence.export(None, datetime(2026, 8, 22), datetime(2026, 8, 1), tmp_path,
                                lambda *a: [], lambda *a: [])
+
+
+# ============ N32: วันสิ้นสุดของช่วงส่งออกหลักฐานต้องหมายถึงสิ้นวัน ไม่ใช่เที่ยงคืนต้นวัน
+def test_range_end_date_only_means_end_of_day():
+    """ของเดิม --to 2026-09-20 = 00:00:00 ทำให้ข้อมูลทั้งวันที่ 20 หายไปจากไฟล์หลักฐานเงียบ ๆ"""
+    end = export_evidence.parse_range_end("2026-09-20")
+    assert (end.hour, end.minute, end.second) == (23, 59, 59)
+    assert end.date().isoformat() == "2026-09-20"
+
+
+def test_range_end_with_explicit_time_is_untouched():
+    end = export_evidence.parse_range_end("2026-09-20T08:30:00")
+    assert (end.hour, end.minute, end.second) == (8, 30, 0)
+
+
+def test_single_day_export_range_is_valid():
+    """คำขอที่พบบ่อยที่สุดจากเจ้าหน้าที่คือ 'ขอข้อมูลวันที่ X' -- ต้องไม่ถูกปฏิเสธ"""
+    from datetime import datetime as _dt
+    start = _dt.fromisoformat("2026-09-20")
+    assert export_evidence.parse_range_end("2026-09-20") > start

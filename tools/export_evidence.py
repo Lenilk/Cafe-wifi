@@ -66,6 +66,22 @@ def build_manifest(files: list[ExportedFile], criteria: dict) -> dict:
     }
 
 
+def parse_range_end(value: str) -> datetime:
+    """
+    N32 (พบตอนทดสอบส่งออกหลักฐานบน Pi จริง 2026-09-20): ถ้าผู้ใช้ระบุวันสิ้นสุดเป็นวันที่เปล่า ๆ
+    (YYYY-MM-DD) ให้หมายถึง **สิ้นวันนั้น** ไม่ใช่เที่ยงคืนต้นวัน
+
+    ของเดิม `--to 2026-09-20` = 2026-09-20 00:00:00 ทำให้ข้อมูลของวันที่ 20 ทั้งวันไม่ติดมาใน
+    ไฟล์หลักฐานเลย (เงียบ ๆ ไม่มี error) และขอข้อมูลวันเดียว (--from กับ --to วันเดียวกัน) ก็ถูก
+    ปฏิเสธด้วย "วันที่สิ้นสุดต้องอยู่หลังวันที่เริ่มต้น" ทั้งที่เป็นคำขอที่พบบ่อยที่สุดจากเจ้าหน้าที่
+    ถ้าระบุเวลามาด้วยจะใช้ตามที่ระบุ ไม่ไปยุ่ง
+    """
+    dt = datetime.fromisoformat(value)
+    if len(value.strip()) == 10:  # "YYYY-MM-DD" ไม่มีส่วนเวลา
+        dt = dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+    return dt
+
+
 def export(mac: str | None, start: datetime, end: datetime, out_dir: Path,
           query_conn_fn, query_dns_fn, staff_id: int | None = None) -> dict:
     if end <= start:
@@ -99,12 +115,13 @@ def _cli() -> int:  # pragma: no cover
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--mac", help="กรองเฉพาะ MAC นี้ (ไม่ใส่ = ทุกเครื่อง)")
     p.add_argument("--from", dest="start", required=True, help="YYYY-MM-DD")
-    p.add_argument("--to", dest="end", required=True, help="YYYY-MM-DD")
+    p.add_argument("--to", dest="end", required=True,
+                  help="YYYY-MM-DD (นับถึงสิ้นวันนั้น) หรือระบุเวลาเองเป็น YYYY-MM-DDTHH:MM:SS")
     p.add_argument("--out", default="/var/log/cafe-wifi/exports")
     args = p.parse_args()
 
     start = datetime.fromisoformat(args.start)
-    end = datetime.fromisoformat(args.end)
+    end = parse_range_end(args.end)
 
     def q_conn(mac, s, e):
         sql = "SELECT ts, mac, src_ip, src_port, dst_ip, dst_port, proto, bytes_out, bytes_in FROM conn_log WHERE ts BETWEEN %s AND %s"
