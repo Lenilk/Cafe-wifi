@@ -8,3 +8,4 @@
 - [Pi DHCP + portal milestone](pi-dhcp-and-portal-milestone.md) — real-hardware test log: customer flow, log integrity, voucher enforcement, power-loss recovery all verified; 17 bugs fixed (N17-N33), install.sh re-run procedure; what still needs testing
 - [Pi macvlan/bcmgenet issue (closed)](pi-macvlan-bcmgenet-open-issue.md) — CLOSED: broadcast UDP was never broken; the real cause was our own nftables input policy dropping DHCPDISCOVER from 0.0.0.0. Keeps the ruled-out theories and the tcpdump-pairing lesson
 - [Aruba lab switch](aruba-lab-switch.md) — 2026-09-19 moved to Aruba CX 6100 + AP-515 for PoE; console/login facts, SSID must be Network-assigned (never VC-assigned/NAT)
+- [Two-machine workflow](two-machine-workflow.md) — งานเล่ม/สไลด์ทำที่อีกเครื่อง (เครื่องนี้ไม่มี Office); ส่งบริบทให้อีกเครื่องผ่านโฟลเดอร์ memory/ ในรีโป ต้อง cp+commit ทุกครั้ง
