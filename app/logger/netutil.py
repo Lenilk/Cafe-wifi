@@ -13,6 +13,10 @@ _ARP_LINE = re.compile(
 )
 
 
+BURST_BATCH_SIZE = 16   # N40 -- ยิง ping ทีละกี่ตัวก่อนหยุดพัก
+BURST_BATCH_GAP = 0.5   # N40 -- หยุดพักกี่วินาทีระหว่างชุด (254 ตัว ≈ 8 วินาที)
+
+
 def _iter_arp_entries(arp_path: str | Path):
     """แกะทุกแถวใน /proc/net/arp เป็น (ip, mac) -- ข้ามแถวที่ mac เป็น 00:00:00:00:00:00
     (incomplete entry ที่เคอร์เนลยังไม่ resolve จริง) ใช้ร่วมกันทั้ง resolve_mac() (หา MAC
@@ -49,7 +53,9 @@ def read_arp_table(arp_path: str | Path = "/proc/net/arp") -> dict[str, str]:
     return dict(_iter_arp_entries(arp_path))
 
 
-def active_arp_refresh(network: str, timeout: float = 1.0) -> None:
+def active_arp_refresh(network: str, timeout: float = 1.0,
+                       batch_size: int = BURST_BATCH_SIZE,
+                       batch_gap: float = BURST_BATCH_GAP) -> None:
     """
     *** เพิ่มหลังพบข้อจำกัดร้ายแรงของ T17 จาก VM lab (2026-08-28) ***
 
@@ -65,8 +71,9 @@ def active_arp_refresh(network: str, timeout: float = 1.0) -> None:
     ฟังก์ชันนี้บังคับให้ Pi ยิง ARP request ไปหาทุก IP ในวงก่อนอ่าน ARP cache จริง (ping
     แบบขนานทุก host ในวง ใช้ ping เองเพราะมีติดมากับทุก distro อยู่แล้วไม่ต้องเพิ่ม
     package ใหม่ -- ไม่สนใจว่า ping จะได้รับ reply กลับมาไหม สนใจแค่ว่า ARP request/reply
-    เกิดขึ้นแล้วเคอร์เนลบันทึกไว้ใน cache) ยิงพร้อมกันทั้งวงไม่ใช่ทีละตัว เพราะรอบละ 1 นาที
-    (cafe-bypass-detect.timer) ไม่พอให้ยิงทีละตัวได้ครบ /24 ทัน
+    เกิดขึ้นแล้วเคอร์เนลบันทึกไว้ใน cache) ยิงเป็นชุด ๆ ขนานกัน ไม่ใช่ทีละตัวจนจบ เพราะรอบละ
+    1 นาที (cafe-bypass-detect.timer) ไม่พอให้ยิงทีละตัวแบบรอผลได้ครบ /24 ทัน (ดู N40 ด้านล่าง
+    ว่าทำไมถึงไม่ยิงพรวดเดียวทั้งวงด้วย)
 
     🔶 หมายเหตุการทดสอบบน VM lab (2026-08-28): ยืนยันว่า active scan บังคับให้เกิด ARP
     resolution กับอุปกรณ์ภายนอกจริงได้สำเร็จ (เจอ host adapter ของเครื่อง Windows และ
@@ -78,11 +85,21 @@ def active_arp_refresh(network: str, timeout: float = 1.0) -> None:
     (Raspberry Pi ที่ต่อกับอุปกรณ์ bypass จริงแยกเครื่องกันทางกายภาพจะไม่เจอข้อจำกัดนี้เลย)
     **T17 เต็มรูปแบบ ("bypass 20 ครั้ง ตรวจจับได้กี่ %") ยังต้องรอทดสอบบน Pi จริงกับอุปกรณ์
     แยกเครื่องจริงถึงจะได้ตัวเลขที่เชื่อถือได้**
+
+    N40: ของเดิมยิง ping ทั้งวง (254 ตัว) พร้อมกันในเสี้ยววินาทีเดียว ผลข้างเคียงที่ไม่ได้
+    ตั้งใจคือ **เคอร์เนลสร้างรายการ conntrack 254 รายการพร้อมกัน แล้วหมดอายุพร้อมกันอีก 30
+    วินาทีต่อมา** ทำให้เกิดชุดเหตุการณ์ 250-290 รายการในวินาทีเดียวทุก ๆ นาที ซึ่งวัดแล้วว่า
+    ทำให้ตัวเก็บ log หลุด (ENOBUFS) และ **หลักฐานการใช้งานของลูกค้าหายจริง ~5%** ในช่วงนั้น
+    (ดู N39) · แก้ด้วยการทยอยยิงเป็นชุดเล็ก ๆ ห่างกันเล็กน้อย -- ครอบคลุมทั้งวงเท่าเดิม
+    ใช้เวลารวมไม่กี่วินาที (ยังจบก่อนรอบถัดไปที่ 60 วินาทีสบาย ๆ) แต่เหตุการณ์กระจายตัว
+    แทนที่จะกระจุกเป็นชุดเดียว · ผลพลอยได้: ไม่ต้องสร้างโปรเซส 254 ตัวพร้อมกันบน Pi
     """
     import subprocess
+    import time as _time
 
     net = ipaddress.ip_network(network, strict=False)
     procs = []
+    batch = 0
     for host in net.hosts():
         try:
             p = subprocess.Popen(
@@ -93,6 +110,9 @@ def active_arp_refresh(network: str, timeout: float = 1.0) -> None:
         except OSError:
             log.warning("ยิง ping ไป %s ไม่สำเร็จ (ไม่มีคำสั่ง ping?) — ข้าม active ARP refresh", host)
             return
+        batch += 1
+        if batch_size > 0 and batch % batch_size == 0 and batch_gap > 0:
+            _time.sleep(batch_gap)
     deadline = timeout + 1.0
     for p in procs:
         try:
