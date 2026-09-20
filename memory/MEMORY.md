@@ -1,0 +1,6 @@
+- [Track fixes and issues](track-fixes-and-issues.md) — always log bugs fixed / problems hit in this project as memories
+- [R11 openNDS/macvlan resolved](r11-opennds-macvlan-resolved.md) — R11 (biggest risk) confirmed fixed via macvlan, tested on real install.sh runs; also found openNDS never read the flat-text config at all
+- [VM lab VMware setup](vm-lab-vmware-setup.md) — OpenWrt + Debian VM lab topology, credentials, and 3 VMware gotchas hit while setting it up
+- [PPTX generation on Windows](pptx-generation-windows-notes.md) — no LibreOffice here, use PowerPoint COM for QA; validate.py needs PYTHONUTF8=1 + pip deps; never charSpacing on Thai text; use Tahoma
+- [Cafe-wifi source of truth](cafe-wifi-source-of-truth.md) — โค้ดจริงอยู่ในทาร์บอล ไม่ใช่บนดิสก์ และไฟล์ที่รากใหม่กว่าในทาร์บอล
+- [Reply in Thai/English only](reply-language-th-en-only.md) — user preference: always respond/report in Thai or English, never other languages
