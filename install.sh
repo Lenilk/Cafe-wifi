@@ -880,6 +880,37 @@ cidr_to_network() {
   printf '%d.%d.%d.%d/%d' $(( (net_int>>24)&255 )) $(( (net_int>>16)&255 )) $(( (net_int>>8)&255 )) $(( net_int&255 )) "$prefix"
 }
 
+ensure_uplink_before_packages() {
+  # N37 (พบตอนย้าย Pi จากเครือข่ายแล็บไปต่อเราเตอร์ TP-Link จริง 2026-09-20):
+  # install.sh ตั้งค่าเครือข่าย *หลัง* ติดตั้งแพ็กเกจ ซึ่งใช้ได้กับการติดตั้งครั้งแรกบนเครื่องที่
+  # ต่อเน็ตอยู่แล้ว แต่พอ **ย้ายเครื่องไปเครือข่ายใหม่** แล้วรันซ้ำด้วย --uplink-cidr ใหม่
+  # เครื่องยังใช้ default route เก่าที่ใช้ไม่ได้แล้ว -> apt/pip ค้างลองใหม่ซ้ำ ๆ หลายนาที
+  # (preflight เตือนว่า "ตรวจอินเทอร์เน็ตไม่ผ่าน" แต่ไม่ได้หยุดหรือแก้ให้)
+  #
+  # ตั้ง IP + default route ของ uplink ให้ก่อน **เฉพาะเมื่อเน็ตใช้ไม่ได้จริง ๆ เท่านั้น**
+  # ถ้าเน็ตใช้ได้อยู่แล้วจะไม่แตะอะไรเลย เพื่อไม่ไปตัดการเชื่อมต่อที่กำลังทำงานอยู่
+  (( SKIP_NETWORK )) && return 0
+  [[ -z "$NIC" || -z "$UPLINK_CIDR" || -z "$UPLINK_GW" ]] && return 0
+  command -v curl >/dev/null 2>&1 || return 0
+  command -v ip   >/dev/null 2>&1 || return 0
+  curl -fsS --max-time 8 -o /dev/null https://pypi.org 2>/dev/null && return 0
+
+  step "กู้การเชื่อมต่ออินเทอร์เน็ตก่อนติดตั้งแพ็กเกจ"
+  warn "เน็ตใช้ไม่ได้ตอนนี้ — ตั้ง ${UPLINK_CIDR} บน ${NIC} และเส้นทางออกผ่าน ${UPLINK_GW} ให้ก่อน"
+  warn "ถ้ากำลัง SSH เข้ามาผ่าน IP เดิมของ ${NIC} การเชื่อมต่ออาจหลุด — ให้ SSH ผ่าน IP ใหม่แทน"
+  run_sh "ip link set '${NIC}' up 2>/dev/null || true"
+  run_sh "ip addr add '${UPLINK_CIDR}' dev '${NIC}' 2>/dev/null || true"
+  run_sh "ip route replace default via '${UPLINK_GW}' dev '${NIC}' 2>/dev/null || true"
+  sleep 2
+
+  if curl -fsS --max-time 10 -o /dev/null https://pypi.org 2>/dev/null; then
+    ok "เชื่อมต่ออินเทอร์เน็ตได้แล้ว — ติดตั้งแพ็กเกจต่อได้"
+  else
+    warn "ยังออกเน็ตไม่ได้หลังตั้งค่า — ตรวจสายและค่า --uplink-cidr/--uplink-gw"
+    warn "การติดตั้งแพ็กเกจจะล้มเหลวหรือค้างนานถ้าเครื่องออกเน็ตไม่ได้จริง ๆ"
+  fi
+}
+
 configure_network() {
   if (( SKIP_NETWORK )); then info "ข้ามการตั้งค่าเครือข่าย (--skip-network)"; return 0; fi
   step "ตั้งค่าเครือข่าย (โหมดสาย LAN เส้นเดียว -- routing / NAT / DHCP / DNS บนอินเทอร์เฟซเดียว)"
@@ -1906,6 +1937,7 @@ main() {
   preflight
 
   create_user_and_dirs
+  ensure_uplink_before_packages   # N37: ย้ายเครื่องมาเครือข่ายใหม่แล้วรันซ้ำต้องไม่ค้างที่ apt/pip
   install_packages
   gen_secrets
   setup_python
