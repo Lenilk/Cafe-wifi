@@ -42,6 +42,7 @@ readonly STATE_FILE="${ETC_DIR}/install.state"
 NIC=""                          # อินเทอร์เฟซเดียว (เช่น eth0) -- ไม่มี WAN/LAN แยกกันอีกแล้ว
 UPLINK_CIDR="192.168.1.2/24"    # IP ของ Pi ฝั่งเราเตอร์ (ใช้ออกเน็ต + SSH เข้ามาดูแล)
 UPLINK_GW="192.168.1.1"         # IP ของเราเตอร์บ้าน (default route ของ Pi)
+TRUSTED_MACS=""                 # N36: MAC ของอุปกรณ์โครงสร้างพื้นฐาน (เช่น AP) คั่นด้วย comma
 CLIENT_CIDR="10.10.0.1/24"      # IP ของ Pi ฝั่งลูกค้า (เป็น gateway/DHCP/DNS ให้ลูกค้า)
 DHCP_START="10.10.0.100"
 DHCP_END="10.10.0.250"
@@ -148,6 +149,7 @@ Cafe Wi-Fi Gateway Installer
   --enable-partitions     เปิด sql/003_partitions.sql (partition รายสัปดาห์ + event scheduler
                           -- optional, ตาราง conn_log/dns_log ที่มีข้อมูลอยู่แล้วอาจ ALTER ช้า)
   --dry-run               แสดงคำสั่งที่จะรัน แต่ไม่รันจริง
+  --trusted-mac LIST      MAC ของอุปกรณ์โครงสร้างพื้นฐานที่ไม่ต้อง login เช่น AP (คั่นด้วย ,)
   --uninstall             ถอนการติดตั้ง
   --version | -h/--help
 USAGE
@@ -159,6 +161,7 @@ parse_args() {
       --nic)             NIC="$2"; shift 2 ;;
       --uplink-cidr)     UPLINK_CIDR="$2"; shift 2 ;;
       --uplink-gw)       UPLINK_GW="$2"; shift 2 ;;
+      --trusted-mac)     TRUSTED_MACS="$2"; shift 2 ;;
       --client-cidr)     CLIENT_CIDR="$2"; shift 2 ;;
       --wan-if|--lan-if|--lan-cidr)
         die "ตัวเลือก $1 ถูกยกเลิกแล้ว (D17 เปลี่ยนเป็นโหมดสาย LAN เส้นเดียว) ใช้ --nic / --uplink-gw / --client-cidr แทน" ;;
@@ -1326,6 +1329,25 @@ NDSDROPIN
   # (parser ของ libopennds.sh อ่านแบบ plain grep/awk จากไฟล์นี้ได้โดยไม่ต้องมี uci บินารีจริง
   # ก็ได้ -- ดู get_option_from_config()/get_list_from_config() ใน libopennds.sh)
   # mode 0640 root:root (แก้บั๊ก H1: ป้องกันไม่ให้ทุกคนบนเครื่องอ่าน faskey ตรงๆ ได้)
+  # N36 (พบตอนทดสอบกับ AP จริง 2026-09-20): อุปกรณ์โครงสร้างพื้นฐานอย่าง access point เองก็ถูก
+  # openNDS นับเป็น "ลูกค้าที่ยังไม่ login" เหมือนกัน -- AP จึงออกไปหา NTP ไม่ได้ นาฬิกาในเครื่อง
+  # AP เลยผิด (ผลคือ log/กราฟฝั่ง AP อ้างอิงเวลาไม่ได้) ใส่ MAC ของมันเป็น trustedmac เพื่อให้
+  # ผ่านได้โดยไม่ต้อง login · ไม่กระทบการเก็บ log ของลูกค้า เพราะลูกค้าเชื่อมผ่าน AP แบบ bridge
+  # Pi จึงยังเห็น MAC จริงของลูกค้าแต่ละเครื่องตามเดิม
+  local nds_trusted_block=""
+  if [[ -n "$TRUSTED_MACS" ]]; then
+    local m
+    nds_trusted_block=$'
+	# อุปกรณ์โครงสร้างพื้นฐานที่ไม่ต้อง login (--trusted-mac)'
+    for m in ${TRUSTED_MACS//,/ }; do
+      if [[ ! "$m" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]]; then
+        die "รูปแบบ MAC ไม่ถูกต้อง: '${m}' (ต้องเป็น aa:bb:cc:dd:ee:ff)"
+      fi
+      nds_trusted_block+=$'
+	'"list trustedmac '${m,,}'"
+    done
+  fi
+
   write_file /etc/config/opennds 0640 <<NDS
 config opennds
 	option enabled '1'
@@ -1363,6 +1385,7 @@ config opennds
 	list walledgarden_fqdn_list 'www.msftconnecttest.com'
 	list walledgarden_fqdn_list 'detectportal.firefox.com'
 	list walledgarden_fqdn_list 'nmcheck.gnome.org'
+${nds_trusted_block}
 NDS
   ok "เขียน /etc/config/opennds (รูปแบบ UCI — ตัวที่ openNDS อ่านจริง)"
 }
