@@ -950,7 +950,12 @@ net.ipv4.conf.all.arp_ignore = 1
 net.ipv4.conf.all.arp_announce = 2
 net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.all.send_redirects = 0
+net.core.rmem_max = 33554432
 SYSCTL
+  # หมายเหตุ net.core.rmem_max (N39): ยกเพดานบัฟเฟอร์รับของ socket ให้ตรงกับที่ตัวเก็บ log
+  # ขอไว้ (32 MB) -- **ไม่ใช่สาเหตุของการสูญหายที่พบ** วัดแล้วพบว่า conntrack ตั้งได้ 64 MB
+  # อยู่แล้วเพราะมี CAP_NET_ADMIN (ใช้ SO_RCVBUFFORCE ข้ามเพดานได้) ตั้งไว้เป็นการกันเหนียว
+  # เผื่อวันใดที่บริการถูกรันโดยไม่มีสิทธิ์นั้น ค่าที่ขอจะได้ไม่ถูกตัดเหลือ 4 MB เงียบ ๆ
   # หมายเหตุ rp_filter=0: โหมดสายเดียวมี 2 IP บนอินเทอร์เฟซเดียว ทำให้ reverse-path
   # ของแพ็กเก็ตขาเข้า/ขาออกไม่สมมาตรได้ตามธรรมชาติ (asymmetric routing) -- ตั้งเป็น strict
   # (ค่า 1 เดิม) จะทำให้ Linux drop แพ็กเก็ตที่ถูกต้องทิ้งอย่างงงงวย ความปลอดภัยส่วนนี้เรา

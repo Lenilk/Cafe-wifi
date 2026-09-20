@@ -38,6 +38,8 @@ NETLINK_BUFFER_BYTES = 32 * 1024 * 1024
 EVENT_QUEUE_MAX = 20000
 # เพดานเรคคอร์ดที่ค้างรอเขียนตอน DB ล่ม (กันหน่วยความจำบวมไม่มีที่สิ้นสุด)
 MAX_PENDING_RECORDS = 20000
+PIPE_BUFFER_BYTES = 1024 * 1024  # N39 -- ท่อปริยาย 64 KB เต็มได้ในชุดเดียวตอน conntrack เก็บกวาด
+F_SETPIPE_SZ = 1031              # ค่าคงที่ของ Linux (ไม่มีใน fcntl ของ Python)
 
 _BRACKET_RE = re.compile(r"\[([^\]]*)\]")
 _KV_RE = re.compile(r"(\w+)=(\S+)")
@@ -220,6 +222,20 @@ def _record_event_loss(detail: str, cooldown_seconds: int = 300,
         log.exception("บันทึก audit_log เรื่องเหตุการณ์ที่หายไม่สำเร็จ")
 
 
+def _enlarge_pipe(stream, target: int = PIPE_BUFFER_BYTES) -> int:  # pragma: no cover (ขึ้นกับ OS)
+    """
+    N39: ขยายท่อระหว่าง conntrack กับตัวเรา (ปริยาย 64 KB ซึ่งเต็มได้ในชุดเดียว)
+    ถ้าเคอร์เนลไม่ยอม (เกิน `/proc/sys/fs/pipe-max-size`) ให้ทำงานต่อด้วยขนาดเดิม
+    ไม่ใช่ล้มทั้งบริการ -- เป็นการปรับให้ทนทานขึ้น ไม่ใช่เงื่อนไขที่ขาดไม่ได้
+    """
+    try:
+        import fcntl
+        return fcntl.fcntl(stream.fileno(), F_SETPIPE_SZ, target)
+    except Exception as exc:
+        log.warning("ขยายบัฟเฟอร์ท่อเป็น %d ไบต์ไม่สำเร็จ (%s) — ใช้ขนาดปริยายต่อไป", target, exc)
+        return 0
+
+
 def run_forever(batch_size: int = 100, flush_interval: float = 5.0) -> None:  # pragma: no cover
     """
     รันจริงบน gateway: เปิด `conntrack -E` เป็น subprocess แล้วแยกเป็น 3 ส่วนที่ไม่บล็อกกัน
@@ -238,14 +254,17 @@ def run_forever(batch_size: int = 100, flush_interval: float = 5.0) -> None:  # 
            "--buffer-size", str(NETLINK_BUFFER_BYTES)]
     log.info("เริ่ม conn_collector: %s", " ".join(cmd))
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    _enlarge_pipe(proc.stdout)
 
     def _read_stdout() -> None:
+        # N39: เธรดนี้ต้อง "โง่และเร็วที่สุด" -- หน้าที่เดียวคือดูดข้อมูลออกจากท่อ
+        # ของเคอร์เนลให้ทัน ของเดิมแปลงบรรทัดเป็น record ตรงนี้ด้วย ซึ่งช้าพอที่จะทำให้
+        # ท่อตันตอนที่ conntrack ปล่อยเหตุการณ์มาเป็นชุดใหญ่พร้อมกัน (เกิดจากการเก็บกวาด
+        # รายการหมดอายุ ซึ่งปล่อยทีละหลายร้อยรายการในมิลลิวินาทีเดียว) -> ENOBUFS -> หลักฐานหาย
+        # วัดจริงแล้วหาย 17 จาก 300 การเชื่อมต่อ (5.7%) เทียบกับตัวอ้างอิงที่รันคู่ขนาน
         for line in proc.stdout:  # type: ignore[union-attr]
-            rec = parse_conntrack_line(line)
-            if not rec:
-                continue
             try:
-                events.put_nowait(rec)
+                events.put_nowait(line)
             except queue.Full:
                 log.error("คิวเหตุการณ์เต็ม (%d) — ทิ้งรายการนี้ conn_log ช่วงนี้จะไม่ครบ",
                          EVENT_QUEUE_MAX)
@@ -257,7 +276,10 @@ def run_forever(batch_size: int = 100, flush_interval: float = 5.0) -> None:  # 
     try:
         while proc.poll() is None:
             try:
-                buffer.append(events.get(timeout=flush_interval))
+                # N39: แปลงบรรทัดเป็น record ตรงนี้ (ลูปหลัก) แทนที่จะทำในเธรดอ่าน
+                rec = parse_conntrack_line(events.get(timeout=flush_interval))
+                if rec:
+                    buffer.append(rec)
             except queue.Empty:
                 pass
             now = time.time()
