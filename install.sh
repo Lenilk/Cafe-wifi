@@ -1121,6 +1121,11 @@ table inet filter {
 
     ip protocol icmp icmp type { echo-request, destination-unreachable, time-exceeded } limit rate 10/second accept
 
+    # N41: echo-reply จากวง uplink ถูกทำเป็น notrack (ดูหมายเหตุที่ table ip raw ด้านล่าง)
+    # จึงไม่เข้าเงื่อนไข ct state established ต้องอนุญาตตรง ๆ ไม่งั้น ping สำรวจวงจะไม่เห็น
+    # เครื่องที่ตอบกลับเลย ซึ่งจะทำให้ผลการตรวจจับ bypass (T17) เพี้ยน
+    ip saddr \$UPLINK_NET icmp type echo-reply limit rate 300/second accept
+
     # *** บั๊กใหญ่ที่พบจากการทดสอบ DHCP จริงบน Pi จริงครั้งแรก (2026-09-16) ***
     # DHCP client ที่ยังไม่มี IP ต้องส่ง DHCPDISCOVER จาก source 0.0.0.0 -> 255.255.255.255
     # เสมอตามมาตรฐาน (RFC 2131) จึงไม่มีทางเข้าเงื่อนไข "ip saddr \$CLIENT_NET" ด้านล่างได้เลย
@@ -1163,6 +1168,26 @@ table inet filter {
   }
 
   chain output { type filter hook output priority filter; policy accept; }
+}
+
+# N41: ห้ามให้ ping สำรวจวงของตัวตรวจจับ bypass สร้างรายการ conntrack
+# ตัวตรวจจับยิง ping ทั้งวง (254 IP) ทุก 1 นาทีเพื่อบังคับให้เกิด ARP resolution (T17)
+# ผลข้างเคียงที่วัดเจอจริง: เคอร์เนลสร้างรายการ conntrack 254 รายการ แล้วตัวเก็บกวาดของ
+# เคอร์เนลลบทั้งหมดพร้อมกันในรอบเดียว -> เหตุการณ์ DESTROY ถล่มมา 250-290 รายการในวินาที
+# เดียวทุกนาที -> ตัวเก็บ log หลุด (ENOBUFS) -> **หลักฐานการใช้งานของลูกค้าหายจริง ~5%**
+# (วัดด้วยการเทียบพอร์ตต้นทางกับตัวฟังอ้างอิง -- N39/N40)
+# การทยอยยิงไม่ช่วย เพราะเคอร์เนลเก็บกวาดรายการหมดอายุเป็นรอบ ไม่ได้ลบทีละรายการ
+# จึงต้องไม่ให้สร้างรายการตั้งแต่แรก · ICMP ที่ Pi ยิงเองในวง uplink ไม่ใช่ข้อมูลจราจรของ
+# ลูกค้า จึงไม่ต้องบันทึกตาม ม.26 อยู่แล้ว
+table ip raw {
+  chain output {
+    type filter hook output priority raw; policy accept;
+    ip daddr \$UPLINK_NET icmp type echo-request notrack
+  }
+  chain prerouting {
+    type filter hook prerouting priority raw; policy accept;
+    ip saddr \$UPLINK_NET icmp type echo-reply notrack
+  }
 }
 
 table ip nat {

@@ -113,4 +113,5 @@ mysql cafewifi -e "SELECT ts, ip, mac, detail FROM bypass_alert ORDER BY id DESC
 | ลูกค้าไม่ได้ IP เลย | DHCP ของเราเตอร์ยังเปิดอยู่ หรือกฎ DHCP หายหลังรีบูต | `sudo nft list chain inet filter input \| grep "sport 68"` ต้องมี |
 | ลูกค้าได้ IP วงเราเตอร์ | ข้อ 3 ของขั้นที่ 1 ยังไม่ได้ทำ | ปิด DHCP ที่เราเตอร์ |
 | เข้าหน้าแอดมินไม่ได้ | ไฟร์วอลล์กันวงลูกค้าเข้าหน้าแอดมินโดยตั้งใจ | เข้าจากฝั่ง uplink `https://192.168.1.2:8443` |
+| ลูกค้าหลุดหมดหลังแก้ไฟร์วอลล์ | `nft -f /etc/nftables.conf` มี `flush ruleset` ซึ่งลบกฎที่ openNDS สร้างไว้ตอนรันด้วย | `sudo systemctl restart opennds` ทุกครั้งหลังโหลดไฟล์กฎใหม่ แล้วตรวจ `nft list tables \| grep nds` ต้องมี 3 ตาราง |
 | SSH เข้า Pi ไม่ได้หลังย้าย | พอร์ต 22 ถูกปิดสำหรับวงลูกค้า | ต่อจากฝั่ง uplink หรือใช้ Wi-Fi ของ Pi |
