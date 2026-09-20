@@ -17,6 +17,7 @@ REVOKE_VOUCHER = "revoke_voucher"
 EXPORT_LOG = "export_log"
 LOGIN_OK = "login_ok"
 LOGIN_FAIL = "login_fail"
+LOGOUT = "logout"  # N38 -- ต้องรู้เวลาจบ session ของแอดมิน ไม่ใช่แค่เวลาเริ่ม
 SETUP_ADMIN = "setup_admin"
 DISK_ALERT = "disk_alert"  # N1 (CODING_BRIEF.md) -- ดิสก์เต็ม = log หยุดเขียน = ผิด ม.26
 ERASE_REFUSED = "erase_refused"  # N33 -- ปฏิเสธคำขอลบเพราะยังอยู่ในช่วงเก็บบังคับตาม ม.26

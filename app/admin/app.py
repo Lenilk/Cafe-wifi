@@ -263,6 +263,10 @@ def login():
 @app.post("/logout")
 @login_required
 def logout():
+    # N38: เดิมออกจากระบบแล้วไม่มีร่องรอยเลย ทั้งที่การเข้าสู่ระบบถูกบันทึกไว้ -- ตรวจสอบย้อนหลัง
+    # ไม่ได้ว่าแอดมินคนไหนใช้งานอยู่ในช่วงเวลาใด (ต้องรู้ทั้งเวลาเริ่มและเวลาจบ session)
+    audit.log(audit.LOGOUT, staff_id=session.get("staff_id"),
+              target=session.get("username", ""), client_ip=g.client_ip)
     session.clear()
     return redirect(url_for("login"))
 
