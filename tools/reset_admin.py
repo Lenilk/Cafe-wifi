@@ -2,7 +2,11 @@
 tools/reset_admin.py — รีเซ็ตรหัสผ่านผู้ดูแลระบบจากบรรทัดคำสั่งบนเครื่อง gateway
 (ใช้เมื่อลืมรหัสผ่าน — ต้องมีสิทธิ์ root บนเครื่องอยู่แล้ว)
 
-    sudo -E /opt/cafe-wifi/venv/bin/python -m tools.reset_admin <username>
+    sudo bash -c 'set -a; . /etc/cafe-wifi/secrets.env; set +a;       cd /opt/cafe-wifi && PYTHONPATH=/opt/cafe-wifi venv/bin/python -m tools.reset_admin <username>'
+
+หมายเหตุ: ต้องโหลด secrets.env ก่อนเสมอ เพราะเครื่องมือนี้ต้องใช้รหัสฐานข้อมูลจากไฟล์นั้น
+`sudo -E` อย่างเดียวใช้ไม่ได้ (env ของผู้ใช้ทั่วไปไม่มี DB_PASS) -- แก้คำอธิบายนี้หลังเจอ
+ปัญหาจริงตอนผู้ดูแลลืมรหัสบน Pi 2026-09-20
 """
 from __future__ import annotations
 
