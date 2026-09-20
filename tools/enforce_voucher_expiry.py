@@ -40,6 +40,7 @@ tools/enforce_voucher_expiry.py — บังคับอายุ voucher จ�
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -62,6 +63,7 @@ class EnforceSummary:
     sessions_closed: int = 0
     deauth_ok: int = 0
     deauth_failed: int = 0
+    sessions_gone: int = 0   # N30: ปิดเพราะ openNDS ไม่มีเครื่องนั้นแล้ว (ลูกค้าไปแล้ว/auth ไม่สำเร็จ)
 
 
 def expire_stale_vouchers(execute_fn) -> int:
@@ -85,7 +87,61 @@ TERMINATE_CAUSE_BY_STATUS = {
     "expired": "voucher_expired",
     "revoked": "voucher_revoked",
     "used_up": "quota_exceeded",
+    # N30: ไม่ใช่สถานะของ voucher แต่ใช้เส้นทาง close_session() เดียวกัน -- ลูกค้าไม่ได้อยู่ใน
+    # openNDS แล้ว (เดินออกจากร้าน, idle timeout, หรือ login ไม่สำเร็จจริงตั้งแต่แรก)
+    "gone": "disconnected",
 }
+
+# N30: เผื่อเวลาให้ลูกค้าที่เพิ่งกดเข้าใช้งานได้ทำ redirect ไป openNDS จนเสร็จก่อน ไม่งั้นจะไปปิด
+# session ที่กำลังจะ auth สำเร็จอยู่พอดี
+GONE_GRACE_SECONDS = 180
+
+
+def find_quota_exceeded_vouchers(query_all_fn, query_one_fn) -> list[dict]:
+    """
+    N29: voucher ที่ยัง active มีโควตา และใช้ถึงโควตาแล้ว **นับรวมทราฟฟิกของ session ที่กำลัง
+    เปิดอยู่ตอนนี้ด้วย**
+
+    เดิมระบบดูแต่ `voucher.used_mb` ซึ่งถูกอัปเดตใน close_session() เท่านั้น และ session จะถูก
+    ปิดก็ต่อเมื่อ voucher ไม่ active แล้ว -> เป็นวงกลม โควตาจึงไม่มีวันถูกบังคับใช้ระหว่างที่ลูกค้า
+    ยังใช้งานอยู่ (ลูกค้าซื้อ 500 MB ใช้กี่ GB ก็ได้จนกว่าจะหมดเวลา) พบตอนจะทดสอบเรื่องนี้บน
+    Pi จริง 2026-09-20
+
+    รวมทุกอุปกรณ์ของ voucher เดียวกัน เพราะโควตาผูกกับ voucher ไม่ใช่ผูกกับเครื่อง
+    """
+    rows = query_all_fn("""
+        SELECT v.id AS voucher_id, v.quota_mb, v.used_mb, ps.mac, ps.started_at
+        FROM portal_session ps
+        JOIN voucher v ON v.id = ps.voucher_id
+        WHERE ps.ended_at IS NULL AND v.status = 'active' AND v.quota_mb IS NOT NULL
+    """)
+    live_bytes: dict[int, int] = {}
+    info: dict[int, dict] = {}
+    for r in rows:
+        bo, bi = sum_session_traffic_bytes(query_one_fn, r["mac"], r["started_at"])
+        live_bytes[r["voucher_id"]] = live_bytes.get(r["voucher_id"], 0) + bo + bi
+        info[r["voucher_id"]] = r
+
+    hits: list[dict] = []
+    for vid, byt in live_bytes.items():
+        total_mb = info[vid]["used_mb"] + byt // BYTES_PER_MB
+        if total_mb >= info[vid]["quota_mb"]:
+            hits.append({"voucher_id": vid, "total_mb": total_mb,
+                        "quota_mb": info[vid]["quota_mb"]})
+    hits.sort(key=lambda h: h["voucher_id"])
+    return hits
+
+
+def mark_quota_exceeded(execute_fn, hits: list[dict]) -> int:
+    """ตั้ง used_up ให้ voucher ที่ใช้เกินโควตาแล้ว -- จากนั้น find_sessions_to_close() จะเห็นเอง
+    แล้วตัด + ปิด session ด้วยสาเหตุ quota_exceeded ตามเส้นทางปกติ"""
+    n = 0
+    for h in hits:
+        n += execute_fn("UPDATE voucher SET status='used_up' WHERE id=%s AND status='active'",
+                       (h["voucher_id"],))
+        log.info("voucher %s ใช้ครบโควตาแล้ว (%s/%s MB) -- ตั้งเป็น used_up",
+                h["voucher_id"], h["total_mb"], h["quota_mb"])
+    return n
 
 
 def find_sessions_to_close(query_all_fn) -> list[dict]:
@@ -103,6 +159,52 @@ def _running_as_root() -> bool:
     ไม่มี os.geteuid เลย ถ้าเรียกตรง ๆ จะ AttributeError และเทสต์ก็ mock ตรงนี้ได้ง่ายกว่า"""
     geteuid = getattr(os, "geteuid", None)
     return geteuid is None or geteuid() == 0
+
+
+def authenticated_macs(ndsctl_bin: str = "ndsctl") -> set[str] | None:
+    """
+    N30: MAC ทั้งหมด (ตัวพิมพ์ใหญ่) ที่ openNDS ถือว่า Authenticated อยู่จริง ณ ตอนนี้
+
+    คืน `None` ถ้าอ่านไม่ได้ (ไม่มี ndsctl / openNDS ล่ม / JSON เพี้ยน) -- ผู้เรียก**ต้องไม่ปิด
+    session ใด ๆ** ในกรณีนั้น เพราะแปลว่าเราไม่รู้ความจริง ไม่ใช่แปลว่าไม่มีใครออนไลน์
+    """
+    if shutil.which(ndsctl_bin) is None:
+        return None
+    cmd = [ndsctl_bin, "json"]
+    if not _running_as_root():
+        cmd = ["sudo", "-n", *cmd]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=10)
+        if r.returncode != 0:
+            log.warning("ndsctl json ไม่สำเร็จ (exit %d) -- ข้ามการตรวจ session ที่หลุดไปแล้วรอบนี้",
+                       r.returncode)
+            return None
+        data = json.loads((r.stdout or b"{}").decode(errors="replace") or "{}")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("อ่าน ndsctl json ไม่ได้: %s -- ข้ามการตรวจ session ที่หลุดไปแล้วรอบนี้", exc)
+        return None
+    return {mac.upper() for mac, c in (data.get("clients") or {}).items()
+            if str(c.get("state", "")).lower().startswith("auth")}
+
+
+def find_sessions_gone(query_all_fn, macs: set[str],
+                       grace_seconds: int = GONE_GRACE_SECONDS) -> list[dict]:
+    """
+    N30: session ที่ยังเปิดอยู่ในฐานข้อมูล แต่ openNDS ไม่มีเครื่องนั้นเป็น Authenticated แล้ว
+
+    ปิด 2 ปัญหาพร้อมกัน (พบบน Pi จริง 2026-09-20):
+    - **session ผี**: FAS บันทึก session + ผูกอุปกรณ์ทันทีที่ตรวจรหัสผ่าน แล้วค่อย redirect ไปให้
+      openNDS รับรอง ถ้า openNDS ปฏิเสธ (เช่น หน้า login ค้างไว้นานจนโดน preauth idle timeout
+      แล้วรหัสอ้างอิงในหน้านั้นหมดอายุ) ฐานข้อมูลจะบอกว่าลูกค้าใช้งานอยู่ทั้งที่ใช้ไม่ได้ และ
+      โควตาจำนวนเครื่องถูกกินไปฟรี ๆ
+    - **M1 ที่ค้างมาตั้งแต่ต้น**: ลูกค้าเดินออกจากร้านเฉย ๆ session ไม่เคยถูกปิด ทำให้ตัวเลข
+      "กำลังใช้งานอยู่ตอนนี้" มีแต่เพิ่มไม่มีลด
+    """
+    rows = query_all_fn(
+        "SELECT id, mac, voucher_id, started_at FROM portal_session "
+        "WHERE ended_at IS NULL AND started_at < (NOW() - INTERVAL %s SECOND)",
+        (grace_seconds,))
+    return [r for r in rows if r["mac"].upper() not in macs]
 
 
 def deauth_mac(mac: str, ndsctl_bin: str = "ndsctl") -> bool:
@@ -180,6 +282,8 @@ def run(deauth: bool = True) -> EnforceSummary:
             return cur.fetchone()
 
         n_expired = expire_stale_vouchers(_exec)
+        # N29: ต้องเช็คโควตาก่อนหา session ที่ต้องปิด ไม่งั้นรอบนี้จะไม่เห็น voucher ที่เพิ่งเกิน
+        n_quota = mark_quota_exceeded(_exec, find_quota_exceeded_vouchers(_query_all, _query_one))
         to_close = find_sessions_to_close(_query_all)
 
         deauth_ok = deauth_failed = 0
@@ -200,15 +304,26 @@ def run(deauth: bool = True) -> EnforceSummary:
             close_session(_exec, row["id"], row["voucher_id"], bo, bi, row["voucher_status"])
             closed += 1
 
-        n_used_up = mark_used_up_vouchers(_exec)
+        n_used_up = n_quota + mark_used_up_vouchers(_exec)
+
+        # N30: ปิด session ที่ openNDS ไม่มีเครื่องนั้นแล้ว (ทำหลังปิดตาม voucher เพื่อไม่ให้ชนกัน)
+        n_gone = 0
+        macs = authenticated_macs() if deauth else None
+        if macs is not None:
+            for row in find_sessions_gone(_query_all, macs):
+                bo, bi = sum_session_traffic_bytes(_query_one, row["mac"], row["started_at"])
+                close_session(_exec, row["id"], row["voucher_id"], bo, bi, "gone")
+                n_gone += 1
+                log.info("ปิด session %s (%s) -- ไม่อยู่ใน openNDS แล้ว", row["id"], row["mac"])
 
     summary = EnforceSummary(expired_vouchers=n_expired, used_up_vouchers=n_used_up,
+                             sessions_gone=n_gone,
                              sessions_closed=closed,
                              deauth_ok=deauth_ok, deauth_failed=deauth_failed)
     log.info("enforce เสร็จ: voucher expired %d, used_up %d, session ปิด %d "
-            "(deauth สำเร็จ %d, ล้มเหลว/ข้าม %d)",
+            "(deauth สำเร็จ %d, ล้มเหลว/ข้าม %d), session ที่หลุดไปแล้ว %d",
             summary.expired_vouchers, summary.used_up_vouchers, summary.sessions_closed,
-            summary.deauth_ok, summary.deauth_failed)
+            summary.deauth_ok, summary.deauth_failed, summary.sessions_gone)
     return summary
 
 

@@ -132,7 +132,11 @@ class _FakeCursor:
 
     def execute(self, sql, args=()):
         s = " ".join(sql.split())
-        if s.startswith("UPDATE voucher SET status='expired'"):
+        if s.startswith("SELECT v.id AS voucher_id, v.quota_mb"):
+            self._result = self.state.get("quota_rows", [])
+        elif s.startswith("UPDATE voucher SET status='used_up' WHERE id="):
+            self.rowcount = 1
+        elif s.startswith("UPDATE voucher SET status='expired'"):
             self.rowcount = self.state["expire_count"]
         elif s.startswith("SELECT ps.id, ps.mac"):
             self._result = self.state["to_close"]
@@ -304,3 +308,122 @@ def test_deauth_other_failures_still_count_as_failure(monkeypatch):
 
     monkeypatch.setattr(ev.subprocess, "run", lambda *a, **kw: FakeResult())
     assert ev.deauth_mac("AA:BB:CC:DD:EE:01") is False
+
+
+# =================== N29: โควตาต้องถูกบังคับใช้ระหว่างที่ลูกค้ายังออนไลน์ ไม่ใช่รอตอนปิด session
+def _quota_rows(*rows):
+    def query_all(sql, args=()):
+        assert "quota_mb IS NOT NULL" in sql
+        return list(rows)
+    return query_all
+
+
+def _traffic(bytes_out, bytes_in):
+    return lambda sql, args=(): {"bo": bytes_out, "bi": bytes_in}
+
+
+def test_quota_counts_traffic_of_sessions_that_are_still_open():
+    """เดิม used_mb อัปเดตตอนปิด session เท่านั้น และ session ปิดเมื่อ voucher ไม่ active แล้ว
+    = วงกลม โควตาจึงไม่มีวันถูกบังคับใช้ระหว่างลูกค้าใช้งานอยู่ (พบบน Pi จริง 2026-09-20)"""
+    rows = _quota_rows({"voucher_id": 3, "quota_mb": 500, "used_mb": 0,
+                        "mac": "AA:BB:CC:DD:EE:01", "started_at": datetime.now()})
+    hits = ev.find_quota_exceeded_vouchers(rows, _traffic(300 * ev.BYTES_PER_MB, 250 * ev.BYTES_PER_MB))
+
+    assert len(hits) == 1
+    assert hits[0]["voucher_id"] == 3 and hits[0]["total_mb"] == 550
+
+
+def test_quota_not_exceeded_yet_is_left_alone():
+    rows = _quota_rows({"voucher_id": 3, "quota_mb": 500, "used_mb": 0,
+                        "mac": "AA:BB:CC:DD:EE:01", "started_at": datetime.now()})
+    assert ev.find_quota_exceeded_vouchers(rows, _traffic(100 * ev.BYTES_PER_MB, 10 * ev.BYTES_PER_MB)) == []
+
+
+def test_quota_sums_every_device_of_the_same_voucher():
+    """โควตาผูกกับ voucher ไม่ใช่ผูกกับเครื่อง -- 2 เครื่องเครื่องละ 300 MB = เกิน 500 MB"""
+    now = datetime.now()
+    rows = _quota_rows(
+        {"voucher_id": 3, "quota_mb": 500, "used_mb": 0, "mac": "AA:BB:CC:DD:EE:01", "started_at": now},
+        {"voucher_id": 3, "quota_mb": 500, "used_mb": 0, "mac": "AA:BB:CC:DD:EE:02", "started_at": now},
+    )
+    hits = ev.find_quota_exceeded_vouchers(rows, _traffic(300 * ev.BYTES_PER_MB, 0))
+
+    assert len(hits) == 1 and hits[0]["total_mb"] == 600
+
+
+def test_quota_adds_usage_recorded_from_previous_sessions():
+    rows = _quota_rows({"voucher_id": 3, "quota_mb": 500, "used_mb": 480,
+                        "mac": "AA:BB:CC:DD:EE:01", "started_at": datetime.now()})
+    hits = ev.find_quota_exceeded_vouchers(rows, _traffic(20 * ev.BYTES_PER_MB, 0))
+
+    assert len(hits) == 1 and hits[0]["total_mb"] == 500
+
+
+def test_mark_quota_exceeded_only_touches_active_vouchers():
+    calls = []
+    ev.mark_quota_exceeded(lambda sql, args=(): calls.append((sql, args)) or 1,
+                          [{"voucher_id": 3, "total_mb": 550, "quota_mb": 500}])
+
+    assert len(calls) == 1
+    sql, args = calls[0]
+    assert "status='used_up'" in " ".join(sql.split())
+    assert "status='active'" in " ".join(sql.split()), "กันไม่ให้ทับ voucher ที่ถูกยกเลิก/หมดอายุไปแล้ว"
+    assert args == (3,)
+
+
+# =================== N30: ปิด session ที่ openNDS ไม่มีเครื่องนั้นแล้ว (session ผี + ลูกค้าเดินออก)
+def _json_run(payload, returncode=0):
+    class R:
+        pass
+    R.returncode = returncode
+    R.stdout = payload.encode("utf-8")
+    R.stderr = b""
+    return lambda *a, **kw: R()
+
+
+def test_authenticated_macs_returns_only_authenticated(monkeypatch):
+    monkeypatch.setattr(ev.shutil, "which", lambda _: "/usr/bin/ndsctl")
+    monkeypatch.setattr(ev, "_running_as_root", lambda: True)
+    monkeypatch.setattr(ev.subprocess, "run", _json_run(
+        '{"clients":{"aa:bb:cc:dd:ee:01":{"state":"Authenticated"},'
+        '"aa:bb:cc:dd:ee:02":{"state":"Preauthenticated"}}}'))
+
+    assert ev.authenticated_macs() == {"AA:BB:CC:DD:EE:01"}
+
+
+def test_authenticated_macs_returns_none_when_ndsctl_fails(monkeypatch):
+    """อ่านไม่ได้ = ไม่รู้ความจริง ต้องไม่ใช่ 'ไม่มีใครออนไลน์' ไม่งั้นจะไปปิด session ของลูกค้าที่
+    กำลังใช้งานอยู่ทั้งร้านตอน openNDS ล่มชั่วคราว"""
+    monkeypatch.setattr(ev.shutil, "which", lambda _: "/usr/bin/ndsctl")
+    monkeypatch.setattr(ev, "_running_as_root", lambda: True)
+    monkeypatch.setattr(ev.subprocess, "run", _json_run("", returncode=1))
+    assert ev.authenticated_macs() is None
+
+    monkeypatch.setattr(ev.subprocess, "run", _json_run("ไม่ใช่ json"))
+    assert ev.authenticated_macs() is None
+
+
+def test_authenticated_macs_returns_none_without_ndsctl(monkeypatch):
+    monkeypatch.setattr(ev.shutil, "which", lambda _: None)
+    assert ev.authenticated_macs() is None
+
+
+def test_find_sessions_gone_picks_only_macs_not_in_opennds():
+    rows = [{"id": 1, "mac": "AA:BB:CC:DD:EE:01", "voucher_id": 3, "started_at": datetime.now()},
+            {"id": 2, "mac": "AA:BB:CC:DD:EE:02", "voucher_id": 3, "started_at": datetime.now()}]
+    seen = []
+
+    def query_all(sql, args=()):
+        seen.append((sql, args))
+        return rows
+
+    gone = ev.find_sessions_gone(query_all, {"AA:BB:CC:DD:EE:01"})
+
+    assert [g["id"] for g in gone] == [2]
+    assert "ended_at IS NULL" in seen[0][0]
+    assert seen[0][1] == (ev.GONE_GRACE_SECONDS,), "ต้องเว้นช่วงผ่อนผันให้คนที่เพิ่งกด login"
+
+
+def test_find_sessions_gone_is_case_insensitive():
+    rows = [{"id": 1, "mac": "AA:BB:CC:DD:EE:01", "voucher_id": 3, "started_at": datetime.now()}]
+    assert ev.find_sessions_gone(lambda sql, args=(): rows, {"aa:bb:cc:dd:ee:01".upper()}) == []
