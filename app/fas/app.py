@@ -126,12 +126,14 @@ def login():
             ctx = decrypt_fas_payload(fas_b64, iv, FAS_KEY)
         except FasProtocolError as exc:
             app.logger.warning("ถอดรหัส FAS payload ไม่สำเร็จ: %s", exc)
-            return render_template("error.html", title="เชื่อมต่อไม่สำเร็จ",
-                                   message="ลิงก์เข้าสู่ระบบไม่ถูกต้องหรือหมดอายุ "
-                                           "กรุณาต่อ Wi-Fi ใหม่อีกครั้ง"), 400
+            # N35: ลูกค้าเจอกรณีนี้บ่อยที่สุดเวลาเปิดหน้า login ค้างไว้นานแล้วค่อยกด (openNDS
+            # ตัด session ที่ไม่มีความเคลื่อนไหวเกิน 10 นาที ลิงก์ในหน้าเก่าจึงใช้ไม่ได้) --
+            # ต้องบอกสิ่งที่ต้องทำ ไม่ใช่บอกแค่ว่าผิดพลาด
+            return render_template("error.html", title="หน้านี้หมดอายุแล้ว",
+                                   message="ปิดหน้านี้แล้วเปิดเว็บใดก็ได้ใหม่อีกครั้ง ระบบจะพาไปหน้าเข้าใช้งานเอง หากยังไม่ขึ้น ให้ปิด-เปิด Wi-Fi ใหม่"), 400
         if not ctx.is_complete():
-            return render_template("error.html", title="ข้อมูลไม่ครบ",
-                                   message="กรุณาต่อ Wi-Fi ใหม่อีกครั้ง"), 400
+            return render_template("error.html", title="หน้านี้หมดอายุแล้ว",
+                                   message="ปิดหน้านี้แล้วเปิดเว็บใดก็ได้ใหม่อีกครั้ง ระบบจะพาไปหน้าเข้าใช้งานเอง หากยังไม่ขึ้น ให้ปิด-เปิด Wi-Fi ใหม่"), 400
         if not MAC_RE.match(ctx.clientmac):
             return render_template("error.html", title="ข้อมูลอุปกรณ์ไม่ถูกต้อง",
                                    message="ไม่รู้จักที่อยู่อุปกรณ์ กรุณาต่อ Wi-Fi ใหม่"), 400
@@ -141,8 +143,8 @@ def login():
     # ---- POST ----
     ctx = ctx_from_form()
     if not ctx.is_complete() or not MAC_RE.match(ctx.clientmac):
-        return render_template("error.html", title="เซสชันหมดอายุ",
-                               message="กรุณาต่อ Wi-Fi ใหม่แล้วลองอีกครั้ง"), 400
+        return render_template("error.html", title="หน้านี้หมดอายุแล้ว",
+                               message="ปิดหน้านี้แล้วเปิดเว็บใดก็ได้ใหม่อีกครั้ง ระบบจะพาไปหน้าเข้าใช้งานเอง หากยังไม่ขึ้น ให้ปิด-เปิด Wi-Fi ใหม่"), 400
 
     # บั๊กเดิม: ใช้ ctx.clientip (มาจาก hidden field ที่ POST เข้ามา -- ผู้ใช้ปลอมค่าได้ตรง ๆ
     # ผ่าน devtools/curl) ไปเขียนลง audit_log/device/portal_session ซึ่งเป็นหลักฐานตาม PDPA
@@ -262,8 +264,10 @@ def policy():
 
 @app.errorhandler(404)
 def e404(e):
-    return render_template("error.html", title="ไม่พบหน้านี้",
-                           message="กรุณาต่อ Wi-Fi ใหม่อีกครั้ง"), 404
+    # N35: ลูกค้าที่เปิด URL ของ portal ตรง ๆ หรือกดจากหน้าที่ค้างไว้จะมาถึงตรงนี้ -- ข้อความ
+    # เดิม "ไม่พบหน้านี้ / กรุณาต่อ Wi-Fi ใหม่" ชวนสับสน เพราะเขาต่อ Wi-Fi อยู่แล้ว
+    return render_template("error.html", title="หน้านี้หมดอายุหรือไม่มีอยู่",
+                           message="ปิดหน้านี้แล้วเปิดเว็บใดก็ได้ใหม่อีกครั้ง ระบบจะพาไปหน้าเข้าใช้งานเอง หากยังไม่ขึ้น ให้ปิด-เปิด Wi-Fi ใหม่"), 404
 
 
 @app.errorhandler(500)
