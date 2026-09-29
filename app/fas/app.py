@@ -15,8 +15,11 @@ fas/app.py — Captive Portal (Forwarding Authentication Service, FAS level 2)
 from __future__ import annotations
 
 import ipaddress
+import hashlib
+import json
 import os
 import re
+import secrets
 import time
 from datetime import datetime, timedelta
 
@@ -24,7 +27,6 @@ from flask import Flask, abort, redirect, render_template, request
 
 from common import audit, crypto
 from common.db import execute, get_conn, query_one
-from common.traffic import sum_session_traffic_bytes
 from logger.netutil import resolve_mac
 from .opennds_proto import (ClientContext, FasProtocolError,
                             build_auth_action_url, decrypt_fas_payload)
@@ -45,6 +47,8 @@ if not os.environ.get("SECRET_KEY"):
 
 FAS_KEY = os.environ.get("FAS_KEY", "")
 GATEWAY_NAME = os.environ.get("GATEWAY_NAME", "Cafe-Guest")
+GATEWAY_IP = os.environ.get("GATEWAY_IP", "10.10.0.1")
+GATEWAY_AUTHDIR = os.environ.get("GATEWAY_AUTHDIR", "opennds_auth")
 MAC_RE = re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
 
 _attempts: dict[str, list[float]] = {}
@@ -81,18 +85,31 @@ def normalize_mac(mac: str) -> str:
     return (mac or "").strip().upper()
 
 
-def ctx_from_form() -> ClientContext:
-    """หลัง POST ต้องอ่าน context กลับจาก hidden fields ที่ฟอร์ม GET เคยฝังไว้"""
-    return ClientContext(
-        clientip=request.form.get("ctx_clientip", ""),
-        clientmac=normalize_mac(request.form.get("ctx_clientmac", "")),
-        gatewayname=request.form.get("ctx_gatewayname", GATEWAY_NAME),
-        hid=request.form.get("ctx_hid", ""),
-        gatewayaddress=request.form.get("ctx_gatewayaddress", ""),
-        authdir=request.form.get("ctx_authdir", ""),
-        originurl=request.form.get("ctx_originurl", ""),
-        clientif=request.form.get("ctx_clientif", ""),
-    )
+def _nonce_hash(nonce: str) -> str:
+    return hashlib.sha256(nonce.encode("ascii")).hexdigest()
+
+
+def _save_context(ctx: ClientContext, ip: str) -> str:
+    nonce = secrets.token_urlsafe(32)
+    execute("INSERT INTO fas_context (nonce_hash, payload, request_ip, expires_at) "
+            "VALUES (%s,%s,%s,%s)",
+            (_nonce_hash(nonce), json.dumps(ctx.__dict__), ip,
+             datetime.now() + timedelta(minutes=10)))
+    return nonce
+
+
+def _load_context(nonce: str, ip: str) -> ClientContext | None:
+    if len(nonce) < 32 or len(nonce) > 128 or not ip:
+        return None
+    row = query_one("SELECT payload, request_ip, expires_at, consumed_at FROM fas_context "
+                    "WHERE nonce_hash=%s", (_nonce_hash(nonce),))
+    if not row or row["request_ip"] != ip or row["consumed_at"] or row["expires_at"] <= datetime.now():
+        return None
+    return ClientContext.from_dict(json.loads(row["payload"]))
+
+
+def _valid_gateway(ctx: ClientContext) -> bool:
+    return ctx.gatewayaddress == GATEWAY_IP and ctx.authdir.strip("/") == GATEWAY_AUTHDIR
 
 
 @app.context_processor
@@ -131,25 +148,34 @@ def login():
             # ต้องบอกสิ่งที่ต้องทำ ไม่ใช่บอกแค่ว่าผิดพลาด
             return render_template("error.html", title="หน้านี้หมดอายุแล้ว",
                                    message="ปิดหน้านี้แล้วเปิดเว็บใดก็ได้ใหม่อีกครั้ง ระบบจะพาไปหน้าเข้าใช้งานเอง หากยังไม่ขึ้น ให้ปิด-เปิด Wi-Fi ใหม่"), 400
-        if not ctx.is_complete():
+        if not ctx.is_complete() or not _valid_gateway(ctx):
             return render_template("error.html", title="หน้านี้หมดอายุแล้ว",
                                    message="ปิดหน้านี้แล้วเปิดเว็บใดก็ได้ใหม่อีกครั้ง ระบบจะพาไปหน้าเข้าใช้งานเอง หากยังไม่ขึ้น ให้ปิด-เปิด Wi-Fi ใหม่"), 400
         if not MAC_RE.match(ctx.clientmac):
             return render_template("error.html", title="ข้อมูลอุปกรณ์ไม่ถูกต้อง",
                                    message="ไม่รู้จักที่อยู่อุปกรณ์ กรุณาต่อ Wi-Fi ใหม่"), 400
 
-        return render_template("login.html", ctx=ctx)
+        real_ip = client_ip()
+        if not real_ip or real_ip != ctx.clientip:
+            return render_template("error.html", title="ข้อมูลเครือข่ายไม่ตรงกัน",
+                                   message="กรุณาต่อ Wi-Fi ใหม่อีกครั้ง"), 400
+        nonce = _save_context(ctx, real_ip)
+        return render_template("login.html", nonce=nonce)
 
     # ---- POST ----
-    ctx = ctx_from_form()
-    if not ctx.is_complete() or not MAC_RE.match(ctx.clientmac):
+    nonce = request.form.get("nonce", "")
+    real_ip = client_ip()
+    ctx = _load_context(nonce, real_ip)
+    if not ctx or not ctx.is_complete() or not _valid_gateway(ctx) or not MAC_RE.match(ctx.clientmac):
         return render_template("error.html", title="หน้านี้หมดอายุแล้ว",
                                message="ปิดหน้านี้แล้วเปิดเว็บใดก็ได้ใหม่อีกครั้ง ระบบจะพาไปหน้าเข้าใช้งานเอง หากยังไม่ขึ้น ให้ปิด-เปิด Wi-Fi ใหม่"), 400
 
     # บั๊กเดิม: ใช้ ctx.clientip (มาจาก hidden field ที่ POST เข้ามา -- ผู้ใช้ปลอมค่าได้ตรง ๆ
     # ผ่าน devtools/curl) ไปเขียนลง audit_log/device/portal_session ซึ่งเป็นหลักฐานตาม PDPA
     # ต้องใช้ IP จริงของ request (client_ip() ที่นิยามไว้แล้วแต่ไม่เคยถูกเรียก) แทน
-    real_ip = client_ip() or ctx.clientip
+    if real_ip != ctx.clientip:
+        return render_template("error.html", title="ข้อมูลเครือข่ายไม่ตรงกัน",
+                               message="กรุณาต่อ Wi-Fi ใหม่อีกครั้ง"), 400
 
     # แก้บั๊ก H2: ctx.clientmac ก็มาจาก hidden field เหมือนกัน (ปลอมได้เช่นเดียวกับ clientip
     # เดิม) แต่ MAC คือกุญแจเดียวที่เชื่อม "ตัวตนลูกค้า" เข้ากับ conn_log/dns_log (ซึ่งได้ MAC
@@ -164,7 +190,7 @@ def login():
 
     bucket = f"login:{ctx.clientmac}"
     if rate_limited(bucket):
-        return render_template("login.html", ctx=ctx,
+        return render_template("login.html", nonce=nonce,
                                error="พยายามเข้าสู่ระบบมากเกินไป กรุณารอ 10 นาทีแล้วลองใหม่"), 429
 
     code = (request.form.get("username") or "").strip().upper()
@@ -196,56 +222,7 @@ def login():
         record_attempt(bucket)
         audit.log(audit.LOGIN_FAIL, target=code, client_ip=real_ip,
                   detail=f"mac={ctx.clientmac} reason={reason}")
-        return render_template("login.html", ctx=ctx, error=reason), 401
-
-    # ---- ตรวจ/ผูกอุปกรณ์ ----
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute("SELECT id FROM device WHERE voucher_id=%s AND mac=%s",
-                    (voucher["id"], ctx.clientmac))
-        existing_device = cur.fetchone()
-        if not existing_device:
-            cur.execute("SELECT COUNT(*) AS n FROM device WHERE voucher_id=%s", (voucher["id"],))
-            if int(cur.fetchone()["n"]) >= voucher["max_devices"]:
-                audit.log(audit.LOGIN_FAIL, target=code, client_ip=real_ip,
-                          detail=f"mac={ctx.clientmac} reason=device_limit_exceeded")
-                return render_template(
-                    "login.html", ctx=ctx,
-                    error=f"รหัสนี้ใช้ครบ {voucher['max_devices']} อุปกรณ์แล้ว "
-                          "กรุณาขอรหัสใหม่จากพนักงานหากต้องการเพิ่มอุปกรณ์"), 403
-            cur.execute("INSERT INTO device (voucher_id, mac, last_ip) VALUES (%s, %s, %s)",
-                        (voucher["id"], ctx.clientmac, real_ip))
-        else:
-            cur.execute("UPDATE device SET last_ip=%s WHERE id=%s",
-                        (real_ip, existing_device["id"]))
-
-        # ปิด session เก่าที่ยังค้างของ mac นี้ (กันนับซ้ำใน "กำลังใช้งานอยู่ตอนนี้")
-        # บั๊กเดิม (พบตอนตรวจทานรอบ 2): ปิด session ตรงนี้โดยไม่บันทึก bytes_out/bytes_in
-        # เลย ต่างจาก enforce_voucher_expiry.py ที่รวมยอดจาก conn_log ให้ -- ผลคือ session ที่
-        # ปิดด้วย reauth มี bytes เป็น 0 ตลอดกาล ขณะที่ session ที่ปิดด้วย voucher หมดอายุมี
-        # ตัวเลขจริง ทำให้ข้อมูลไม่สม่ำเสมอ ใช้ฟังก์ชันรวมยอดตัวเดียวกับ enforce_voucher_expiry
-        # เพื่อไม่ให้ตรรกะซ้ำกันสองที่
-        def _query_one(sql, args=()):
-            cur.execute(sql, args)
-            return cur.fetchone()
-
-        # บั๊กเดิม (พบตอนตรวจทานรอบ 4): เดิม fetchone() ดึง started_at มาแค่แถวเดียว (ไม่ระบุ
-        # ORDER BY จึงได้แถวไหนก็ได้) แต่ UPDATE ด้านล่างที่ตามมาแก้ "ทุกแถว" ที่ mac=%s AND
-        # ended_at IS NULL ตรงกัน -- ถ้าบังเอิญมี session ค้างเปิดพร้อมกันมากกว่า 1 อันของ mac
-        # เดียวกัน (เช่น race condition กับ enforce_voucher_expiry.py ที่รันคู่ขนานอยู่) ทุกแถว
-        # จะถูกเขียนทับด้วยยอด bytes ของแถวเดียวกันหมด ทั้งที่แต่ละ session เริ่มคนละเวลา ยอด
-        # ที่ควรจะได้ไม่เท่ากัน -- ดึงมาทีละแถวแล้วปิด+คำนวณ bytes แยกต่อแถวแทน (ปกติจะมีแค่
-        # 0-1 แถวเสมออยู่แล้ว จึงไม่กระทบประสิทธิภาพ)
-        cur.execute("SELECT id, started_at FROM portal_session WHERE mac=%s AND ended_at IS NULL",
-                    (ctx.clientmac,))
-        for stale in cur.fetchall():
-            bo, bi = sum_session_traffic_bytes(_query_one, ctx.clientmac, stale["started_at"])
-            cur.execute("""UPDATE portal_session SET ended_at=NOW(), terminate_cause='reauth',
-                           bytes_out=%s, bytes_in=%s WHERE id=%s""",
-                        (bo, bi, stale["id"]))
-        cur.execute("""INSERT INTO portal_session (voucher_id, mac, ip, started_at)
-                       VALUES (%s, %s, %s, NOW())""", (voucher["id"], ctx.clientmac, real_ip))
-
-    audit.log(audit.LOGIN_OK, target=code, client_ip=real_ip, detail=f"mac={ctx.clientmac}")
+        return render_template("login.html", nonce=nonce, error=reason), 401
 
     try:
         redirect_url = build_auth_action_url(ctx, FAS_KEY)
@@ -253,6 +230,42 @@ def login():
         app.logger.error("สร้าง auth URL ไม่สำเร็จ: %s", exc)
         return render_template("error.html", title="เกิดข้อผิดพลาด",
                                message="กรุณาลองใหม่อีกครั้ง หรือแจ้งพนักงาน"), 500
+
+    # จองโควตาและสร้าง pending ภายใต้ transaction เดียวกัน; ผูก device หลัง gateway ยืนยัน
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT id FROM voucher WHERE id=%s FOR UPDATE", (voucher["id"],))
+        cur.fetchone()
+        cur.execute("SELECT COUNT(*) AS n FROM ("
+                    "SELECT mac FROM device WHERE voucher_id=%s UNION "
+                    "SELECT mac FROM portal_session WHERE voucher_id=%s AND state='pending' "
+                    "AND pending_until > NOW()) AS reserved",
+                    (voucher["id"], voucher["id"]))
+        reserved = int(cur.fetchone()["n"])
+        cur.execute("SELECT 1 FROM device WHERE voucher_id=%s AND mac=%s UNION "
+                    "SELECT 1 FROM portal_session WHERE voucher_id=%s AND mac=%s "
+                    "AND state='pending' AND pending_until > NOW() LIMIT 1",
+                    (voucher["id"], ctx.clientmac, voucher["id"], ctx.clientmac))
+        if not cur.fetchone() and reserved >= voucher["max_devices"]:
+                audit.log(audit.LOGIN_FAIL, target=code, client_ip=real_ip,
+                          detail=f"mac={ctx.clientmac} reason=device_limit_exceeded")
+                return render_template(
+                    "login.html", nonce=nonce,
+                    error=f"รหัสนี้ใช้ครบ {voucher['max_devices']} อุปกรณ์แล้ว "
+                    "กรุณาขอรหัสใหม่จากพนักงานหากต้องการเพิ่มอุปกรณ์"), 403
+        cur.execute("UPDATE fas_context SET consumed_at=NOW() WHERE nonce_hash=%s "
+                    "AND consumed_at IS NULL AND expires_at > NOW()", (_nonce_hash(nonce),))
+        if cur.rowcount != 1:
+            return render_template("error.html", title="หน้านี้หมดอายุแล้ว",
+                                   message="กรุณาเปิดหน้าเข้าใช้งานใหม่"), 400
+        cur.execute("UPDATE portal_session SET state='closed', ended_at=NOW(), "
+                    "terminate_cause='replaced_pending' WHERE mac=%s AND state='pending'",
+                    (ctx.clientmac,))
+        cur.execute("INSERT INTO portal_session "
+                    "(voucher_id, mac, ip, started_at, pending_until, state) "
+                    "VALUES (%s,%s,%s,NOW(),DATE_ADD(NOW(), INTERVAL 180 SECOND),'pending')",
+                    (voucher["id"], ctx.clientmac, real_ip))
+
+    audit.log("login_pending", target=code, client_ip=real_ip, detail=f"mac={ctx.clientmac}")
 
     return redirect(redirect_url, code=302)
 

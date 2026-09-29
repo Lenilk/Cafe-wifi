@@ -7,14 +7,7 @@
 {% if error %}<div class="msg err">{{ error }}</div>{% endif %}
 
 <form method="post" autocomplete="off">
-  <input type="hidden" name="ctx_clientip" value="{{ ctx.clientip }}">
-  <input type="hidden" name="ctx_clientmac" value="{{ ctx.clientmac }}">
-  <input type="hidden" name="ctx_gatewayname" value="{{ ctx.gatewayname }}">
-  <input type="hidden" name="ctx_hid" value="{{ ctx.hid }}">
-  <input type="hidden" name="ctx_gatewayaddress" value="{{ ctx.gatewayaddress }}">
-  <input type="hidden" name="ctx_authdir" value="{{ ctx.authdir }}">
-  <input type="hidden" name="ctx_originurl" value="{{ ctx.originurl }}">
-  <input type="hidden" name="ctx_clientif" value="{{ ctx.clientif }}">
+  <input type="hidden" name="nonce" value="{{ nonce }}">
 
   <label for="username">ชื่อผู้ใช้</label>
   <input type="text" id="username" name="username" required autofocus

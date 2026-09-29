@@ -150,7 +150,7 @@ def find_sessions_to_close(query_all_fn) -> list[dict]:
         SELECT ps.id, ps.mac, ps.voucher_id, ps.started_at, v.status AS voucher_status
         FROM portal_session ps
         JOIN voucher v ON v.id = ps.voucher_id
-        WHERE ps.ended_at IS NULL AND v.status != 'active'
+        WHERE ps.ended_at IS NULL AND ps.state='authenticated' AND v.status != 'active'
     """)
 
 
@@ -202,7 +202,8 @@ def find_sessions_gone(query_all_fn, macs: set[str],
     """
     rows = query_all_fn(
         "SELECT id, mac, voucher_id, started_at FROM portal_session "
-        "WHERE ended_at IS NULL AND started_at < (NOW() - INTERVAL %s SECOND)",
+        "WHERE state='authenticated' AND ended_at IS NULL "
+        "AND started_at < (NOW() - INTERVAL %s SECOND)",
         (grace_seconds,))
     return [r for r in rows if r["mac"].upper() not in macs]
 
@@ -255,7 +256,7 @@ def close_session(execute_fn, session_id: int, voucher_id: int,
                   bytes_out: int, bytes_in: int, voucher_status: str = "expired") -> None:
     cause = TERMINATE_CAUSE_BY_STATUS.get(voucher_status, "voucher_expired")
     execute_fn(
-        "UPDATE portal_session SET ended_at=NOW(), terminate_cause=%s, "
+        "UPDATE portal_session SET state='closed', ended_at=NOW(), terminate_cause=%s, "
         "bytes_out=%s, bytes_in=%s WHERE id=%s",
         (cause, bytes_out, bytes_in, session_id))
     used_mb_delta = (bytes_out + bytes_in) // BYTES_PER_MB

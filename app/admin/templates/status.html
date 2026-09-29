@@ -59,6 +59,7 @@
 
 <div class="grid">
   <div class="stat"><b>{{ db.active_sessions if db.active_sessions is not none else '—' }}</b><span>session ที่ active</span></div>
+  <div class="stat"><b>{{ db.pending_sessions if db.pending_sessions is not none else '—' }}</b><span>session ที่รอยืนยัน</span></div>
   <div class="stat"><b>{{ db.log_rows_today if db.log_rows_today is not none else '—' }}</b><span>log rows วันนี้ (conn+dns)</span></div>
   <div class="stat"><b>{{ db.last_sealed_at.strftime('%d/%m %H:%M') if db.last_sealed_at else '—' }}</b><span>seal hash chain ล่าสุด</span></div>
 </div>

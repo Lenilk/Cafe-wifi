@@ -121,7 +121,8 @@ def db_status() -> dict:
     try:
         row = query_one("""
             SELECT
-              (SELECT COUNT(*) FROM portal_session WHERE ended_at IS NULL) AS active_sessions,
+              (SELECT COUNT(*) FROM portal_session WHERE state='authenticated' AND ended_at IS NULL) AS active_sessions,
+              (SELECT COUNT(*) FROM portal_session WHERE state='pending') AS pending_sessions,
               (SELECT COUNT(*) FROM conn_log WHERE DATE(ts) = CURDATE())   AS conn_log_today,
               (SELECT COUNT(*) FROM dns_log  WHERE DATE(ts) = CURDATE())   AS dns_log_today,
               (SELECT MAX(sealed_at) FROM log_manifest)                    AS last_sealed_at
@@ -130,6 +131,7 @@ def db_status() -> dict:
         dns_today = int(row.get("dns_log_today") or 0)
         return dict(
             active_sessions=row.get("active_sessions"),
+            pending_sessions=row.get("pending_sessions"),
             conn_log_today=conn_today,
             dns_log_today=dns_today,
             log_rows_today=conn_today + dns_today,
@@ -138,7 +140,7 @@ def db_status() -> dict:
         )
     except Exception as exc:  # noqa: BLE001
         log.error("อ่านสถิติจาก DB ไม่สำเร็จ: %s", exc)
-        return dict(active_sessions=None, conn_log_today=None, dns_log_today=None,
+        return dict(active_sessions=None, pending_sessions=None, conn_log_today=None, dns_log_today=None,
                     log_rows_today=None, last_sealed_at=None, error=str(exc))
 
 

@@ -584,6 +584,8 @@ FAS_PORT=${FAS_BACKEND}
 ADMIN_PORT=${ADMIN_BACKEND}
 NDS_PORT=${NDS_PORT}
 GATEWAY_NAME=${GATEWAY_NAME}
+GATEWAY_IP=${CLIENT_CIDR%%/*}
+GATEWAY_AUTHDIR=opennds_auth
 
 # N10 (CODING_BRIEF.md) -- bypass_detector.py (T17) ใช้ 3 ค่านี้เฝ้าวง uplink หา IP/MAC
 # แปลกปลอมที่ไม่ใช่ Pi เองหรือเราเตอร์ (ดู D19/§3.1.4) -- ก่อนหน้านี้ UPLINK_CIDR/UPLINK_GW
@@ -1640,6 +1642,37 @@ OnUnitActiveSec=5min
 WantedBy=timers.target
 UNIT
 
+  write_file /etc/systemd/system/cafe-reconcile.service 0644 <<UNIT
+[Unit]
+Description=Confirm pending Cafe WiFi sessions with openNDS
+After=mariadb.service opennds.service
+
+[Service]
+Type=oneshot
+User=root
+EnvironmentFile=${ETC_DIR}/secrets.env
+Environment=PYTHONPATH=${OPT_DIR}
+WorkingDirectory=${OPT_DIR}
+ExecStart=${VENV_DIR}/bin/python -m tools.reconcile_pending
+NoNewPrivileges=yes
+PrivateTmp=no
+ProtectSystem=strict
+ReadWritePaths=/tmp
+ProtectHome=yes
+UNIT
+
+  write_file /etc/systemd/system/cafe-reconcile.timer 0644 <<'UNIT'
+[Unit]
+Description=Check pending Cafe WiFi sessions every 5 seconds
+
+[Timer]
+OnBootSec=5sec
+OnUnitInactiveSec=5sec
+
+[Install]
+WantedBy=timers.target
+UNIT
+
   # N10 (CODING_BRIEF.md): bypass_detector.py (T17) -- แค่อ่าน /proc/net/arp (world-readable
   # ปกติ ไม่ต้อง CAP_NET_ADMIN/RAW) แล้วต่อ DB ผ่าน TCP ธรรมดา จึงรันเป็น ${APP_USER} พร้อม
   # hardening ชุดเดียวกับ cafe-enforce ได้เลย -- รันถี่กว่า (ทุก 1 นาที) เพราะ ARP cache ของ
@@ -1833,6 +1866,7 @@ start_services() {
     # N10 (CODING_BRIEF.md): ต้องมี eth0/UPLINK_CIDR ตั้งค่าแล้วถึงจะมี ARP table ของวง uplink
     # ให้เฝ้าจริง -- ผูกไว้กับเงื่อนไขเดียวกับ cafe-logger/opennds
     run systemctl enable --now cafe-bypass-detect.timer 2>/dev/null || warn "เปิด cafe-bypass-detect.timer ไม่สำเร็จ"
+    run systemctl enable --now cafe-reconcile.timer 2>/dev/null || warn "เปิด cafe-reconcile.timer ไม่สำเร็จ"
   fi
   ok "เปิด service เรียบร้อย"
 }
@@ -1907,7 +1941,8 @@ uninstall() {
 
   local s
   for s in cafe-fas cafe-admin cafe-logger cafe-maintenance.timer cafe-maintenance \
-          cafe-enforce.timer cafe-enforce cafe-bypass-detect.timer cafe-bypass-detect opennds; do
+          cafe-enforce.timer cafe-enforce cafe-reconcile.timer cafe-reconcile \
+          cafe-bypass-detect.timer cafe-bypass-detect opennds; do
     svc disable "$s"
     run_sh "rm -f /etc/systemd/system/${s}.service /etc/systemd/system/${s}.timer"
   done

@@ -69,13 +69,27 @@ CREATE TABLE IF NOT EXISTS portal_session (
   mac        CHAR(17) NOT NULL,
   ip         VARCHAR(45) NOT NULL,
   started_at DATETIME NOT NULL,
+  authenticated_at DATETIME NULL,
+  pending_until DATETIME NULL,
+  state ENUM('pending','authenticated','closed') NOT NULL DEFAULT 'pending',
   ended_at   DATETIME NULL,
   bytes_in   BIGINT NOT NULL DEFAULT 0,
   bytes_out  BIGINT NOT NULL DEFAULT 0,
   terminate_cause VARCHAR(32) NULL,
   INDEX idx_time (started_at, ended_at),
   INDEX idx_mac_time (mac, started_at),
+  INDEX idx_pending (state, pending_until),
   CONSTRAINT fk_session_voucher FOREIGN KEY (voucher_id) REFERENCES voucher(id)
+) ENGINE=InnoDB;
+
+-- FAS context ถูกส่งจาก gateway เพียงครั้งเดียว; browser ส่งกลับแค่ nonce
+CREATE TABLE IF NOT EXISTS fas_context (
+  nonce_hash CHAR(64) PRIMARY KEY,
+  payload TEXT NOT NULL,
+  request_ip VARCHAR(45) NOT NULL,
+  expires_at DATETIME NOT NULL,
+  consumed_at DATETIME NULL,
+  INDEX idx_expiry (expires_at)
 ) ENGINE=InnoDB;
 
 -- ---------------------------------------------------------------- ข้อมูลจราจร (ม.26)

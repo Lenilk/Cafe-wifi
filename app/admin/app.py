@@ -280,7 +280,7 @@ def dashboard():
           (SELECT COUNT(*) FROM voucher WHERE status='active' AND valid_until > NOW()) AS active_vouchers,
           (SELECT COUNT(*) FROM customer)                                              AS customers,
           (SELECT COUNT(*) FROM voucher WHERE DATE(issued_at) = CURDATE())             AS issued_today,
-          (SELECT COUNT(*) FROM portal_session WHERE ended_at IS NULL)                 AS online_now
+          (SELECT COUNT(*) FROM portal_session WHERE state='authenticated' AND ended_at IS NULL) AS online_now
     """) or {}
     recent = query_all("""
         SELECT v.id, v.username, v.issued_at, v.valid_until, v.status,

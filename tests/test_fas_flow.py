@@ -23,11 +23,12 @@ CUSTOMERS: dict[int, dict] = {}
 DEVICES: list[dict] = []
 SESSIONS: list[dict] = []
 AUDIT: list[tuple] = []
+FAS_CONTEXTS: dict[str, dict] = {}
 _ids = {"customer": 0, "device": 0, "session": 0}
 
 
 def _reset():
-    VOUCHERS.clear(); CUSTOMERS.clear(); DEVICES.clear(); SESSIONS.clear(); AUDIT.clear()
+    VOUCHERS.clear(); CUSTOMERS.clear(); DEVICES.clear(); SESSIONS.clear(); AUDIT.clear(); FAS_CONTEXTS.clear()
     _ids.update(customer=0, device=0, session=0)
 
 
@@ -49,6 +50,7 @@ class FakeCursor:
     def __init__(self):
         self.lastrowid = None
         self._rows = []
+        self.rowcount = 0
 
     def execute(self, sql, args=()):
         s = " ".join(sql.split()).lower()
@@ -60,42 +62,45 @@ class FakeCursor:
             else:
                 c = CUSTOMERS[v["customer_id"]]
                 self._rows = [{**v, "is_blocked": c["is_blocked"]}]
-        elif s.startswith("select id from device where voucher_id=%s and mac=%s".replace("%s", "%s")) \
-                or s.startswith("select id from device where voucher_id="):
-            vid, mac = args
-            self._rows = [d for d in DEVICES if d["voucher_id"] == vid and d["mac"] == mac]
-        elif s.startswith("select count(*) as n from device"):
+        elif s.startswith("insert into fas_context"):
+            key, payload, ip, expiry = args
+            FAS_CONTEXTS[key] = dict(payload=payload, request_ip=ip, expires_at=expiry,
+                                     consumed_at=None)
+            self.rowcount = 1
+        elif s.startswith("select payload, request_ip"):
+            row = FAS_CONTEXTS.get(args[0])
+            self._rows = [row] if row else []
+        elif s.startswith("select id from voucher where id=%s for update"):
+            self._rows = [{"id": args[0]}]
+        elif s.startswith("select count(*) as n from ("):
             vid = args[0]
-            self._rows = [{"n": sum(1 for d in DEVICES if d["voucher_id"] == vid)}]
-        elif s.startswith("insert into device"):
-            vid, mac, ip = args
-            _ids["device"] += 1
-            DEVICES.append(dict(id=_ids["device"], voucher_id=vid, mac=mac, last_ip=ip))
-            self.lastrowid = _ids["device"]
-        elif s.startswith("update device set last_ip"):
-            ip, did = args
-            for d in DEVICES:
-                if d["id"] == did:
-                    d["last_ip"] = ip
-        elif s.startswith("select id, started_at from portal_session where mac=%s and ended_at is null"):
-            mac = args[0]
-            open_sessions = [sess for sess in SESSIONS if sess["mac"] == mac and sess["ended_at"] is None]
-            self._rows = [{"id": sess["id"], "started_at": sess["started_at"]} for sess in open_sessions]
-        elif s.startswith("select coalesce(sum(bytes_out)"):
-            # ไม่มี conn_log จำลองในเทสต์ชุดนี้ -- COALESCE(...,0) ของจริงคืน 0 เมื่อไม่มีแถวตรงเงื่อนไข
-            self._rows = [{"bo": 0, "bi": 0}]
-        elif s.startswith("update portal_session set ended_at=now(), terminate_cause='reauth'"):
-            bo, bi, sid = args
+            macs = {d["mac"] for d in DEVICES if d["voucher_id"] == vid}
+            macs.update(sess["mac"] for sess in SESSIONS
+                        if sess["voucher_id"] == vid and sess["state"] == "pending"
+                        and sess["ended_at"] is None)
+            self._rows = [{"n": len(macs)}]
+        elif s.startswith("select 1 from device"):
+            vid, mac, _, _ = args
+            exists = any(d["voucher_id"] == vid and d["mac"] == mac for d in DEVICES)
+            exists |= any(sess["voucher_id"] == vid and sess["mac"] == mac
+                          and sess["state"] == "pending" and sess["ended_at"] is None
+                          for sess in SESSIONS)
+            self._rows = [{"1": 1}] if exists else []
+        elif s.startswith("update fas_context set consumed_at=now()"):
+            row = FAS_CONTEXTS.get(args[0])
+            self.rowcount = int(bool(row and not row["consumed_at"]))
+            if self.rowcount:
+                row["consumed_at"] = datetime.now()
+        elif s.startswith("update portal_session set state='closed'"):
             for sess in SESSIONS:
-                if sess["id"] == sid:
-                    sess["ended_at"] = "now"
-                    sess["bytes_out"], sess["bytes_in"] = bo, bi
+                if sess["mac"] == args[0] and sess["state"] == "pending":
+                    sess["state"] = "closed"; sess["ended_at"] = "now"
         elif s.startswith("insert into portal_session"):
             vid, mac, ip = args
             _ids["session"] += 1
             SESSIONS.append(dict(id=_ids["session"], voucher_id=vid, mac=mac, ip=ip,
                                  started_at=f"t{_ids['session']}", ended_at=None,
-                                 bytes_out=0, bytes_in=0))
+                                 state="pending", bytes_out=0, bytes_in=0))
             self.lastrowid = _ids["session"]
         elif s.startswith("insert into audit_log"):
             AUDIT.append(args)
@@ -135,13 +140,14 @@ def client(monkeypatch):
 
     monkeypatch.setattr(db, "query_one", lambda s, a=(): _run(s, a).fetchone())
     monkeypatch.setattr(db, "query_all", lambda s, a=(): _run(s, a).fetchall())
-    monkeypatch.setattr(db, "execute", lambda s, a=(): _run(s, a).lastrowid)
+    monkeypatch.setattr(db, "execute", lambda s, a=(): _run(s, a).rowcount)
 
     import importlib
     fas_app = importlib.import_module("fas.app")
     importlib.reload(fas_app)
     fas_app.FAS_KEY = FASKEY
     fas_app.GATEWAY_NAME = "Cafe-Guest-Test"
+    fas_app.client_ip = lambda: GW_PARAMS["clientip"]
     fas_app.app.config.update(TESTING=True)
     fas_app._attempts.clear()
     c = fas_app.app.test_client()
@@ -167,9 +173,7 @@ def _extract_hidden(html: str, field: str) -> str:
 
 
 def _post_login(client, html, username, password):
-    fields = ["ctx_clientip", "ctx_clientmac", "ctx_gatewayname", "ctx_hid",
-              "ctx_gatewayaddress", "ctx_authdir", "ctx_originurl", "ctx_clientif"]
-    data = {f: _extract_hidden(html, f) for f in fields}
+    data = {"nonce": _extract_hidden(html, "nonce")}
     data["username"] = username
     data["password"] = password
     return client.post("/login", data=data)
@@ -186,8 +190,8 @@ def test_get_login_decodes_gateway_payload(client):
     r = client.get(_gw_url())
     html = r.get_data(as_text=True)
     assert r.status_code == 200
-    assert _extract_hidden(html, "ctx_clientmac") == "AA:BB:CC:DD:EE:01"
-    assert _extract_hidden(html, "ctx_gatewayaddress") == "10.10.0.1"
+    assert _extract_hidden(html, "nonce")
+    assert "ctx_clientmac" not in html
 
 
 def test_get_login_wrong_faskey_shows_error(client):
@@ -212,8 +216,9 @@ def test_successful_login_redirects_to_gateway_auth_url(client):
     assert loc.startswith("http://10.10.0.1/opennds_auth/?tok=")
     assert auth_token("hid-0001", FASKEY) in loc
     assert len(SESSIONS) == 1 and SESSIONS[0]["ended_at"] is None
-    assert len(DEVICES) == 1
-    assert any("login_ok" in str(a) for a in AUDIT)
+    assert len(DEVICES) == 0
+    assert SESSIONS[0]["state"] == "pending"
+    assert any("login_pending" in str(a) for a in AUDIT)
 
 
 def test_username_is_case_insensitive(client):
@@ -227,6 +232,7 @@ def test_reauth_closes_previous_open_session(client):
     code, pw = _make_voucher()
     html = client.get(_gw_url()).get_data(as_text=True)
     _post_login(client, html, code, pw)
+    html = client.get(_gw_url()).get_data(as_text=True)
     _post_login(client, html, code, pw)  # login ซ้ำด้วยเครื่องเดิม (mac เดิม)
     open_sessions = [s for s in SESSIONS if s["ended_at"] is None]
     assert len(open_sessions) == 1, "ต้องมี session เปิดอยู่แค่ 1 อันต่อ mac เท่านั้น"
@@ -246,11 +252,11 @@ def test_reauth_closes_every_stale_session_of_the_mac_individually(client):
     _ids["session"] += 1
     SESSIONS.append(dict(id=_ids["session"], voucher_id=1, mac="AA:BB:CC:DD:EE:01",
                          ip="10.10.0.50", started_at="t-old-1", ended_at=None,
-                         bytes_out=0, bytes_in=0))
+                         state="pending", bytes_out=0, bytes_in=0))
     _ids["session"] += 1
     SESSIONS.append(dict(id=_ids["session"], voucher_id=1, mac="AA:BB:CC:DD:EE:01",
                          ip="10.10.0.51", started_at="t-old-2", ended_at=None,
-                         bytes_out=0, bytes_in=0))
+                         state="pending", bytes_out=0, bytes_in=0))
 
     r = _post_login(client, html, code, pw)
     assert r.status_code == 302
@@ -318,7 +324,7 @@ def test_same_device_can_relogin_even_at_limit(client):
     # เครื่องเดิม login ซ้ำ ต้องไม่โดนนับว่าเกินโควตา
     html2 = client.get(_gw_url(mac="AA:BB:CC:DD:EE:01")).get_data(as_text=True)
     assert _post_login(client, html2, code, pw).status_code == 302
-    assert len(DEVICES) == 1
+    assert len(DEVICES) == 0
 
 
 # ---------------------------------------------------------------- rate limit / เซสชันหมดอายุ
@@ -334,6 +340,20 @@ def test_rate_limit_after_repeated_failures(client):
 def test_tampered_hidden_fields_rejected(client):
     r = client.post("/login", data=dict(ctx_clientmac="not-a-mac", username="X", password="Y"))
     assert r.status_code == 400
+
+
+def test_hidden_context_is_ignored_and_nonce_is_single_use(client):
+    code, pw = _make_voucher()
+    html = client.get(_gw_url()).get_data(as_text=True)
+    nonce = _extract_hidden(html, "nonce")
+    r = client.post("/login", data=dict(nonce=nonce, username=code, password=pw,
+                                         ctx_clientmac="AA:BB:CC:DD:EE:99",
+                                         ctx_gatewayaddress="evil.example"))
+    assert r.status_code == 302
+    assert r.headers["Location"].startswith("http://10.10.0.1/opennds_auth/")
+    assert SESSIONS[-1]["mac"] == "AA:BB:CC:DD:EE:01"
+    replay = client.post("/login", data=dict(nonce=nonce, username=code, password=pw))
+    assert replay.status_code == 400
 
 
 def test_missing_context_rejected(client):

@@ -57,7 +57,7 @@ def test_close_session_writes_bytes_and_bumps_used_mb():
     ev.close_session(fake_exec, session_id=42, voucher_id=7,
                      bytes_out=3_000_000, bytes_in=2_000_000)
     assert len(calls) == 2
-    assert calls[0][0].startswith("UPDATE portal_session SET ended_at=NOW()")
+    assert calls[0][0].startswith("UPDATE portal_session SET state='closed', ended_at=NOW()")
     assert calls[0][1] == ("voucher_expired", 3_000_000, 2_000_000, 42)  # default voucher_status="expired"
     assert calls[1][0].startswith("UPDATE voucher SET used_mb = used_mb +")
     assert calls[1][1] == (5, 7)  # (3MB+2MB) รวม 5MB
@@ -142,7 +142,7 @@ class _FakeCursor:
             self._result = self.state["to_close"]
         elif s.startswith("SELECT COALESCE(SUM(bytes_out)"):
             self._result = {"bo": 1_000_000, "bi": 1_000_000}
-        elif s.startswith("UPDATE portal_session SET ended_at"):
+        elif s.startswith("UPDATE portal_session SET state='closed'"):
             self.state["closed"].append(args)
             self.rowcount = 1
         elif s.startswith("UPDATE voucher SET used_mb"):
