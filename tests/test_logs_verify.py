@@ -93,7 +93,8 @@ def client(tmp_path, monkeypatch):
     import importlib
     admin_app = importlib.import_module("admin.app")
     importlib.reload(admin_app)  # ให้ LOG_DIR (module-level constant) อ่านค่า env ใหม่
-    admin_app.app.config.update(SESSION_COOKIE_SECURE=False, TESTING=True)
+    admin_app.app.config.update(SESSION_COOKIE_SECURE=False, TESTING=True,
+                                CSRF_ENABLED=False)  # R2-09: CSRF ทดสอบแยกท้าย test_setup_flow.py
     c = admin_app.app.test_client()
     c.archive_dir = archive_dir
     c.module = admin_app

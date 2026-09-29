@@ -20,6 +20,7 @@
   {% endif %}
 
   <form method="post" autocomplete="off">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <label for="token">Setup Token</label>
     <input type="text" id="token" name="token" class="mono" required
            placeholder="วางค่าจาก /etc/cafe-wifi/setup.token">

@@ -25,6 +25,7 @@
         {% if r.status == 'active' %}
         <form method="post" action="{{ url_for('revoke_voucher', vid=r.id) }}"
               onsubmit="return confirm('ยกเลิกรหัส {{ r.username }} ใช่ไหม? ลูกค้าจะหลุดจากเน็ตภายใน 5 นาที')">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <button class="ghost" type="submit">ยกเลิก</button>
         </form>
         {% endif %}
@@ -41,6 +42,7 @@
   {% if current_role == 'admin' %}
   <p class="hint">ตรวจว่าไฟล์ log ที่ผนึกไว้ (§6.1) ยังไม่ถูกแก้ไขเลยตั้งแต่ผนึก</p>
   <form method="post" action="{{ url_for('verify_log_integrity') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <button type="submit">ตรวจสอบความถูกต้องของ log</button>
   </form>
   {% else %}<span class="hint">เฉพาะ admin</span>{% endif %}

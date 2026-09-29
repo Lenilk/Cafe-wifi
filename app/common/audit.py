@@ -26,6 +26,7 @@ SEARCH_LOG = "search_log"  # N9 (CODING_BRIEF.md) -- ค้น conn_log/dns_log 
 BYPASS_DETECTED = "bypass_detected"  # N10 (CODING_BRIEF.md) -- T17: ตรวจพบอุปกรณ์แปลกปลอมในวง uplink
 LOG_GAP = "log_gap"  # N31 -- เหตุการณ์จราจรบางส่วนถูกทิ้ง (ENOBUFS/DB ล่ม) หลักฐานช่วงนั้นไม่ครบ
 INTEGRITY_FAILED = "integrity_failed"  # N21 -- hash chain ของ log ไม่ตรง = หลักฐานถูกแก้ไขย้อนหลัง
+CSRF_REJECT = "csrf_reject"  # R2-09 -- POST ไม่มี/ผิด CSRF token = อาจมีหน้าอื่นพยายามสั่งงานแทนพนักงาน
 
 
 def log(action: str, staff_id: int | None = None, target: str = "",

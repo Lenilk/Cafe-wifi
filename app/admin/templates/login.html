@@ -5,6 +5,7 @@
   <h1>เข้าสู่ระบบพนักงาน</h1>
   {% if error %}<div class="msg err">{{ error }}</div>{% endif %}
   <form method="post" autocomplete="off">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <label for="username">ชื่อผู้ใช้</label>
     <input type="text" id="username" name="username" required autofocus>
     <label for="password">รหัสผ่าน</label>

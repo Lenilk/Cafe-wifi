@@ -41,6 +41,7 @@ app.config.update(
     SESSION_COOKIE_SECURE=True,          # ผ่าน nginx TLS เท่านั้น
     PERMANENT_SESSION_LIFETIME=timedelta(hours=8),
     MAX_CONTENT_LENGTH=1 * 1024 * 1024,
+    CSRF_ENABLED=True,                   # R2-09 -- ปิดได้เฉพาะในเทสต์ที่ไม่ได้ทดสอบ CSRF โดยตรง
 )
 
 
@@ -129,6 +130,24 @@ def safe_next(nxt: str) -> str | None:
     return nxt
 
 
+CSRF_FIELD = "csrf_token"
+
+
+def csrf_token() -> str:
+    """R2-09: token สุ่มผูกกับ session (synchronizer token pattern) ใช้ใน hidden field ทุกฟอร์ม POST
+    สร้างใหม่เมื่อ session ถูกล้าง (login/logout) -- token เก่าก่อน login จึงใช้ต่อหลัง login ไม่ได้"""
+    tok = session.get(CSRF_FIELD)
+    if not tok:
+        tok = session[CSRF_FIELD] = secrets.token_urlsafe(32)
+    return tok
+
+
+def csrf_ok() -> bool:
+    expected = session.get(CSRF_FIELD)
+    sent = request.form.get(CSRF_FIELD) or request.headers.get("X-CSRF-Token") or ""
+    return bool(expected) and secrets.compare_digest(sent.encode(), expected.encode())
+
+
 def admin_required(view):
     @wraps(view)
     def wrapper(*a, **kw):
@@ -143,6 +162,12 @@ def gate():
     g.client_ip = client_ip()
     if request.path.startswith("/static"):
         return None
+    # R2-09: SameSite=Lax อย่างเดียวไม่กันคำขอจากหน้าอื่นใน "site" เดียวกัน (host/IP เดียวกันคนละ port)
+    # ตรวจ token ทุก POST รวม /login และ /setup ด้วย (กัน login CSRF -- ถูกจับ login เป็นบัญชีคนอื่น)
+    if request.method == "POST" and app.config["CSRF_ENABLED"] and not csrf_ok():
+        audit.log(audit.CSRF_REJECT, staff_id=session.get("staff_id"), target=request.path,
+                  client_ip=g.client_ip)
+        abort(400, "แบบฟอร์มหมดอายุหรือไม่ได้ส่งมาจากหน้านี้ กรุณาโหลดหน้าใหม่แล้วลองอีกครั้ง")
     # ยังไม่มีบัญชีผู้ดูแล -> บังคับไปหน้า setup
     if staff_count() == 0 and request.endpoint not in {"setup", "health"}:
         return redirect(url_for("setup"))
@@ -156,6 +181,7 @@ def inject_globals():
         "current_user": session.get("username"),
         "current_role": session.get("role"),
         "now": datetime.now(),
+        "csrf_token": csrf_token,
     }
 
 
@@ -675,6 +701,11 @@ def verify_log_integrity():
     audit.log("verify_integrity", staff_id=session["staff_id"], client_ip=g.client_ip,
               detail=(f"พบ {len(issues)} ปัญหา" if issues else "chain สมบูรณ์ ไม่พบปัญหา"))
     return render_template("logs_verify.html", issues=issues, archive_dir=str(archive_dir))
+
+
+@app.errorhandler(400)
+def e400(e):
+    return render_template("error.html", title="คำขอไม่ถูกต้อง", message=e.description), 400
 
 
 @app.errorhandler(403)

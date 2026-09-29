@@ -152,7 +152,8 @@ def client(monkeypatch):
     import importlib
     admin_app = importlib.import_module("admin.app")
     importlib.reload(admin_app)
-    admin_app.app.config.update(SESSION_COOKIE_SECURE=False, TESTING=True)
+    admin_app.app.config.update(SESSION_COOKIE_SECURE=False, TESTING=True,
+                                CSRF_ENABLED=False)  # R2-09: CSRF ทดสอบแยกท้าย test_setup_flow.py
     return admin_app.app.test_client()
 
 

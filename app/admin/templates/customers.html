@@ -23,6 +23,7 @@
         <span class="hint">ลบข้อมูลแล้ว</span>
         {% elif current_role == 'admin' %}
         <form method="post" action="{{ url_for('reveal', cid=r.id) }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <input type="text" name="reason" placeholder="เหตุผลที่ต้องเปิดเผย (บันทึกไว้)"
                  required minlength="10" style="width:auto;display:inline-block">
           <button class="ghost" type="submit">เปิดเผยเลขเต็ม</button>
@@ -30,10 +31,12 @@
         <form method="post" action="{{ url_for('toggle_block_customer', cid=r.id) }}"
               style="margin-top:.4rem"
               onsubmit="return confirm('{{ 'ยกเลิกระงับ' if r.is_blocked else 'ระงับ' }}ลูกค้ารายนี้ใช่ไหม?')">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <button class="ghost" type="submit">{{ 'ยกเลิกระงับ' if r.is_blocked else 'ระงับ' }}</button>
         </form>
         <form method="post" action="{{ url_for('erase_customer', cid=r.id) }}" style="margin-top:.4rem"
               onsubmit="return confirm('ลบข้อมูลระบุตัวตนของลูกค้ารายนี้ตามคำขอใช่ไหม? ย้อนกลับไม่ได้')">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <input type="text" name="reason" placeholder="เหตุผล/คำขอของเจ้าของข้อมูล (บันทึกไว้)"
                  required minlength="10" style="width:auto;display:inline-block">
           <button class="ghost" type="submit">ลบข้อมูล (DSR)</button>

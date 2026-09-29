@@ -13,6 +13,7 @@
   </div>
 
   <form method="post" autocomplete="off">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <label for="natid">เลขประจำตัวประชาชน 13 หลัก</label>
     <input type="text" id="natid" name="natid" class="mono" required autofocus
            inputmode="numeric" maxlength="17" value="{{ natid or '' }}"

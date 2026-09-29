@@ -79,7 +79,8 @@ def client(tmp_path, monkeypatch):
     admin_app = importlib.import_module("admin.app")
     importlib.reload(admin_app)
     admin_app.SETUP_TOKEN_FILE = tmp_path / "setup.token"
-    admin_app.app.config.update(SESSION_COOKIE_SECURE=False, TESTING=True)
+    admin_app.app.config.update(SESSION_COOKIE_SECURE=False, TESTING=True,
+                                CSRF_ENABLED=False)  # R2-09: CSRF ทดสอบแยกท้าย test_setup_flow.py
     c = admin_app.app.test_client()
     c.token_file = tmp_path / "setup.token"
     return c
@@ -174,3 +175,86 @@ def test_login_rejects_open_redirect(client, nxt):
     loc = _login_next(client, nxt)
     assert "evil" not in loc and "javascript" not in loc
     assert loc in ("/", "http://localhost/")
+
+
+# ---------------------------------------------------------------- R2-09: CSRF token
+import re  # noqa: E402
+
+_TOKEN_RE = re.compile(r'name="csrf_token" value="([^"]+)"')
+
+
+@pytest.fixture
+def csrf_client(client):
+    """client เดิมแต่เปิดการตรวจ CSRF (ค่าจริงตอนใช้งาน)"""
+    client.application.config["CSRF_ENABLED"] = True
+    return client
+
+
+def _form_token(c, path):
+    m = _TOKEN_RE.search(c.get(path).get_data(as_text=True))
+    assert m, f"หน้า {path} ต้องมี hidden field csrf_token"
+    return m.group(1)
+
+
+def _setup_and_login(c):
+    _post(c, csrf_token=_form_token(c, "/setup"))
+    r = c.post("/login", data=dict(username="admin", password=GOOD_PW,
+                                   csrf_token=_form_token(c, "/login")))
+    assert r.status_code == 302
+
+
+def test_csrf_setup_without_token_rejected(csrf_client):
+    r = _post(csrf_client)
+    assert r.status_code == 400
+    assert STAFF == [], "ไม่มี token ต้องไม่สร้างบัญชี"
+    assert any("csrf_reject" in str(a) for a in AUDIT)
+
+
+def test_csrf_setup_with_token_works(csrf_client):
+    r = _post(csrf_client, csrf_token=_form_token(csrf_client, "/setup"))
+    assert r.status_code == 302 and len(STAFF) == 1
+
+
+def test_csrf_login_without_token_rejected(csrf_client):
+    # กัน login CSRF: หน้าอื่นบังคับ browser พนักงานให้ login เป็นบัญชีของผู้โจมตี
+    _post(csrf_client, csrf_token=_form_token(csrf_client, "/setup"))
+    r = csrf_client.post("/login", data=dict(username="admin", password=GOOD_PW))
+    assert r.status_code == 400
+    with csrf_client.session_transaction() as sess:
+        assert "staff_id" not in sess
+
+
+@pytest.mark.parametrize("bad", ["", "wrong-token"])
+def test_csrf_logged_in_post_with_bad_token_rejected(csrf_client, bad):
+    _setup_and_login(csrf_client)
+    r = csrf_client.post("/logout", data=dict(csrf_token=bad))
+    assert r.status_code == 400
+    with csrf_client.session_transaction() as sess:
+        assert "staff_id" in sess, "POST ที่ไม่ผ่าน CSRF ต้องไม่มีผลใด ๆ"
+
+
+def test_csrf_token_rotates_on_login(csrf_client):
+    # token ที่ได้ก่อน login (ผู้โจมตีอาจรู้ได้ถ้าฝัง session ไว้) ต้องใช้หลัง login ไม่ได้
+    _post(csrf_client, csrf_token=_form_token(csrf_client, "/setup"))
+    pre = _form_token(csrf_client, "/login")
+    csrf_client.post("/login", data=dict(username="admin", password=GOOD_PW, csrf_token=pre))
+    assert csrf_client.post("/logout", data=dict(csrf_token=pre)).status_code == 400
+    post = _form_token(csrf_client, "/")
+    assert post != pre
+    assert csrf_client.post("/logout", data=dict(csrf_token=post)).status_code == 302
+
+
+def test_csrf_header_accepted(csrf_client):
+    _setup_and_login(csrf_client)
+    tok = _form_token(csrf_client, "/")
+    r = csrf_client.post("/logout", headers={"X-CSRF-Token": tok})
+    assert r.status_code == 302
+
+
+def test_every_admin_post_form_has_csrf_field():
+    """กันลืมใส่ hidden field เวลาเพิ่มฟอร์มใหม่"""
+    tpl_dir = pathlib.Path(__file__).resolve().parents[1] / "app" / "admin" / "templates"
+    for tpl in tpl_dir.glob("*.html"):
+        html = tpl.read_text(encoding="utf-8")
+        for m in re.finditer(r'<form[^>]*method="post"[^>]*>(.*?)</form>', html, re.S | re.I):
+            assert 'name="csrf_token"' in m.group(1), f"{tpl.name}: ฟอร์ม POST ไม่มี csrf_token"
