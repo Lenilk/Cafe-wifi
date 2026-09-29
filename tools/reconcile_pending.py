@@ -22,17 +22,20 @@ def gateway_clients() -> dict | None:
         return None
 
 
-def confirmed_since(client: dict | None, ip: str, started_at: datetime) -> bool:
-    """MAC อย่างเดียวไม่พอ: ต้องเป็น IP เดิมและ gateway session ที่เริ่มหลัง pending."""
+def confirmed_at(client: dict | None, ip: str, started_at: datetime) -> datetime | None:
+    """คืนเวลาที่ openNDS เปิดสิทธิ์จริง (session_start) ถ้ายืนยันได้ ไม่งั้นคืน None
+
+    MAC อย่างเดียวไม่พอ: ต้องเป็น IP เดิมและ gateway session ที่เริ่มหลัง pending
+    """
     if not client or not str(client.get("state", "")).lower().startswith("auth"):
-        return False
+        return None
     if str(client.get("ip") or client.get("clientip") or "") != ip:
-        return False
+        return None
     try:
         gateway_start = datetime.fromtimestamp(int(client["session_start"]))
     except (KeyError, TypeError, ValueError, OverflowError, OSError):
-        return False
-    return gateway_start >= started_at
+        return None
+    return gateway_start if gateway_start >= started_at else None
 
 
 def purge_orphan_claims() -> int:
@@ -62,7 +65,13 @@ def run() -> tuple[int, int]:
                     "WHERE ps.state='pending' ORDER BY ps.id FOR UPDATE")
         pending = cur.fetchall()
         for row in pending:
-            if row["pending_until"] <= datetime.now():
+            # R2-08: ตรวจการยืนยันจาก openNDS ก่อน timeout -- ลูกค้าที่กดตาม redirect ใกล้
+            # วินาทีสุดท้ายของ pending ถูกเปิดสิทธิ์ไปแล้ว ต้องไม่ถูกตัดทิ้งว่า auth_timeout
+            gateway_start = None
+            if clients is not None:
+                client = clients.get(row["mac"].lower()) or clients.get(row["mac"].upper())
+                gateway_start = confirmed_at(client, row["ip"], row["started_at"])
+            if gateway_start is None and row["pending_until"] <= datetime.now():
                 from tools.enforce_voucher_expiry import deauth_mac
                 if not deauth_mac(row["mac"]):
                     log.error("pending %s หมดเวลาแต่ตัดสิทธิ์ที่ gateway ไม่สำเร็จ", row["id"])
@@ -74,10 +83,7 @@ def run() -> tuple[int, int]:
                             (row["mac"], row["id"]))
                 expired += 1
                 continue
-            if clients is None:
-                continue
-            client = clients.get(row["mac"].lower()) or clients.get(row["mac"].upper())
-            if not confirmed_since(client, row["ip"], row["started_at"]):
+            if gateway_start is None:
                 continue
             if row["status"] != "active" or row["valid_until"] <= datetime.now():
                 from tools.enforce_voucher_expiry import deauth_mac
@@ -104,8 +110,10 @@ def run() -> tuple[int, int]:
             cur.execute("INSERT INTO device (voucher_id, mac, last_ip) VALUES (%s,%s,%s) "
                         "ON DUPLICATE KEY UPDATE last_ip=VALUES(last_ip)",
                         (row["voucher_id"], row["mac"], row["ip"]))
-            cur.execute("UPDATE portal_session SET state='authenticated', authenticated_at=NOW() "
-                        "WHERE id=%s AND state='pending'", (row["id"],))
+            # R2-08: ใช้เวลาที่ openNDS เปิดสิทธิ์จริง ไม่ใช่เวลาที่ timer มาเจอ (ช้ากว่าได้หลายวินาที)
+            # ไม่งั้น DNS query ชุดแรกหลังเปิดสิทธิ์จะมี ts < authenticated_at และโยงหาลูกค้าไม่ได้
+            cur.execute("UPDATE portal_session SET state='authenticated', authenticated_at=%s "
+                        "WHERE id=%s AND state='pending'", (gateway_start, row["id"]))
             cur.execute("DELETE FROM pending_mac_claim WHERE mac=%s AND portal_session_id=%s",
                         (row["mac"], row["id"]))
             promoted += 1
