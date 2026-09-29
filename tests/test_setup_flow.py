@@ -150,3 +150,27 @@ def test_login_with_new_account(client):
     _post(client)
     assert client.post("/login", data=dict(username="admin", password=GOOD_PW)).status_code == 302
     assert client.post("/login", data=dict(username="admin", password="wrong-pass-123")).status_code == 401
+
+
+def _login_next(client, nxt):
+    _post(client)
+    r = client.post("/login", query_string={"next": nxt},
+                    data=dict(username="admin", password=GOOD_PW))
+    assert r.status_code == 302
+    return r.headers["Location"]
+
+
+def test_login_redirects_to_internal_next(client):
+    # R2-04: path ภายในยังพากลับไปหน้าที่ตั้งใจไว้ได้ตามเดิม
+    assert _login_next(client, "/logs?page=2").endswith("/logs?page=2")
+
+
+@pytest.mark.parametrize("nxt", [
+    "//evil.example/", "/\\evil.example/", "/\t/evil.example/", "/\n/evil.example/",
+    "https://evil.example/", "javascript:alert(1)", "evil.example",
+])
+def test_login_rejects_open_redirect(client, nxt):
+    # R2-04: ปลายทางที่ browser ตีความเป็นโดเมนอื่นต้องตกไปหน้า dashboard แทน
+    loc = _login_next(client, nxt)
+    assert "evil" not in loc and "javascript" not in loc
+    assert loc in ("/", "http://localhost/")

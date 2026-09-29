@@ -18,6 +18,7 @@ import time
 from datetime import datetime, timedelta
 from functools import wraps
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from flask import (Flask, abort, flash, g, redirect, render_template,
                    request, session, url_for)
@@ -112,6 +113,20 @@ def login_required(view):
             return redirect(url_for("login", next=request.path))
         return view(*a, **kw)
     return wrapper
+
+
+def safe_next(nxt: str) -> str | None:
+    """R2-04: รับเฉพาะ path ภายในเว็บนี้ -- กัน open redirect หลัง login
+    `//evil.example/` และ `/\\evil.example/` ขึ้นต้นด้วย `/` แต่ browser ตีความเป็นโดเมนอื่น
+    ส่วน tab/newline browser จะตัดทิ้งก่อน (`/<TAB>/evil` กลายเป็น `//evil`) จึงปฏิเสธ control char ทั้งหมด"""
+    if not nxt or not nxt.startswith("/") or nxt.startswith("//"):
+        return None
+    if "\\" in nxt or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in nxt):
+        return None
+    parts = urlsplit(nxt)
+    if parts.scheme or parts.netloc:
+        return None
+    return nxt
 
 
 def admin_required(view):
@@ -266,8 +281,7 @@ def login():
     session.update(staff_id=row["id"], username=row["username"], role=row["role"])
     audit.log(audit.LOGIN_OK, staff_id=row["id"], target=username, client_ip=ip)
 
-    nxt = request.args.get("next", "")
-    return redirect(nxt if nxt.startswith("/") else url_for("dashboard"))
+    return redirect(safe_next(request.args.get("next", "")) or url_for("dashboard"))
 
 
 @app.post("/logout")
