@@ -27,7 +27,8 @@
 | R2-02 | ✅ แก้แล้ว | `4f232c3` | ยังไม่ได้ทดสอบ (ต้องตรวจรูปแบบเอาต์พุตของ conntrack จริง) |
 | R2-03 | ⚠️ แก้บางส่วน — ปิดช่องทาง IPv6 แล้ว ช่องทางตั้ง IP ในวง uplink ยังเปิดอยู่ | `6247ff4` | ยังไม่ได้ทดสอบ |
 | R2-04 | ✅ แก้แล้ว | `fd604a5` | — (มีเทสต์อัตโนมัติครอบแล้ว) |
-| R2-05 ถึง R2-10, R2-L01 ถึง R2-L06 | ⏳ ยังไม่ได้แก้ | — | — |
+| R2-09 | ✅ แก้แล้ว | `bc7aaec` | ควรลองกดทุกปุ่มใน Admin บน Pi หนึ่งรอบ |
+| R2-05 ถึง R2-08, R2-10, R2-L01 ถึง R2-L06 | ⏳ ยังไม่ได้แก้ | — | — |
 
 ชุดทดสอบหลังแก้ R2-01: `PYTHONPATH=app pytest -q tests` → **297 passed**
 
@@ -237,6 +238,12 @@ return redirect(nxt if nxt.startswith("/") else url_for("dashboard"))
 ทุก POST ที่มีผล (ออกรหัส, ยกเลิกรหัส, ระงับ, ลบข้อมูล DSR, เปิดเลขบัตร, logout) ป้องกัน CSRF ด้วย `SESSION_COOKIE_SAMESITE="Lax"` เพียงชั้นเดียว ซึ่งกันกรณีทั่วไปได้ แต่ไม่ใช่มาตรการที่ผู้ตรวจงานความปลอดภัยยอมรับเป็นหลัก และไม่กันกรณีต้นทางอยู่ใน "site" เดียวกัน (เช่น หน้าอื่นบน host/IP เดียวกันที่ถูกฝังสคริปต์)
 
 **แก้:** ใช้ Flask-WTF `CSRFProtect` หรือทำ token เองใน session แล้วใส่ hidden field ทุกฟอร์ม พร้อมเทสต์ว่า POST ที่ไม่มี token ได้ 400
+
+> **✅ แก้แล้ว — commit `bc7aaec`**
+>
+> ทำ token เองแบบ synchronizer token (ไม่เพิ่ม dependency ใหม่ให้ต้องติดตั้งบน Pi): `csrf_token()` ใน `app/admin/app.py` สุ่ม token 32 ไบต์เก็บใน session แล้วส่งเข้า template ผ่าน context processor ส่วน `gate()` (before_request) ตรวจ **ทุก POST** รวม `/login` และ `/setup` (กัน login CSRF) ด้วย `secrets.compare_digest` รับจาก field `csrf_token` หรือ header `X-CSRF-Token` ไม่ผ่านได้ 400 พร้อมหน้า error ภาษาไทย และลง `audit_log` เป็น `csrf_reject` token ถูกสร้างใหม่ทุกครั้งที่ session ถูกล้าง (login/logout) จึงใช้ token ก่อน login ต่อไม่ได้
+>
+> ใส่ hidden field ครบ 10 ฟอร์มใน 7 template (ออกรหัส, ยกเลิกรหัส, ระงับ, ลบข้อมูล DSR, เปิดเลขบัตร, ตรวจ log 2 จุด, logout, login, setup) เทสต์เดิมที่ไม่ได้ทดสอบ CSRF ปิดด้วย `CSRF_ENABLED=False` ส่วนเทสต์ใหม่ท้าย `tests/test_setup_flow.py` (8 เคส) เปิดการตรวจจริง: ไม่มี/ผิด token ได้ 400 และไม่มีผล, token หมุนหลัง login, header ใช้ได้ และตรวจว่าทุก `<form method="post">` ใน template มี `csrf_token` (กันลืมเวลาเพิ่มฟอร์มใหม่) — ตอนเปิดการตรวจกับเทสต์เดิมทั้งหมด POST ไม่มี token fail 43 ข้อ ยืนยันว่าบังคับใช้จริง ชุดทดสอบรวม → **305 passed**
 
 ---
 
