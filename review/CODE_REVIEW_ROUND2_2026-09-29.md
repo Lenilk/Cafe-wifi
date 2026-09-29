@@ -28,7 +28,8 @@
 | R2-03 | ⚠️ แก้บางส่วน — ปิดช่องทาง IPv6 แล้ว ช่องทางตั้ง IP ในวง uplink ยังเปิดอยู่ | `6247ff4` | ยังไม่ได้ทดสอบ |
 | R2-04 | ✅ แก้แล้ว | `fd604a5` | — (มีเทสต์อัตโนมัติครอบแล้ว) |
 | R2-09 | ✅ แก้แล้ว | `bc7aaec` | ควรลองกดทุกปุ่มใน Admin บน Pi หนึ่งรอบ |
-| R2-05 ถึง R2-08, R2-10, R2-L01 ถึง R2-L06 | ⏳ ยังไม่ได้แก้ | — | — |
+| R2-05 | ✅ แก้แล้ว | `9969b02` | ควรลองระงับลูกค้าที่ออนไลน์อยู่แล้วรอ enforce รอบถัดไป (≤ 5 นาที) |
+| R2-06 ถึง R2-08, R2-10, R2-L01 ถึง R2-L06 | ⏳ ยังไม่ได้แก้ | — | — |
 
 ชุดทดสอบหลังแก้ R2-01: `PYTHONPATH=app pytest -q tests` → **297 passed**
 
@@ -189,6 +190,14 @@ return redirect(nxt if nxt.startswith("/") else url_for("dashboard"))
 `toggle_block_customer` ตั้งแค่ `customer.is_blocked = 1` ส่วน `find_sessions_to_close` หา session ที่ต้องตัดจาก `v.status != 'active'` อย่างเดียว ไม่ดู `is_blocked` ผลคือการระงับมีผลแค่กับการ login ครั้งถัดไป (FAS ตรวจ `is_blocked`) ลูกค้าที่ออนไลน์อยู่ใช้ต่อได้จนรหัสหมดอายุ (สูงสุด 24 ชม.)
 
 **แก้:** ตอนระงับให้ `UPDATE voucher SET status='revoked' WHERE customer_id=%s AND status='active'` ใน transaction เดียวกันพร้อม audit (enforce รอบถัดไปจะตัดให้เอง ≤ 5 นาที) หรือเพิ่ม `OR c.is_blocked` ในคิวรีของ enforce และเพิ่ม cause `customer_blocked` ใน `TERMINATE_CAUSE_BY_STATUS`
+
+> **✅ แก้แล้ว — commit `9969b02`** (ใช้แนวทางที่ 2: ตรวจ `is_blocked` ใน enforce)
+>
+> - `tools/enforce_voucher_expiry.py`: `find_sessions_to_close()` JOIN `customer` แล้วเลือก session ที่ `v.status != 'active' OR c.is_blocked` คืนสถานะ `blocked` ถ้า voucher ยัง active (ถ้า voucher ไม่ active อยู่แล้วใช้สาเหตุจาก voucher) และ map `blocked → customer_blocked` ใน `TERMINATE_CAUSE_BY_STATUS`
+> - ไม่เปลี่ยน voucher เป็น `revoked` เพราะการระงับเป็นแบบสลับได้ — ยกเลิกการระงับแล้วลูกค้าใช้รหัสเดิมต่อได้เลย ไม่ต้องออกรหัสใหม่
+> - หน้า Admin แจ้งว่าอุปกรณ์ที่ออนไลน์จะถูกตัดภายใน 5 นาที (รอบของ `cafe-enforce.timer` — แอป Admin รันเป็น `cafewifi` สั่ง `ndsctl deauth` เองไม่ได้)
+> - เทสต์: รันคิวรีจริงบน sqlite ครอบกรณีถูกระงับ/ปกติ/หมดอายุ/ปิดแล้ว/pending และกรณีเข้าทั้งสองเงื่อนไข — fail กับโค้ดเดิม · ชุดทดสอบทั้งหมด **308 passed**
+> - ยังไม่ได้ทดสอบบน MariaDB/Pi จริง
 
 ---
 
