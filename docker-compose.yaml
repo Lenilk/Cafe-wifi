@@ -21,6 +21,7 @@ services:
       - ./sql/001_schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
       - ./sql/005_bypass_alert.sql:/docker-entrypoint-initdb.d/005_bypass_alert.sql:ro
       - ./sql/006_drop_totp.sql:/docker-entrypoint-initdb.d/006_drop_totp.sql:ro
+      - ./sql/007_conn_log_started_at.sql:/docker-entrypoint-initdb.d/007_conn_log_started_at.sql:ro
     healthcheck:
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
       interval: 5s

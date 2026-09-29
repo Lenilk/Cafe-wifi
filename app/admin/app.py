@@ -573,12 +573,14 @@ LOGS_PAGE_SIZE = 50
 # เมื่อ MAC ถูกนำกลับมาใช้ซ้ำข้ามช่วงเวลา ส่วน c.natid_masked มาจากคอลัมน์ที่เก็บค่า mask ไว้แล้ว
 # ใน DB (ไม่เคย SELECT natid_enc/natid_hash ในหน้านี้เลย) จึงไม่มีทางเห็นเลขเต็มไม่ว่า role ไหน
 # ตรงตาม §6.2 ข้อ 5 -- role staff จะเห็นแบบเดียวกับ admin ในหน้านี้เป๊ะ (เหมือนหน้า /customers เดิม)
+# R2-02: conn_log.ts คือเวลาจบ connection (DESTROY) ซึ่งอาจเลยช่วง session ของเจ้าของไปแล้ว
+# จึงจับคู่ด้วยเวลาเริ่ม ({tsexpr} = COALESCE(cl.started_at, cl.ts)) ส่วน dns_log ใช้ ts ตรง ๆ
 _MAPPING_JOIN = (
     " LEFT JOIN portal_session ps ON ps.id = ("
     " SELECT CASE WHEN COUNT(*)=1 THEN MAX(s.id) END FROM portal_session s"
     " WHERE s.mac={alias}.mac AND s.ip={alias}.{ipfield}"
-    " AND s.authenticated_at <= {alias}.ts"
-    " AND (s.ended_at IS NULL OR {alias}.ts <= s.ended_at))"
+    " AND s.authenticated_at <= {tsexpr}"
+    " AND (s.ended_at IS NULL OR {tsexpr} <= s.ended_at))"
     " LEFT JOIN voucher v ON v.id=ps.voucher_id"
     " LEFT JOIN customer c ON c.id=v.customer_id"
 )
@@ -623,7 +625,8 @@ def search_logs():
     if log_type == "dns":
         sql = ("SELECT dl.ts, dl.client_ip, dl.mac, dl.qname, dl.qtype, dl.answer, dl.event_kind, "
               "v.username AS voucher_username, c.natid_masked "
-              "FROM dns_log dl" + _MAPPING_JOIN.format(alias="dl", ipfield="client_ip") +
+              "FROM dns_log dl" + _MAPPING_JOIN.format(alias="dl", ipfield="client_ip",
+                                                        tsexpr="dl.ts") +
               " WHERE dl.ts BETWEEN %s AND %s")
         params: list = [start, end]
         if mac:
@@ -633,9 +636,10 @@ def search_logs():
         sql += " ORDER BY dl.ts DESC LIMIT %s OFFSET %s"
         params += [LOGS_PAGE_SIZE + 1, offset]
     else:
-        sql = ("SELECT cl.ts, cl.mac, cl.src_ip, cl.src_port, cl.dst_ip, cl.dst_port, cl.proto, "
+        sql = ("SELECT cl.ts, cl.started_at, cl.mac, cl.src_ip, cl.src_port, cl.dst_ip, cl.dst_port, cl.proto, "
               "cl.bytes_out, cl.bytes_in, v.username AS voucher_username, c.natid_masked "
-              "FROM conn_log cl" + _MAPPING_JOIN.format(alias="cl", ipfield="src_ip") +
+              "FROM conn_log cl" + _MAPPING_JOIN.format(alias="cl", ipfield="src_ip",
+                                                         tsexpr="COALESCE(cl.started_at, cl.ts)") +
               " WHERE cl.ts BETWEEN %s AND %s")
         params = [start, end]
         if mac:

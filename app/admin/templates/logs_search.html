@@ -72,10 +72,11 @@
     </tr>
     {% endfor %}
     {% else %}
-    <tr><th>เวลา</th><th>MAC</th><th>ต้นทาง</th><th>ปลายทาง</th><th>โปรโตคอล</th>
+    <tr><th>เริ่ม</th><th>จบ</th><th>MAC</th><th>ต้นทาง</th><th>ปลายทาง</th><th>โปรโตคอล</th>
         <th>bytes out</th><th>bytes in</th><th>รหัสวอเชอร์</th><th>ลูกค้า</th></tr>
     {% for r in rows %}
     <tr>
+      <td>{{ r.started_at.strftime('%d/%m/%Y %H:%M:%S') if r.started_at else '-' }}</td>
       <td>{{ r.ts.strftime('%d/%m/%Y %H:%M:%S') }}</td>
       <td class="mono">{{ r.mac or '-' }}</td>
       <td class="mono">{{ r.src_ip }}:{{ r.src_port or '-' }}</td>

@@ -310,3 +310,24 @@ def test_staff_sees_masked_natid_not_full_number(client):
     html = client.get("/logs", query_string={"start": "2026-08-01T00:00",
                                              "end": "2026-08-02T00:00"}).get_data(as_text=True)
     assert "1-2345-XXXXX-XX-3" in html  # masked เท่านั้น -- คิวรี่ไม่เคย SELECT natid_enc/natid_hash เลย
+
+
+def test_conn_log_maps_owner_by_start_time_not_destroy_time(client):
+    """R2-02: conn_log.ts คือเวลา DESTROY ซึ่งเลยช่วง session ของเจ้าของไปได้ -- การจับคู่
+    กับ portal_session ต้องใช้เวลาเริ่ม (started_at) ถ้ามี"""
+    _login_as(client, "admin")
+    captured = []
+    orig = FakeCursor._search_conn
+
+    def spy(self, s, args):
+        captured.append(s)
+        return orig(self, s, args)
+
+    FakeCursor._search_conn = spy
+    try:
+        client.get("/logs", query_string={"log_type": "conn", "start": "2026-08-01T00:00",
+                                          "end": "2026-08-02T00:00"})
+    finally:
+        FakeCursor._search_conn = orig
+    assert "s.authenticated_at <= coalesce(cl.started_at, cl.ts)" in captured[0]
+    assert "coalesce(cl.started_at, cl.ts) <= s.ended_at" in captured[0]

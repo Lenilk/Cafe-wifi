@@ -723,6 +723,16 @@ SQL
     warn "ไม่พบ sql/006_drop_totp.sql — ข้าม (staff.totp_secret จะยังค้างอยู่ในสคีมาเฉย ๆ ไม่กระทบการทำงาน)"
   fi
 
+  # R2-02: conn_log.started_at -- เวลาเริ่ม connection (ts เดิมคือเวลาจบ) ใช้จับคู่ว่าใครเปิด
+  # connection นั้น ต้องมีก่อน cafe-logger เริ่ม เพราะ conn_collector.py INSERT คอลัมน์นี้เสมอ
+  local connstart="${SCRIPT_DIR}/sql/007_conn_log_started_at.sql"
+  if [[ -f "$connstart" ]]; then
+    run_sh "mysql '${DB_NAME}' < '${connstart}'"
+    ok "เพิ่มคอลัมน์ conn_log.started_at แล้ว (R2-02)"
+  else
+    die "ไม่พบ sql/007_conn_log_started_at.sql — cafe-logger จะเขียน conn_log ไม่ได้ถ้าไม่มีคอลัมน์นี้"
+  fi
+
   # แก้บั๊ก (พบตอนตรวจทานรอบ 2): sql/003_partitions.sql มีอยู่ในโปรเจกต์และ Task Board
   # ติ๊กว่าเขียนแล้ว แต่ install.sh ไม่เคยเรียกใช้ไฟล์นี้เลยสักบรรทัด -- เป็น optional
   # ตามที่ comment ในไฟล์บอกไว้ (ไม่มีก็ทำงานถูกต้อง แค่ purge ช้ากว่าเมื่อข้อมูลเยอะมาก)
@@ -1248,6 +1258,13 @@ NFT
   # ตัวอื่นตอนต้นฟังก์ชัน) จะไม่มี key นี้ให้ตั้งเลย เงียบๆ ไม่มี error ให้เห็นด้วย (--quiet)
   run_sh "modprobe nf_conntrack 2>/dev/null || true"
   run_sh "sysctl -w net.netfilter.nf_conntrack_acct=1 >/dev/null 2>&1 || warn \"ตั้ง nf_conntrack_acct ไม่สำเร็จ — bytes ใน conn_log จะเป็น 0 เสมอ, quota_mb จะไม่ตัดสิทธิ์ลูกค้าได้จริง\""
+  # R2-02: (1) nf_conntrack_timestamp=1 ให้ DESTROY บอกเวลาเริ่ม connection ได้ (เป็นตัวสำรอง
+  # ของ conn_log.started_at เวลาที่ collector ไม่เห็น NEW เช่นเพิ่งรีสตาร์ท)
+  # (2) ลด timeout ของ TCP ESTABLISHED จากปริยาย 5 วัน -- ลูกค้าที่เดินออกจากร้านไปเฉย ๆ
+  # ทำให้ connection ค้างในตารางจนกว่าจะหมดอายุ ยิ่งค้างนานยิ่งห่างจากการใช้งานจริง และ IP นั้น
+  # ถูกแจกต่อให้คนอื่นไปแล้ว · 7440 วินาที (2 ชม. 4 นาที) คือค่าต่ำสุดที่ RFC 5382 แนะนำสำหรับ
+  # NAT ไม่ให้ตัด connection ที่ idle แต่ยังใช้งานอยู่ (แอปทั่วไปส่ง keepalive ถี่กว่านี้มาก)
+  run_sh "sysctl -w net.netfilter.nf_conntrack_timestamp=1 net.netfilter.nf_conntrack_tcp_timeout_established=7440 >/dev/null 2>&1 || warn \"ตั้ง nf_conntrack_timestamp/tcp_timeout_established ไม่สำเร็จ — conn_log.started_at อาจว่างสำหรับ connection ที่ collector ไม่เห็นตอนเปิด\""
 
   # ตั้งค่านี้ตอน install อย่างเดียวไม่พอ -- ต้องทำซ้ำทุกครั้งที่บูตด้วย เพราะ
   # net.netfilter.nf_conntrack_acct เป็น sysctl key แบบ dynamic ที่มีก็ต่อเมื่อโมดูล
@@ -1265,6 +1282,8 @@ Before=cafe-logger.service
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/bin/sh -c 'modprobe nf_conntrack 2>/dev/null; sysctl -w net.netfilter.nf_conntrack_acct=1'
+# R2-02: key แบบ dynamic เหมือนกัน ต้องตั้งหลังโหลดโมดูล -- ดูเหตุผลตอนตั้งครั้งแรกด้านบน
+ExecStart=-/bin/sh -c 'sysctl -w net.netfilter.nf_conntrack_timestamp=1 net.netfilter.nf_conntrack_tcp_timeout_established=7440'
 
 [Install]
 WantedBy=multi-user.target

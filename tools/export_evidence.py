@@ -24,7 +24,7 @@ from pathlib import Path
 
 log = logging.getLogger("cafe-wifi.export")
 
-CONN_FIELDS = ["ts", "mac", "src_ip", "src_port", "dst_ip", "dst_port", "proto", "bytes_out", "bytes_in"]
+CONN_FIELDS = ["ts", "started_at", "mac", "src_ip", "src_port", "dst_ip", "dst_port", "proto", "bytes_out", "bytes_in"]
 DNS_FIELDS = ["ts", "event_kind", "client_ip", "mac", "qname", "qtype", "answer"]
 
 
@@ -124,7 +124,7 @@ def _cli() -> int:  # pragma: no cover
     end = parse_range_end(args.end)
 
     def q_conn(mac, s, e):
-        sql = "SELECT ts, mac, src_ip, src_port, dst_ip, dst_port, proto, bytes_out, bytes_in FROM conn_log WHERE ts BETWEEN %s AND %s"
+        sql = "SELECT ts, started_at, mac, src_ip, src_port, dst_ip, dst_port, proto, bytes_out, bytes_in FROM conn_log WHERE ts BETWEEN %s AND %s"
         params = [s, e]
         if mac:
             sql += " AND mac = %s"; params.append(mac)

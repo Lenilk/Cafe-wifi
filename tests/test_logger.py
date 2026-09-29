@@ -518,7 +518,116 @@ def test_conn_event_with_unknown_mac_is_inserted(monkeypatch):
         def get(self, ip): return None
 
     assert conn_collector.insert_conn_records([_rec()], MissingMac()) == 1
-    assert inserted[0][1] is None
+    assert inserted[0][2] is None  # (ts, started_at, mac, ...)
+
+
+# ---------------------------------------------------------------- R2-02 ผูก MAC ตอน NEW
+NEW_WITH_ID = ("[1789000000.0] [NEW] ipv4     2 tcp      6 120 SYN_SENT "
+               "src=10.10.0.50 dst=93.184.216.34 sport=40000 dport=443 [UNREPLIED] "
+               "src=93.184.216.34 dst=10.10.0.50 sport=443 dport=40000 id=3141592")
+DESTROY_WITH_ID = ("[1789000900.0] [DESTROY] ipv4     2 tcp      6 "
+                   "src=10.10.0.50 dst=93.184.216.34 sport=40000 dport=443 packets=10 bytes=900 "
+                   "src=93.184.216.34 dst=10.10.0.50 sport=443 dport=40000 packets=8 bytes=7000 "
+                   "[ASSURED] delta-time=900 id=3141592")
+
+
+class _SwitchableArp:
+    """ARP ที่เปลี่ยนเจ้าของ IP ได้ -- จำลอง DHCP แจก IP เดิมให้ลูกค้าคนใหม่"""
+    def __init__(self, mac):
+        self.mac = mac
+    def get(self, ip, now=None):
+        return self.mac
+
+
+def test_parse_event_reads_id_and_kernel_delta_time():
+    ev, rec = conn_collector.parse_conntrack_event(DESTROY_WITH_ID)
+    assert ev == "DESTROY" and rec.ct_id == "3141592"
+    assert rec.started_at == 1789000000.0, "เวลาเริ่ม = เวลา DESTROY - delta-time"
+    assert rec.bytes_out == 900 and rec.bytes_in == 7000
+
+
+def test_parse_line_still_returns_only_destroy():
+    assert parse_conntrack_line(NEW_WITH_ID) is None
+    assert parse_conntrack_line(DESTROY_WITH_ID).ct_id == "3141592"
+
+
+def test_ip_reassigned_between_new_and_destroy_keeps_original_mac():
+    """R2-02: IP เดียวกันเปลี่ยน MAC ระหว่าง NEW กับ DESTROY -- record ต้องได้ MAC ของคนที่เปิด
+    connection ไม่ใช่ของผู้ถือ IP ณ ตอน DESTROY"""
+    arp = _SwitchableArp("AA:AA:AA:AA:AA:01")
+    tracker = conn_collector.ConnTracker(arp)
+    assert tracker.feed(*conn_collector.parse_conntrack_event(NEW_WITH_ID)) is None
+
+    arp.mac = "BB:BB:BB:BB:BB:02"  # ลูกค้าคนเก่าออกไป DHCP แจก 10.10.0.50 ให้คนใหม่
+    rec = tracker.feed(*conn_collector.parse_conntrack_event(DESTROY_WITH_ID))
+
+    assert rec.mac == "AA:AA:AA:AA:AA:01"
+    assert rec.started_at == 1789000000.0 and rec.ts == 1789000900.0
+    assert len(tracker) == 0, "DESTROY แล้วต้องลืม connection นั้น"
+
+
+def test_destroy_without_new_does_not_guess_from_current_arp():
+    """collector เพิ่งเริ่ม (ไม่เห็น NEW) -- ห้ามใช้ ARP ปัจจุบันเพราะอาจเป็นคนใหม่"""
+    tracker = conn_collector.ConnTracker(_SwitchableArp("BB:BB:BB:BB:BB:02"))
+    rec = tracker.feed(*conn_collector.parse_conntrack_event(DESTROY_WITH_ID))
+    assert rec.mac is None and rec.started_at == 1789000000.0
+
+
+def test_tracker_evicts_oldest_when_full():
+    tracker = conn_collector.ConnTracker(_SwitchableArp("AA:AA:AA:AA:AA:01"), max_open=2)
+    for i in range(3):
+        tracker.feed("NEW", conn_collector.replace(_rec(i), ct_id=str(i)))
+    assert len(tracker) == 2 and tracker.evicted == 1
+    assert tracker.feed("DESTROY", conn_collector.replace(_rec(0), ct_id="0")).mac is None
+    assert tracker.feed("DESTROY", conn_collector.replace(_rec(2), ct_id="2")).mac == "AA:AA:AA:AA:AA:01"
+
+
+def _fake_db(monkeypatch, session_macs):
+    import contextlib
+    import common.db as db
+    state = dict(inserted=[], lookups=[])
+
+    class Cursor:
+        def execute(self, sql, params):
+            state["lookups"].append(params)
+        def fetchall(self):
+            return [dict(mac=m) for m in session_macs]
+        def executemany(self, sql, rows):
+            state["sql"] = sql
+            state["inserted"].extend(rows)
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+
+    class Conn:
+        def cursor(self): return Cursor()
+
+    monkeypatch.setattr(db, "get_conn", lambda: contextlib.nullcontext(Conn()))
+    return state
+
+
+def test_insert_uses_captured_mac_and_started_at(monkeypatch):
+    state = _fake_db(monkeypatch, [])
+    rec = conn_collector.replace(_rec(), mac="AA:AA:AA:AA:AA:01", started_at=1788999000.0)
+    assert conn_collector.insert_conn_records([rec]) == 1
+    row = state["inserted"][0]
+    assert "started_at" in state["sql"]
+    assert row[1] == datetime.fromtimestamp(1788999000.0) and row[2] == "AA:AA:AA:AA:AA:01"
+    assert state["lookups"] == [], "มี MAC จากตอน NEW แล้ว ไม่ต้องค้นประวัติ"
+
+
+def test_insert_falls_back_to_session_history_at_start_time(monkeypatch):
+    state = _fake_db(monkeypatch, ["AA:AA:AA:AA:AA:01"])
+    rec = conn_collector.replace(_rec(), started_at=1788999000.0)
+    conn_collector.insert_conn_records([rec])
+    assert state["lookups"][0][1] == datetime.fromtimestamp(1788999000.0), \
+        "ต้องค้นด้วยเวลาเริ่ม ไม่ใช่เวลา DESTROY"
+    assert state["inserted"][0][2] == "AA:AA:AA:AA:AA:01"
+
+
+def test_insert_leaves_mac_empty_when_history_is_ambiguous(monkeypatch):
+    state = _fake_db(monkeypatch, ["AA:AA:AA:AA:AA:01", "BB:BB:BB:BB:BB:02"])
+    conn_collector.insert_conn_records([conn_collector.replace(_rec(), started_at=1788999000.0)])
+    assert state["inserted"][0][2] is None
 
 
 def test_logger_process_exits_nonzero_if_collector_stops(monkeypatch):
@@ -546,3 +655,15 @@ def test_stderr_drain_flags_enobufs_as_evidence_loss():
         on_event_loss=seen.append)
 
     assert len(seen) == 1 and "ENOBUFS" in seen[0]
+
+
+def test_parse_kernel_start_bracket_takes_precedence(monkeypatch):
+    """R2-02: รูปแบบ `[start=<ctime>]` จาก nf_conntrack_timestamp (conntrack -o ktimestamp)"""
+    import time as _time
+    start = _time.mktime(_time.strptime("Tue Sep 29 10:00:00 2026", "%a %b %d %H:%M:%S %Y"))
+    line = ("[1790000000.0] [DESTROY] ipv4     2 udp      17 src=10.10.0.9 dst=8.8.8.8 "
+            "sport=5000 dport=53 src=8.8.8.8 dst=10.10.0.9 sport=53 dport=5000 "
+            "[start=Tue Sep 29 10:00:00 2026] [stop=Tue Sep 29 10:03:00 2026] delta-time=5 id=7")
+    ev, rec = conn_collector.parse_conntrack_event(line)
+    assert ev == "DESTROY" and rec.started_at == start and rec.ct_id == "7"
+    assert rec.proto == "udp" and rec.dst_port == 53

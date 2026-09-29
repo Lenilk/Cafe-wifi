@@ -4,6 +4,8 @@ logger/conn_collector.py — เก็บข้อมูลจราจร (meta
 รันจริงต้องใช้สิทธิ์ CAP_NET_ADMIN/CAP_NET_RAW (systemd unit cafe-logger.service ให้ไว้แล้ว)
 และต้องเปิด accounting ของเคอร์เนลก่อนจึงจะได้ตัวเลข bytes:
     sysctl -w net.netfilter.nf_conntrack_acct=1
+และ (R2-02) เปิด timestamp ของ connection เพื่อให้ DESTROY บอกได้ว่า connection เริ่มเมื่อไร:
+    sysctl -w net.netfilter.nf_conntrack_timestamp=1
 
 ไฟล์นี้แยกส่วน "แปลงข้อความ 1 บรรทัดเป็นข้อมูล" (parse_conntrack_line, ทดสอบได้ล้วน ๆ
 ไม่ต้องมี conntrack จริง) ออกจากส่วน "รันจริงแบบ stream ต่อเนื่อง" (run_forever)
@@ -18,7 +20,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .netutil import MacCache
 from .telemetry import CollectorTelemetry
@@ -39,16 +41,21 @@ NETLINK_BUFFER_BYTES = 32 * 1024 * 1024
 EVENT_QUEUE_MAX = 20000
 # เพดานเรคคอร์ดที่ค้างรอเขียนตอน DB ล่ม (กันหน่วยความจำบวมไม่มีที่สิ้นสุด)
 MAX_PENDING_RECORDS = 20000
+# R2-02: เพดานจำนวน connection ที่เปิดค้างอยู่ซึ่งเราจำ MAC ไว้ (ต่อรายการ ~200 ไบต์ -> ~25 MB)
+MAX_OPEN_CONNS = 131072
 PIPE_BUFFER_BYTES = 1024 * 1024  # N39 -- ท่อปริยาย 64 KB เต็มได้ในชุดเดียวตอน conntrack เก็บกวาด
 F_SETPIPE_SZ = 1031              # ค่าคงที่ของ Linux (ไม่มีใน fcntl ของ Python)
 
 _BRACKET_RE = re.compile(r"\[([^\]]*)\]")
 _KV_RE = re.compile(r"(\w+)=(\S+)")
 _TS_RE = re.compile(r"^\[(\d+\.\d+)\]")
+_DELTA_RE = re.compile(r"\bdelta-time=(\d+)")
 
-# เฉพาะ event ที่บอกว่า connection "จบแล้ว" เท่านั้นที่มีตัวเลข bytes สุดท้ายให้บันทึก
-# NEW/UPDATE ยังไม่นิ่ง ถ้าบันทึกทุก event จะซ้ำซ้อนและ bytes ยังไม่ครบ
-INTERESTING_EVENTS = {"DESTROY"}
+# บันทึกลง conn_log เฉพาะ DESTROY เพราะเป็น event เดียวที่มีตัวเลข bytes สุดท้าย
+# R2-02: แต่ต้องฟัง NEW ด้วยเพื่อจับ MAC + เวลาเริ่ม ณ ตอนที่ connection เปิดจริง -- ถ้าไปหา
+# MAC ตอน DESTROY (ซึ่งช้ากว่าได้ตั้งแต่ 2 นาทีถึง 5 วัน) IP นั้นอาจถูก DHCP แจกให้คนอื่นไปแล้ว
+# UPDATE ไม่สนใจ
+INTERESTING_EVENTS = {"NEW", "DESTROY"}
 
 
 @dataclass(frozen=True)
@@ -61,6 +68,12 @@ class ConnRecord:
     dst_port: int | None
     bytes_out: int
     bytes_in: int
+    # R2-02: id จาก `-o id` ใช้จับคู่ NEW กับ DESTROY ของ connection เดียวกัน
+    ct_id: str | None = None
+    # R2-02: เวลาที่ connection เริ่ม (ts คือเวลาจบ = DESTROY) -- None ถ้าไม่รู้
+    started_at: float | None = None
+    # R2-02: MAC ที่จับไว้ตอน NEW (ไม่ใช่ตอนเขียน DB)
+    mac: str | None = None
 
 
 def _proto_norm(p: str) -> str:
@@ -68,11 +81,26 @@ def _proto_norm(p: str) -> str:
     return p if p in {"tcp", "udp", "icmp"} else "other"
 
 
-def parse_conntrack_line(line: str, now: float | None = None) -> ConnRecord | None:
+def _parse_kernel_start(brackets: list[str], ts: float, body: str) -> float | None:
+    """R2-02: เวลาเริ่ม connection จาก nf_conntrack_timestamp -- `[start=<ctime>]` ถ้ามี
+    ไม่งั้นใช้ `delta-time=<วินาที>` (ระยะเวลาทั้งหมดของ connection) ย้อนจากเวลา DESTROY"""
+    for b in brackets:
+        if b.startswith("start="):
+            try:
+                return time.mktime(time.strptime(b[len("start="):].strip(), "%a %b %d %H:%M:%S %Y"))
+            except ValueError:
+                pass
+    m = _DELTA_RE.search(body)
+    if m:
+        return ts - int(m.group(1))
+    return None
+
+
+def parse_conntrack_event(line: str, now: float | None = None) -> tuple[str, ConnRecord] | None:
     """
-    แปลงบรรทัดหนึ่งจาก `conntrack -E -o timestamp -e DESTROY [-o extended]`
-    คืน None ถ้าไม่ใช่ event ที่สนใจ หรือ parse ไม่ได้ (บันทึก warning แล้วข้าม ไม่ throw
-    เพื่อไม่ให้ 1 บรรทัดเสียทำให้ collector ทั้งตัวตายทั้งกระบวนการ)
+    แปลงบรรทัดหนึ่งจาก `conntrack -E -o timestamp,extended,id -e NEW,DESTROY`
+    เป็น (ชื่อ event, record) -- คืน None ถ้าไม่ใช่ event ที่สนใจ หรือ parse ไม่ได้ (บันทึก
+    warning แล้วข้าม ไม่ throw เพื่อไม่ให้ 1 บรรทัดเสียทำให้ collector ทั้งตัวตายทั้งกระบวนการ)
     """
     line = line.strip()
     if not line:
@@ -92,7 +120,8 @@ def parse_conntrack_line(line: str, now: float | None = None) -> ConnRecord | No
     if INTERESTING_EVENTS and event not in INTERESTING_EVENTS:
         return None
 
-    body = _BRACKET_RE.sub(" ", line)
+    started_at = _parse_kernel_start(brackets, ts, line) if event == "DESTROY" else None
+    body = _BRACKET_RE.sub(" ", _DELTA_RE.sub(" ", line))
     tokens = body.split()
     proto = "other"
     # *** แก้บั๊ก (พบจาก conntrack ตัวจริงบน VM lab, 2026-08-28) *** — เดิมเข้าใจว่า token
@@ -136,35 +165,106 @@ def parse_conntrack_line(line: str, now: float | None = None) -> ConnRecord | No
     bytes_out = byte_values[0] if len(byte_values) >= 1 else 0
     bytes_in = byte_values[1] if len(byte_values) >= 2 else 0
 
-    return ConnRecord(
+    return event, ConnRecord(
         ts=ts, proto=proto, src_ip=src_ip, src_port=_to_port(kv_first.get("sport")),
         dst_ip=dst_ip, dst_port=_to_port(kv_first.get("dport")),
         bytes_out=bytes_out, bytes_in=bytes_in,
+        ct_id=kv_first.get("id"), started_at=started_at,
     )
 
 
-def insert_conn_records(records: list[ConnRecord], mac_cache: MacCache,
+def parse_conntrack_line(line: str, now: float | None = None) -> ConnRecord | None:
+    """เหมือน parse_conntrack_event แต่คืนเฉพาะ record ของ DESTROY (ที่จะลง conn_log)"""
+    parsed = parse_conntrack_event(line, now)
+    if parsed and parsed[0] == "DESTROY":
+        return parsed[1]
+    return None
+
+
+class ConnTracker:
+    """
+    R2-02: จำ MAC + เวลาเริ่มของแต่ละ connection ตั้งแต่ event NEW แล้วแปะให้ record ตอน DESTROY
+
+    ของเดิมหา MAC จาก ARP ตอนเขียน DB ซึ่งช้ากว่าตอนเปิด connection ได้มาก (TIME_WAIT ~2 นาที,
+    TCP ที่ลูกค้าหายไปเฉย ๆ ค้างได้ถึง 5 วัน) ระหว่างนั้น IP อาจถูก DHCP แจกให้ลูกค้าคนใหม่ ->
+    ทราฟฟิกของคนเก่าถูกบันทึกเป็นของคนใหม่ ซึ่งเป็นหลักฐานผิดคนตาม ม.26
+    """
+
+    def __init__(self, mac_cache: MacCache, max_open: int = MAX_OPEN_CONNS):
+        self.mac_cache = mac_cache
+        self.max_open = max_open
+        self._open: dict[str, tuple[str | None, float]] = {}
+        self.evicted = 0
+
+    def __len__(self) -> int:
+        return len(self._open)
+
+    def feed(self, event: str, rec: ConnRecord) -> ConnRecord | None:
+        """คืน record ที่พร้อมบันทึก (เฉพาะ DESTROY) หรือ None"""
+        if event == "NEW":
+            if rec.ct_id is None:
+                return None
+            if len(self._open) >= self.max_open:
+                # dict เรียงตามลำดับที่ใส่ -- ทิ้งรายการเก่าสุด DESTROY ของมันจะไปพึ่ง fallback
+                self._open.pop(next(iter(self._open)))
+                self.evicted += 1
+            self._open[rec.ct_id] = (self.mac_cache.get(rec.src_ip), rec.ts)
+            return None
+        opened = self._open.pop(rec.ct_id, None) if rec.ct_id is not None else None
+        if opened is None:
+            # ไม่เห็น NEW (collector เพิ่งเริ่ม / event หายตอน ENOBUFS) -- ห้ามเดาจาก ARP ปัจจุบัน
+            # ปล่อย mac ว่างให้ insert_conn_records หาจากประวัติ portal_session ตามเวลาเริ่มแทน
+            return rec
+        mac, started_at = opened
+        return replace(rec, mac=mac, started_at=started_at)
+
+
+# R2-02: fallback เมื่อไม่มี MAC จากตอน NEW -- หาจาก portal_session ที่ IP นี้ authenticated อยู่
+# ณ เวลาที่ connection เริ่ม ต้องเจอ MAC เดียวเท่านั้น ถ้าคลุมเครือให้เว้นว่างดีกว่าชี้ผิดคน
+_SESSION_MAC_SQL = (
+    "SELECT DISTINCT mac FROM portal_session WHERE ip=%s"
+    " AND authenticated_at IS NOT NULL AND authenticated_at <= %s"
+    " AND (ended_at IS NULL OR %s <= ended_at) LIMIT 2"
+)
+
+
+def _mac_from_session_history(cur, ip: str, at) -> str | None:
+    cur.execute(_SESSION_MAC_SQL, (ip, at, at))
+    rows = cur.fetchall()
+    if len(rows) != 1:
+        return None
+    row = rows[0]
+    return row["mac"] if isinstance(row, dict) else row[0]
+
+
+def insert_conn_records(records: list[ConnRecord], mac_cache: MacCache | None = None,
                         on_unmapped=None) -> int:
-    """เขียนกลุ่ม record ลง conn_log เป็น batch — คืนจำนวนแถวที่เขียนสำเร็จ"""
+    """เขียนกลุ่ม record ลง conn_log เป็น batch — คืนจำนวนแถวที่เขียนสำเร็จ
+
+    R2-02: ใช้ MAC ที่จับไว้ใน record (ตอน NEW) เท่านั้น ไม่อ่าน ARP ณ ตอนเขียน DB อีกแล้ว
+    (`mac_cache` เหลือไว้เพื่อความเข้ากันได้ของ signature เดิม)"""
     from datetime import datetime
 
     from common.db import get_conn
 
+    if not records:
+        return 0
     rows = []
     unmapped = 0
-    for r in records:
-        mac = mac_cache.get(r.src_ip)
-        if not mac:
-            log.warning("ไม่พบ MAC ของ %s — เก็บ conn_log โดยไม่ระบุตัวอุปกรณ์", r.src_ip)
-            unmapped += 1
-        rows.append((datetime.fromtimestamp(r.ts), mac, r.src_ip, r.src_port,
-                     r.dst_ip, r.dst_port, r.proto, r.bytes_out, r.bytes_in))
-    if not rows:
-        return 0
     with get_conn() as conn, conn.cursor() as cur:
+        for r in records:
+            mac = r.mac
+            started = datetime.fromtimestamp(r.started_at) if r.started_at is not None else None
+            if not mac and started is not None:
+                mac = _mac_from_session_history(cur, r.src_ip, started)
+            if not mac:
+                log.warning("ไม่พบ MAC ของ %s — เก็บ conn_log โดยไม่ระบุตัวอุปกรณ์", r.src_ip)
+                unmapped += 1
+            rows.append((datetime.fromtimestamp(r.ts), started, mac, r.src_ip, r.src_port,
+                         r.dst_ip, r.dst_port, r.proto, r.bytes_out, r.bytes_in))
         cur.executemany(
-            "INSERT INTO conn_log (ts, mac, src_ip, src_port, dst_ip, dst_port, "
-            "proto, bytes_out, bytes_in) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)", rows)
+            "INSERT INTO conn_log (ts, started_at, mac, src_ip, src_port, dst_ip, dst_port, "
+            "proto, bytes_out, bytes_in) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", rows)
     if on_unmapped and unmapped:
         on_unmapped(unmapped)
     return len(rows)
@@ -262,13 +362,16 @@ def run_forever(batch_size: int = 100, flush_interval: float = 5.0) -> None:  # 
       3. ลูปหลัก          -> ดึงจากคิวมาเขียน DB เป็น batch
     """
     mac_cache = MacCache()
+    tracker = ConnTracker(mac_cache)
+    reported_evicted = 0
     telemetry = CollectorTelemetry("conn")
     buffer: list[ConnRecord] = []
     events: queue.Queue = queue.Queue(maxsize=EVENT_QUEUE_MAX)
     overflow = [0]
     last_flush = time.time()
 
-    cmd = ["conntrack", "-E", "-o", "timestamp,extended", "-e", "DESTROY",
+    # R2-02: `id` ใช้จับคู่ NEW กับ DESTROY · ฟัง NEW ด้วยเพื่อจับ MAC ตอนเปิด connection
+    cmd = ["conntrack", "-E", "-o", "timestamp,extended,id", "-e", "NEW,DESTROY",
            "--buffer-size", str(NETLINK_BUFFER_BYTES)]
     log.info("เริ่ม conn_collector: %s", " ".join(cmd))
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -300,12 +403,18 @@ def run_forever(batch_size: int = 100, flush_interval: float = 5.0) -> None:  # 
                 raise RuntimeError("conntrack reader thread หยุดทำงาน")
             try:
                 # N39: แปลงบรรทัดเป็น record ตรงนี้ (ลูปหลัก) แทนที่จะทำในเธรดอ่าน
-                rec = parse_conntrack_line(events.get(timeout=flush_interval))
+                parsed = parse_conntrack_event(events.get(timeout=flush_interval))
+                rec = tracker.feed(*parsed) if parsed else None
                 if rec:
                     buffer.append(rec)
                     telemetry.event()
             except queue.Empty:
                 pass
+            if tracker.evicted != reported_evicted:
+                log.warning("connection ที่เปิดค้างเกิน %d รายการ — ลืม MAC ตอนเปิดไป %d รายการ "
+                            "(จะหาจาก portal_session แทน)", tracker.max_open,
+                            tracker.evicted - reported_evicted)
+                reported_evicted = tracker.evicted
             if overflow[0] != reported_overflow:
                 lost = overflow[0] - reported_overflow
                 reported_overflow = overflow[0]
