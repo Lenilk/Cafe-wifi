@@ -540,7 +540,10 @@ def toggle_block_customer(cid: int):
     execute("UPDATE customer SET is_blocked=%s WHERE id=%s", (new_state, cid))
     audit.log("block_customer" if new_state else "unblock_customer",
               staff_id=session["staff_id"], target=f"customer:{cid}", client_ip=g.client_ip)
-    flash("ระงับลูกค้ารายนี้แล้ว" if new_state else "ยกเลิกการระงับแล้ว", "success")
+    # R2-05: เครื่องที่ออนไลน์อยู่ถูกตัดโดย cafe-enforce.timer รอบถัดไป (ทุก 5 นาที) -- แอปนี้
+    # รันเป็น cafewifi สั่ง ndsctl deauth เองไม่ได้
+    flash("ระงับลูกค้ารายนี้แล้ว อุปกรณ์ที่ออนไลน์อยู่จะถูกตัดภายใน 5 นาที" if new_state
+          else "ยกเลิกการระงับแล้ว", "success")
     return redirect(url_for("customers"))
 
 

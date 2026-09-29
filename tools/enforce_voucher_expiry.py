@@ -90,6 +90,9 @@ TERMINATE_CAUSE_BY_STATUS = {
     # N30: ไม่ใช่สถานะของ voucher แต่ใช้เส้นทาง close_session() เดียวกัน -- ลูกค้าไม่ได้อยู่ใน
     # openNDS แล้ว (เดินออกจากร้าน, idle timeout, หรือ login ไม่สำเร็จจริงตั้งแต่แรก)
     "gone": "disconnected",
+    # R2-05: ไม่ใช่สถานะของ voucher เช่นกัน -- แอดมินระงับลูกค้า (customer.is_blocked) ขณะที่
+    # voucher ยัง active อยู่
+    "blocked": "customer_blocked",
 }
 
 # N30: เผื่อเวลาให้ลูกค้าที่เพิ่งกดเข้าใช้งานได้ทำ redirect ไป openNDS จนเสร็จก่อน ไม่งั้นจะไปปิด
@@ -145,12 +148,24 @@ def mark_quota_exceeded(execute_fn, hits: list[dict]) -> int:
 
 
 def find_sessions_to_close(query_all_fn) -> list[dict]:
-    """session ที่ยังเปิดอยู่ (ended_at IS NULL) แต่ voucher ของมันไม่ active แล้ว"""
+    """
+    session ที่ยังเปิดอยู่ (ended_at IS NULL) แต่ voucher ของมันไม่ active แล้ว หรือเจ้าของ
+    voucher ถูกระงับ
+
+    R2-05: เดิมดูแค่ v.status ทำให้การระงับลูกค้ามีผลแค่กับการ login ครั้งถัดไป (FAS ตรวจ
+    is_blocked) เครื่องที่ออนไลน์อยู่ใช้ต่อได้จนรหัสหมดอายุ (สูงสุด 24 ชม.) -- ตรวจ is_blocked
+    ตรงนี้แทนการเปลี่ยน voucher เป็น revoked เพราะยกเลิกการระงับแล้วรหัสเดิมใช้ต่อได้ทันที
+    ถ้า voucher ไม่ active อยู่แล้ว ให้สาเหตุจาก voucher มาก่อน (เป็นเหตุที่เกิดก่อน/เป็นกลไกปกติ)
+    """
     return query_all_fn("""
-        SELECT ps.id, ps.mac, ps.voucher_id, ps.started_at, v.status AS voucher_status
+        SELECT ps.id, ps.mac, ps.voucher_id, ps.started_at,
+               CASE WHEN v.status != 'active' THEN v.status ELSE 'blocked' END
+                   AS voucher_status
         FROM portal_session ps
         JOIN voucher v ON v.id = ps.voucher_id
-        WHERE ps.ended_at IS NULL AND ps.state='authenticated' AND v.status != 'active'
+        JOIN customer c ON c.id = v.customer_id
+        WHERE ps.ended_at IS NULL AND ps.state='authenticated'
+          AND (v.status != 'active' OR c.is_blocked)
     """)
 
 

@@ -85,6 +85,66 @@ def test_close_session_maps_terminate_cause_from_voucher_status():
     assert calls[0][1][0] == "quota_exceeded"
 
 
+def _sessions_to_close_on_sqlite(customers, vouchers, sessions):
+    """รันคิวรีจริงของ find_sessions_to_close() บน sqlite (ใช้แค่ JOIN/CASE มาตรฐาน) เพื่อตรวจ
+    ความหมายของ WHERE ไม่ใช่แค่ว่ามีคำไหนอยู่ในสตริง"""
+    import sqlite3
+    db = sqlite3.connect(":memory:")
+    db.row_factory = sqlite3.Row
+    db.executescript("""
+        CREATE TABLE customer (id INTEGER PRIMARY KEY, is_blocked BOOLEAN NOT NULL);
+        CREATE TABLE voucher (id INTEGER PRIMARY KEY, customer_id INTEGER, status TEXT);
+        CREATE TABLE portal_session (id INTEGER PRIMARY KEY, mac TEXT, voucher_id INTEGER,
+                                     started_at TEXT, state TEXT, ended_at TEXT);
+    """)
+    db.executemany("INSERT INTO customer VALUES (?,?)", customers)
+    db.executemany("INSERT INTO voucher VALUES (?,?,?)", vouchers)
+    db.executemany("INSERT INTO portal_session VALUES (?,?,?,?,?,?)", sessions)
+
+    def q(sql, args=()):
+        return [dict(r) for r in db.execute(sql, args).fetchall()]
+
+    return {r["id"]: r["voucher_status"] for r in ev.find_sessions_to_close(q)}
+
+
+def test_find_sessions_to_close_includes_blocked_customer_with_active_voucher():
+    """
+    R2-05: ระงับลูกค้าแล้ว เครื่องที่ออนไลน์อยู่ต้องถูกตัดรอบถัดไป ไม่ใช่ใช้ต่อได้จนรหัสหมดอายุ
+    ส่วนลูกค้าปกติที่ voucher ยัง active ต้องไม่โดน
+    """
+    got = _sessions_to_close_on_sqlite(
+        customers=[(1, True), (2, False)],
+        vouchers=[(10, 1, "active"), (20, 2, "active"), (21, 2, "expired")],
+        sessions=[
+            (100, "AA", 10, "t", "authenticated", None),   # ถูกระงับ -> ตัด
+            (101, "BB", 20, "t", "authenticated", None),   # ปกติ -> ไม่ตัด
+            (102, "CC", 21, "t", "authenticated", None),   # หมดอายุ -> ตัดตามเดิม
+            (103, "DD", 10, "t", "closed", "t"),           # ปิดไปแล้ว -> ไม่แตะ
+            (104, "EE", 10, "t", "pending", None),         # ยังไม่ auth -> ไม่แตะ
+        ])
+    assert got == {100: "blocked", 102: "expired"}
+
+
+def test_find_sessions_to_close_prefers_voucher_status_when_both_apply():
+    got = _sessions_to_close_on_sqlite(
+        customers=[(1, True)],
+        vouchers=[(10, 1, "revoked")],
+        sessions=[(100, "AA", 10, "t", "authenticated", None)])
+    assert got == {100: "revoked"}
+
+
+def test_close_session_records_customer_blocked_cause():
+    calls = []
+
+    def fake_exec(sql, args=()):
+        calls.append(args)
+        return 1
+
+    ev.close_session(fake_exec, session_id=1, voucher_id=1,
+                     bytes_out=0, bytes_in=0, voucher_status="blocked")
+    assert calls[0][0] == "customer_blocked"
+
+
 def test_close_session_skips_voucher_update_when_zero_bytes():
     calls = []
 
