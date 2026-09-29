@@ -1562,6 +1562,9 @@ Environment=PYTHONPATH=${OPT_DIR}
 ExecStart=${VENV_DIR}/bin/python -m logger.run_all
 Restart=on-failure
 RestartSec=10
+# R2-06: SIGTERM ไปที่ python ตัวเดียว ให้มันปิด conntrack เองหลังดูดเหตุการณ์ที่ค้างในท่อ -- ค่าปริยาย
+# (control-group) ส่งถึง conntrack พร้อมกัน ถ้ามันตายก่อน จะดูเหมือน crash และข้ามขั้นตอนดูดคิว
+KillMode=mixed
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
 
@@ -1569,6 +1572,9 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
+# R2-06: ต้องเขียนได้ -- collector-*.json (สถานะที่หน้า Admin อ่าน) และตำแหน่งที่อ่าน dnsmasq.log
+# ถึง (อ่านต่อหลัง restart) อยู่ใน LOG_DIR เดิมไม่มีบรรทัดนี้ ProtectSystem=strict ทำให้เขียนไม่ได้เงียบ ๆ
+ReadWritePaths=${LOG_DIR}
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK

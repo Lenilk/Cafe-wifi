@@ -6,10 +6,12 @@ logger/dns_collector.py — เก็บ DNS query log จาก dnsmasq (`log-q
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -157,46 +159,136 @@ def flush_buffer(buffer: list[dict], mac_cache: MacCache,
     return n
 
 
+OFFSET_STATE_FILE = "collector-dns.offset.json"
+
+
+def load_offset(path: str) -> tuple[int, int] | None:
+    """คืน (inode, offset) ที่บันทึกไว้ หรือ None ถ้ายังไม่เคยบันทึก/ไฟล์เสีย"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return int(data["inode"]), int(data["offset"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def save_offset(path: str, inode: int, offset: int) -> None:
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"inode": inode, "offset": offset}, f)
+        os.replace(tmp, path)
+    except OSError as exc:
+        log.warning("บันทึกตำแหน่งที่อ่าน dnsmasq.log ไม่สำเร็จ: %s", exc)
+
+
+def resume_position(state: tuple[int, int] | None, inode: int,
+                    size: int) -> tuple[int, str | None]:
+    """
+    R2-06: เลือกจุดเริ่มอ่าน dnsmasq.log ตอน start -- คืน (offset, เหตุของ log_gap หรือ None)
+
+    เดิม seek ไปท้ายไฟล์ทุกครั้ง บรรทัดที่ dnsmasq เขียนระหว่าง logger ดับ (restart, reboot,
+    RestartSec=10 หลัง crash) จึงไม่ถูกอ่านเลยและไม่มีร่องรอย ตอนนี้อ่านต่อจากจุดที่บันทึกไว้
+    """
+    if state is None:
+        return size, None  # รันครั้งแรก ไม่มีจุดอ้างอิง -- เริ่มที่ท้ายไฟล์เหมือนเดิม
+    saved_inode, saved_offset = state
+    if saved_inode != inode:
+        return 0, "dnsmasq.log ถูกหมุนระหว่างที่ logger ดับ — ท้ายไฟล์เก่าหลังจุดที่อ่านถึงไม่ได้ถูกอ่าน"
+    if saved_offset > size:
+        return 0, f"dnsmasq.log สั้นกว่าจุดที่อ่านถึง ({size} < {saved_offset}) — ไฟล์ถูกตัด"
+    return saved_offset, None
+
+
+def _record_gap(detail: str) -> None:
+    log.error("log_gap dns_log: %s", detail)
+    try:
+        from common import audit
+        audit.log(audit.LOG_GAP, target="dns_log", detail=detail[:200])
+    except Exception:
+        log.exception("บันทึก audit_log เรื่อง dns_log ขาดช่วงไม่สำเร็จ")
+
+
 def run_forever(log_path: str = "/var/log/cafe-wifi/dnsmasq.log",
-                batch_size: int = 200, flush_interval: float = 5.0) -> None:  # pragma: no cover
-    """tail -F แบบง่าย ๆ ด้วยมือ (ไม่พึ่ง binary ภายนอก) แล้วป้อนเข้า DnsCorrelator"""
+                batch_size: int = 200, flush_interval: float = 5.0,
+                stop_event: threading.Event | None = None,
+                state_path: str | None = None) -> None:
+    """
+    tail -F แบบง่าย ๆ ด้วยมือ (ไม่พึ่ง binary ภายนอก) แล้วป้อนเข้า DnsCorrelator
+
+    R2-06: บันทึกตำแหน่งที่อ่านถึง (inode, offset) เฉพาะตอนที่ทุกบรรทัดก่อนหน้าลง DB แล้ว
+    (buffer ว่าง) เริ่มใหม่ครั้งหน้าจึงอ่านต่อได้โดยไม่ข้ามอะไร -- ถ้าดับหลัง INSERT แต่ก่อน
+    บันทึกตำแหน่ง จะอ่านซ้ำได้ไม่กี่แถว ซึ่งดีกว่าหลักฐานหาย
+    """
+    stop_event = stop_event or threading.Event()
+    state_path = state_path or os.path.join(os.path.dirname(log_path), OFFSET_STATE_FILE)
     correlator = DnsCorrelator()
     mac_cache = MacCache()
     telemetry = CollectorTelemetry("dns", os.path.dirname(log_path))
     buffer: list[dict] = []
     last_flush = time.time()
+    saved: tuple[int, int] | None = None
 
     log.info("เริ่ม dns_collector: tail -F %s", log_path)
-    f = open(log_path, "r", encoding="utf-8", errors="replace")
+    f = open(log_path, "rb")
+    inode = os.fstat(f.fileno()).st_ino
+    start, gap = resume_position(load_offset(state_path), inode, os.fstat(f.fileno()).st_size)
+    if gap:
+        _record_gap(gap)
+    f.seek(start)
+
+    def checkpoint() -> None:
+        nonlocal saved
+        if buffer:
+            return  # ยังมีแถวที่ไม่ลง DB -- ห้ามขยับตำแหน่งข้ามมันไป
+        pos = (inode, f.tell())
+        if pos != saved:
+            save_offset(state_path, *pos)
+            saved = pos
+
     try:
-        f.seek(0, 2)  # ไปท้ายไฟล์ก่อน แล้วค่อยตามอ่านของใหม่
-        while True:
+        while not stop_event.is_set():
             telemetry.heartbeat()
             line = f.readline()
+            if line and not line.endswith(b"\n"):
+                f.seek(-len(line), os.SEEK_CUR)  # dnsmasq ยังเขียนบรรทัดนี้ไม่จบ รออ่านทั้งบรรทัด
+                line = b""
             if not line:
                 now = time.time()
                 if buffer and now - last_flush >= flush_interval:
                     flush_buffer(buffer, mac_cache, telemetry=telemetry)
                     last_flush = now
+                checkpoint()
                 try:
-                    replaced = os.fstat(f.fileno()).st_ino != os.stat(log_path).st_ino
+                    replaced = os.stat(log_path).st_ino != inode
                 except FileNotFoundError:
                     replaced = False
                 if replaced:
                     log.info("dnsmasq.log ถูกหมุน — เปิดไฟล์ใหม่")
+                    flush_buffer(buffer, mac_cache, telemetry=telemetry)
+                    last_flush = time.time()
                     f.close()
-                    f = open(log_path, "r", encoding="utf-8", errors="replace")
+                    f = open(log_path, "rb")
                     # ตำแหน่งเริ่มต้นเป็น 0 เพื่ออ่านบรรทัดที่เข้ามาระหว่างหมุนไฟล์
-                time.sleep(0.5)
+                    inode = os.fstat(f.fileno()).st_ino
+                    checkpoint()
+                stop_event.wait(0.5)
                 continue
-            row = correlator.feed_line(line)
+            row = correlator.feed_line(line.decode("utf-8", errors="replace"))
             if row:
                 buffer.append(row)
                 telemetry.event()
             if len(buffer) >= batch_size:
                 flush_buffer(buffer, mac_cache, telemetry=telemetry)
                 last_flush = time.time()
+                checkpoint()
     finally:
+        flush_buffer(buffer, mac_cache, telemetry=telemetry)
+        if buffer:
+            log.warning("ปิด dns_collector ทั้งที่ยังเขียน %d รายการไม่สำเร็จ — "
+                        "จะอ่านซ้ำจากตำแหน่งที่บันทึกไว้ตอนเริ่มครั้งหน้า", len(buffer))
+        checkpoint()
+        telemetry.heartbeat(force=True)
         f.close()
 
 

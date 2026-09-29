@@ -352,7 +352,20 @@ def _enlarge_pipe(stream, target: int = PIPE_BUFFER_BYTES) -> int:  # pragma: no
         return 0
 
 
-def run_forever(batch_size: int = 100, flush_interval: float = 5.0) -> None:  # pragma: no cover
+def _record_restart_gap(since: str) -> None:  # pragma: no cover (ต้องมี DB)
+    """R2-06: `conntrack -E` เห็นแค่เหตุการณ์สด connection ที่ปิดระหว่าง logger ดับจึงหายแน่นอน
+    แก้ไม่ได้ แต่ต้องมีร่องรอยว่าช่วงไหนไม่ครบ ไม่ใช่ให้ดูเหมือนไม่มีทราฟฟิก"""
+    detail = f"conn_collector เริ่มใหม่ — ไม่ได้ฟัง conntrack ตั้งแต่ heartbeat ล่าสุด {since}"
+    log.warning("log_gap conn_log: %s", detail)
+    try:
+        from common import audit
+        audit.log(audit.LOG_GAP, target="conn_log", detail=detail[:200])
+    except Exception:
+        log.exception("บันทึก audit_log เรื่อง conn_log ขาดช่วงไม่สำเร็จ")
+
+
+def run_forever(batch_size: int = 100, flush_interval: float = 5.0,
+                stop_event: threading.Event | None = None) -> None:  # pragma: no cover
     """
     รันจริงบน gateway: เปิด `conntrack -E` เป็น subprocess แล้วแยกเป็น 3 ส่วนที่ไม่บล็อกกัน
     (N31) -- เดิมอ่านและเขียน DB อยู่ในลูปเดียวกัน ระหว่างที่รอ DB ท่อจากเคอร์เนลจะตันจนเกิด
@@ -360,11 +373,19 @@ def run_forever(batch_size: int = 100, flush_interval: float = 5.0) -> None:  # 
       1. เธรดอ่าน stdout  -> โยนเข้าคิว (ต้องว่างตลอด)
       2. เธรดอ่าน stderr  -> log คำเตือน ENOBUFS + บันทึกลง audit_log
       3. ลูปหลัก          -> ดึงจากคิวมาเขียน DB เป็น batch
+
+    R2-06: เมื่อ `stop_event` ถูกตั้ง (SIGTERM) ให้ปิด conntrack แล้วดูดเหตุการณ์ที่ค้างในท่อ/คิว
+    มาเขียนให้หมดก่อน return -- เดิมเธรดนี้เป็น daemon ที่ถูกฆ่าตอน interpreter ปิด บล็อก
+    finally ไม่ได้ทำงาน record ใน buffer และคิวหายทุกครั้งที่ restart/reboot
     """
+    stop_event = stop_event or threading.Event()
     mac_cache = MacCache()
     tracker = ConnTracker(mac_cache)
     reported_evicted = 0
     telemetry = CollectorTelemetry("conn")
+    last_seen = telemetry.previous_heartbeat()
+    if last_seen:
+        _record_restart_gap(last_seen)
     buffer: list[ConnRecord] = []
     events: queue.Queue = queue.Queue(maxsize=EVENT_QUEUE_MAX)
     overflow = [0]
@@ -397,13 +418,13 @@ def run_forever(batch_size: int = 100, flush_interval: float = 5.0) -> None:  # 
 
     try:
         reported_overflow = 0
-        while proc.poll() is None:
+        while proc.poll() is None and not stop_event.is_set():
             telemetry.heartbeat()
             if not stdout_thread.is_alive() or not stderr_thread.is_alive():
                 raise RuntimeError("conntrack reader thread หยุดทำงาน")
             try:
                 # N39: แปลงบรรทัดเป็น record ตรงนี้ (ลูปหลัก) แทนที่จะทำในเธรดอ่าน
-                parsed = parse_conntrack_event(events.get(timeout=flush_interval))
+                parsed = parse_conntrack_event(events.get(timeout=min(flush_interval, 1.0)))
                 rec = tracker.feed(*parsed) if parsed else None
                 if rec:
                     buffer.append(rec)
@@ -426,11 +447,35 @@ def run_forever(batch_size: int = 100, flush_interval: float = 5.0) -> None:  # 
                 n = flush_buffer(buffer, mac_cache, telemetry=telemetry)
                 log.debug("บันทึก conn_log %d แถว", n)
                 last_flush = now
+        if stop_event.is_set():
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            stdout_thread.join(timeout=5)  # อ่านท่อจนเจอ EOF ก่อน แล้วค่อยดูดคิว
+            drained = 0
+            while True:
+                try:
+                    parsed = parse_conntrack_event(events.get_nowait())
+                except queue.Empty:
+                    break
+                rec = tracker.feed(*parsed) if parsed else None
+                if rec:
+                    buffer.append(rec)
+                    telemetry.event()
+                    drained += 1
+            log.info("ปิด conn_collector: เก็บเหตุการณ์ที่ค้างในคิวอีก %d รายการ", drained)
+            return
         log.error("conntrack หยุดทำงาน (exit %s) — cafe-logger จะถูก systemd รีสตาร์ทให้",
                  proc.returncode)
         raise RuntimeError(f"conntrack หยุดทำงาน (exit {proc.returncode})")
     finally:
         flush_buffer(buffer, mac_cache, telemetry=telemetry)
+        if buffer:
+            log.error("log_gap conn_log: ปิดตัวทั้งที่ยังเขียน %d รายการไม่สำเร็จ", len(buffer))
+            telemetry.drop(len(buffer))
+        telemetry.heartbeat(force=True)
         proc.terminate()
 
 

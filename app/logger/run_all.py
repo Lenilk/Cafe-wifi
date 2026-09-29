@@ -19,6 +19,8 @@ from . import conn_collector, dns_collector
 
 log = logging.getLogger("cafe-wifi.logger")
 _stop = threading.Event()
+# R2-06: เวลาที่รอให้ collector flush ของที่ค้างก่อนออก -- ต้องน้อยกว่า TimeoutStopSec (90 วิ)
+STOP_TIMEOUT = 20.0
 
 
 def _handle_signal(signum, frame):  # noqa: ARG001
@@ -38,22 +40,34 @@ def main() -> int:
     log_dir = os.environ.get("LOG_DIR", "/var/log/cafe-wifi")
     dnsmasq_log = os.path.join(log_dir, "dnsmasq.log")
 
+    # R2-06: ส่ง _stop เข้าไปให้ collector ออกจากลูปแล้ว flush เอง ยังเป็น daemon ไว้กันกรณีที่
+    # ค้างจนเกิน STOP_TIMEOUT (ปล่อยให้ interpreter ปิดได้) แต่ต้อง join ก่อน main() return เสมอ
     threads = [
-        threading.Thread(target=conn_collector.run_forever, name="conn_collector", daemon=True),
+        threading.Thread(target=conn_collector.run_forever, kwargs=dict(stop_event=_stop),
+                         name="conn_collector", daemon=True),
         threading.Thread(target=dns_collector.run_forever, args=(dnsmasq_log,),
-                         name="dns_collector", daemon=True),
+                         kwargs=dict(stop_event=_stop), name="dns_collector", daemon=True),
     ]
     for t in threads:
         t.start()
         log.info("เริ่ม thread %s", t.name)
 
+    status = 0
     while not _stop.wait(1):
-        for t in threads:
-            if not t.is_alive():
-                log.error("collector %s หยุดทำงาน", t.name)
-                return 1
-    log.info("ปิด cafe-logger เรียบร้อย")
-    return 0
+        dead = [t for t in threads if not t.is_alive()]
+        if dead:
+            log.error("collector %s หยุดทำงาน", dead[0].name)
+            status = 1
+            _stop.set()  # ให้ตัวที่ยังรันอยู่ flush ก่อนออก systemd จะรีสตาร์ทให้
+    for t in threads:
+        t.join(timeout=STOP_TIMEOUT)
+        if t.is_alive():
+            log.error("log_gap: collector %s ไม่ยอมหยุดภายใน %.0f วินาที — ของที่ค้างอาจหาย",
+                      t.name, STOP_TIMEOUT)
+            status = 1
+    if status == 0:
+        log.info("ปิด cafe-logger เรียบร้อย")
+    return status
 
 
 if __name__ == "__main__":

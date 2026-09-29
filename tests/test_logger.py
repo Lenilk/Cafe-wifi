@@ -492,9 +492,12 @@ def test_dns_collector_reopens_rotated_file_from_start(tmp_path, monkeypatch):
         if calls[0] > 3:
             raise StopCollector
 
-    monkeypatch.setattr(dns_collector.time, "sleep", rotate_then_stop)
+    class Stop:  # R2-06: ลูปรอด้วย stop_event.wait() แทน time.sleep() เพื่อหยุดได้ทันที
+        def is_set(self): return False
+        def wait(self, seconds): rotate_then_stop(seconds)
+
     with pytest.raises(StopCollector):
-        dns_collector.run_forever(str(path), batch_size=1, flush_interval=0)
+        dns_collector.run_forever(str(path), batch_size=1, flush_interval=0, stop_event=Stop())
     assert [r["event_kind"] for r in seen] == ["query", "answer"]
 
 
@@ -631,7 +634,6 @@ def test_insert_leaves_mac_empty_when_history_is_ambiguous(monkeypatch):
 
 
 def test_logger_process_exits_nonzero_if_collector_stops(monkeypatch):
-    from types import SimpleNamespace
     from logger import run_all
 
     class DeadThread:
@@ -639,10 +641,12 @@ def test_logger_process_exits_nonzero_if_collector_stops(monkeypatch):
             self.name = kwargs["name"]
         def start(self): pass
         def is_alive(self): return False
+        def join(self, timeout=None): pass
 
+    import threading
     monkeypatch.setattr(run_all.threading, "Thread", DeadThread)
     monkeypatch.setattr(run_all.signal, "signal", lambda *a: None)
-    monkeypatch.setattr(run_all, "_stop", SimpleNamespace(wait=lambda timeout: False))
+    monkeypatch.setattr(run_all, "_stop", threading.Event())
     assert run_all.main() == 1
 
 

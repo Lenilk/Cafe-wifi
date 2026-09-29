@@ -22,6 +22,13 @@ class CollectorTelemetry:
         self.last_error = None
         self._last_heartbeat = 0.0
 
+    def previous_heartbeat(self) -> str | None:
+        """R2-06: heartbeat ล่าสุดของรอบก่อน (อ่านก่อนเขียนทับ) = จุดที่ collector เงียบไป"""
+        try:
+            return json.loads(self.path.read_text(encoding="utf-8"))["heartbeat_at"]
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+
     def event(self) -> None:
         self.received += 1
         self.last_event_at = datetime.now().isoformat()
