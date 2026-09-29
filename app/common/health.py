@@ -162,11 +162,13 @@ def build_status(log_dir: str | os.PathLike | None = None, *,
                  disk_usage_fn=shutil.disk_usage,
                  service_runner=_systemctl_is_active) -> dict:
     log_dir = log_dir or os.environ.get("LOG_DIR", "/var/log/cafe-wifi")
+    from logger.telemetry import read_collector_status
     return dict(
         generated_at=datetime.now(),
         disks=disk_statuses(log_dir, disk_usage_fn=disk_usage_fn),
         chrony=chrony_status(log_dir),
         services=service_statuses(runner=service_runner),
+        collectors=read_collector_status(log_dir),
         db=db_status(),
         latest_alert=latest_alert(log_dir),
     )

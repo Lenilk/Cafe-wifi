@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from .netutil import MacCache
+from .telemetry import CollectorTelemetry
 
 log = logging.getLogger("cafe-wifi.dns_collector")
 
@@ -102,12 +103,15 @@ class DnsCorrelator:
         return None
 
 
-def insert_dns_rows(rows: list[dict], mac_cache: MacCache) -> int:
+def insert_dns_rows(rows: list[dict], mac_cache: MacCache, on_unmapped=None) -> int:
     from common.db import get_conn
 
     values = []
+    unmapped = 0
     for r in rows:
         mac = mac_cache.get(r["client_ip"]) if r["client_ip"] else None
+        if r["client_ip"] and not mac:
+            unmapped += 1
         values.append((r["ts"], r["client_ip"], mac, r["qname"][:255],
                        (r["qtype"] or "")[:10] or None,
                        (r["answer"] or "")[:255] or None, r["event_kind"]))
@@ -117,6 +121,8 @@ def insert_dns_rows(rows: list[dict], mac_cache: MacCache) -> int:
         cur.executemany(
             "INSERT INTO dns_log (ts, client_ip, mac, qname, qtype, answer, event_kind) "
             "VALUES (%s,%s,%s,%s,%s,%s,%s)", values)
+    if on_unmapped and unmapped:
+        on_unmapped(unmapped)
     return len(values)
 
 
@@ -124,20 +130,30 @@ MAX_PENDING_RECORDS = 20000
 
 
 def flush_buffer(buffer: list[dict], mac_cache: MacCache,
-                 max_pending: int = MAX_PENDING_RECORDS) -> int:
+                 max_pending: int = MAX_PENDING_RECORDS,
+                 telemetry: CollectorTelemetry | None = None) -> int:
     if not buffer:
         return 0
     try:
-        n = insert_dns_rows(buffer, mac_cache)
+        if telemetry:
+            n = insert_dns_rows(buffer, mac_cache, on_unmapped=telemetry.missing_mac)
+        else:
+            n = insert_dns_rows(buffer, mac_cache)
     except Exception:
         log.exception("เขียน dns_log ไม่สำเร็จ — เก็บ %d รายการไว้ลองใหม่", len(buffer))
+        if telemetry:
+            telemetry.error("เขียน dns_log ไม่สำเร็จ")
         if len(buffer) > max_pending:
             dropped = buffer[:len(buffer) - max_pending]
             del buffer[:len(dropped)]
             log.error("log_gap dns_log: ทิ้ง %d รายการ ช่วง %s ถึง %s",
                       len(dropped), dropped[0]["ts"], dropped[-1]["ts"])
+            if telemetry:
+                telemetry.drop(len(dropped))
         return 0
     buffer.clear()
+    if telemetry:
+        telemetry.write(n)
     return n
 
 
@@ -146,6 +162,7 @@ def run_forever(log_path: str = "/var/log/cafe-wifi/dnsmasq.log",
     """tail -F แบบง่าย ๆ ด้วยมือ (ไม่พึ่ง binary ภายนอก) แล้วป้อนเข้า DnsCorrelator"""
     correlator = DnsCorrelator()
     mac_cache = MacCache()
+    telemetry = CollectorTelemetry("dns", os.path.dirname(log_path))
     buffer: list[dict] = []
     last_flush = time.time()
 
@@ -154,11 +171,12 @@ def run_forever(log_path: str = "/var/log/cafe-wifi/dnsmasq.log",
     try:
         f.seek(0, 2)  # ไปท้ายไฟล์ก่อน แล้วค่อยตามอ่านของใหม่
         while True:
+            telemetry.heartbeat()
             line = f.readline()
             if not line:
                 now = time.time()
                 if buffer and now - last_flush >= flush_interval:
-                    flush_buffer(buffer, mac_cache)
+                    flush_buffer(buffer, mac_cache, telemetry=telemetry)
                     last_flush = now
                 try:
                     replaced = os.fstat(f.fileno()).st_ino != os.stat(log_path).st_ino
@@ -174,8 +192,9 @@ def run_forever(log_path: str = "/var/log/cafe-wifi/dnsmasq.log",
             row = correlator.feed_line(line)
             if row:
                 buffer.append(row)
+                telemetry.event()
             if len(buffer) >= batch_size:
-                flush_buffer(buffer, mac_cache)
+                flush_buffer(buffer, mac_cache, telemetry=telemetry)
                 last_flush = time.time()
     finally:
         f.close()

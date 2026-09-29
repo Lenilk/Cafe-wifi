@@ -5,6 +5,7 @@ from datetime import datetime
 import pytest
 
 from logger import conn_collector
+from logger import dns_collector
 from logger.conn_collector import ConnRecord, flush_buffer, parse_conntrack_line
 from logger.dns_collector import DnsCorrelator, parse_dnsmasq_line, parse_syslog_timestamp
 from logger import integrity
@@ -454,6 +455,86 @@ def test_flush_drops_oldest_when_db_down_too_long(monkeypatch):
 
     assert len(buf) == 6
     assert buf[0].src_port == 4, "ต้องทิ้งของเก่าสุดก่อน เก็บของใหม่ไว้"
+
+
+def test_dns_flush_retries_without_losing_buffer(monkeypatch):
+    row = dict(ts=NOW, client_ip="10.10.0.5", qname="example.test",
+               qtype="A", answer=None, event_kind="query")
+    buffer = [row]
+    monkeypatch.setattr(dns_collector, "insert_dns_rows",
+                        lambda *a: (_ for _ in ()).throw(RuntimeError("DB down")))
+    assert dns_collector.flush_buffer(buffer, _Cache()) == 0
+    assert buffer == [row]
+    monkeypatch.setattr(dns_collector, "insert_dns_rows", lambda rows, cache: len(rows))
+    assert dns_collector.flush_buffer(buffer, _Cache()) == 1
+    assert buffer == []
+
+
+def test_dns_collector_reopens_rotated_file_from_start(tmp_path, monkeypatch):
+    path = tmp_path / "dnsmasq.log"
+    path.write_text("", encoding="utf-8")
+    seen = []
+    monkeypatch.setattr(dns_collector, "insert_dns_rows",
+                        lambda rows, cache, **kw: seen.extend(rows) or len(rows))
+    calls = [0]
+
+    class StopCollector(Exception):
+        pass
+
+    def rotate_then_stop(_seconds):
+        calls[0] += 1
+        if calls[0] == 1:
+            path.rename(tmp_path / "dnsmasq.log-2026-08-22")
+            path.write_text(
+                "Aug 22 10:15:32 dnsmasq[1]: query[A] example.test from 10.10.0.5\n"
+                "Aug 22 10:15:33 dnsmasq[1]: reply example.test is 192.0.2.1\n",
+                encoding="utf-8")
+        if calls[0] > 3:
+            raise StopCollector
+
+    monkeypatch.setattr(dns_collector.time, "sleep", rotate_then_stop)
+    with pytest.raises(StopCollector):
+        dns_collector.run_forever(str(path), batch_size=1, flush_interval=0)
+    assert [r["event_kind"] for r in seen] == ["query", "answer"]
+
+
+def test_conn_event_with_unknown_mac_is_inserted(monkeypatch):
+    import contextlib
+    import common.db as db
+    inserted = []
+
+    class Cursor:
+        def executemany(self, sql, rows):
+            inserted.extend(rows)
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+
+    class Conn:
+        def cursor(self): return Cursor()
+
+    monkeypatch.setattr(db, "get_conn", lambda: contextlib.nullcontext(Conn()))
+
+    class MissingMac:
+        def get(self, ip): return None
+
+    assert conn_collector.insert_conn_records([_rec()], MissingMac()) == 1
+    assert inserted[0][1] is None
+
+
+def test_logger_process_exits_nonzero_if_collector_stops(monkeypatch):
+    from types import SimpleNamespace
+    from logger import run_all
+
+    class DeadThread:
+        def __init__(self, *args, **kwargs):
+            self.name = kwargs["name"]
+        def start(self): pass
+        def is_alive(self): return False
+
+    monkeypatch.setattr(run_all.threading, "Thread", DeadThread)
+    monkeypatch.setattr(run_all.signal, "signal", lambda *a: None)
+    monkeypatch.setattr(run_all, "_stop", SimpleNamespace(wait=lambda timeout: False))
+    assert run_all.main() == 1
 
 
 def test_stderr_drain_flags_enobufs_as_evidence_loss():

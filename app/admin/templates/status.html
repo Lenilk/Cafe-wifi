@@ -57,6 +57,22 @@
   </table>
 </div>
 
+<div class="card">
+  <h2>ตัวเก็บ log</h2>
+  <table>
+    <tr><th>ชนิด</th><th>ความคืบหน้า</th><th>รับ</th><th>เขียน</th><th>ทิ้ง</th><th>หา MAC ไม่พบ</th><th>เขียนล่าสุด</th></tr>
+    {% for name, c in collectors.items() %}
+    <tr>
+      <td>{{ name }}</td>
+      <td>{% if c.healthy %}<span class="badge ok">ทำงาน</span>{% else %}<span class="badge err">ไม่มี heartbeat ล่าสุด</span>{% endif %}</td>
+      <td>{{ c.received }}</td><td>{{ c.written }}</td><td>{{ c.dropped }}</td><td>{{ c.unmapped }}</td>
+      <td>{{ c.last_write_at or 'ยังไม่มีเหตุการณ์' }}</td>
+    </tr>
+    {% if c.last_error %}<tr><td colspan="7" class="hint">{{ name }}: {{ c.last_error }}</td></tr>{% endif %}
+    {% endfor %}
+  </table>
+</div>
+
 <div class="grid">
   <div class="stat"><b>{{ db.active_sessions if db.active_sessions is not none else '—' }}</b><span>session ที่ active</span></div>
   <div class="stat"><b>{{ db.pending_sessions if db.pending_sessions is not none else '—' }}</b><span>session ที่รอยืนยัน</span></div>

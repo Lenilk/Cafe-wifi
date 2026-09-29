@@ -1981,22 +1981,16 @@ main() {
 
   if (( DO_UNINSTALL )); then uninstall; exit 0; fi
 
+  if (( INTERACTIVE )); then wizard; fi
+
+  # ตรวจหลัง wizard แต่ก่อนสร้าง log directory หรือแก้ค่าใด ๆ ทั้งโหมดปกติและ -y
+  [[ "$LOG_RETENTION_DAYS" =~ ^[0-9]+$ ]] || die "retention-days ต้องเป็นจำนวนวันเต็ม"
+  (( 10#$LOG_RETENTION_DAYS >= 90 )) || die "retention-days ต้องไม่น้อยกว่า 90 วัน"
+
   if (( ! DRY_RUN )); then
     install -d -m 0750 "$LOG_DIR"
     exec > >(tee -a "${LOG_DIR}/install.log") 2>&1
   fi
-
-  if (( INTERACTIVE )); then wizard; fi
-
-  # แก้บั๊ก (พบตอนตรวจทานรอบ 4): เช็คนี้เคยอยู่ข้างใน wizard() เท่านั้น -- `sudo ./install.sh
-  # -y --retention-days 30` (ไม่ผ่าน wizard เลยเพราะ INTERACTIVE=0) จึงติดตั้งผ่านไปเงียบ ๆ
-  # โดยไม่เตือนเรื่องขั้นต่ำ 90 วันตามกฎหมายเลยสักครั้ง แล้ว purge_old_data.py/partition
-  # maintenance จะปฏิเสธทำงานทุกคืนแบบเงียบ ๆ ต่อไป (ExecStart มี `-` นำหน้าอยู่แล้ว) --
-  # ย้ายมาไว้นอก wizard() ให้ทำงานเสมอไม่ว่าจะผ่าน wizard หรือไม่ก็ตาม
-  # (confirm() คืนค่า true ทันทีถ้า ASSUME_YES แต่ warn บรรทัดก่อนหน้ายังพิมพ์ให้เห็นเสมอ
-  # ไม่ได้ถูกกลืนไปเงียบ ๆ เหมือนเดิม)
-  [[ "$LOG_RETENTION_DAYS" =~ ^[0-9]+$ ]] || die "retention-days ต้องเป็นจำนวนวันเต็ม"
-  (( 10#$LOG_RETENTION_DAYS >= 90 )) || die "retention-days ต้องไม่น้อยกว่า 90 วัน"
 
   preflight
 

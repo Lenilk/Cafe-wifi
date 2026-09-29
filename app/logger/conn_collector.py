@@ -21,6 +21,7 @@ import time
 from dataclasses import dataclass
 
 from .netutil import MacCache
+from .telemetry import CollectorTelemetry
 
 log = logging.getLogger("cafe-wifi.conn_collector")
 
@@ -142,17 +143,20 @@ def parse_conntrack_line(line: str, now: float | None = None) -> ConnRecord | No
     )
 
 
-def insert_conn_records(records: list[ConnRecord], mac_cache: MacCache) -> int:
+def insert_conn_records(records: list[ConnRecord], mac_cache: MacCache,
+                        on_unmapped=None) -> int:
     """เขียนกลุ่ม record ลง conn_log เป็น batch — คืนจำนวนแถวที่เขียนสำเร็จ"""
     from datetime import datetime
 
     from common.db import get_conn
 
     rows = []
+    unmapped = 0
     for r in records:
         mac = mac_cache.get(r.src_ip)
         if not mac:
             log.warning("ไม่พบ MAC ของ %s — เก็บ conn_log โดยไม่ระบุตัวอุปกรณ์", r.src_ip)
+            unmapped += 1
         rows.append((datetime.fromtimestamp(r.ts), mac, r.src_ip, r.src_port,
                      r.dst_ip, r.dst_port, r.proto, r.bytes_out, r.bytes_in))
     if not rows:
@@ -161,11 +165,14 @@ def insert_conn_records(records: list[ConnRecord], mac_cache: MacCache) -> int:
         cur.executemany(
             "INSERT INTO conn_log (ts, mac, src_ip, src_port, dst_ip, dst_port, "
             "proto, bytes_out, bytes_in) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)", rows)
+    if on_unmapped and unmapped:
+        on_unmapped(unmapped)
     return len(rows)
 
 
 def flush_buffer(buffer: list[ConnRecord], mac_cache: MacCache,
-                 max_pending: int = MAX_PENDING_RECORDS) -> int:
+                 max_pending: int = MAX_PENDING_RECORDS,
+                 telemetry: CollectorTelemetry | None = None) -> int:
     """
     พยายามเขียน buffer ลง DB -- คืนจำนวนแถวที่เขียนสำเร็จ (0 ถ้าล้มเหลว)
 
@@ -177,16 +184,25 @@ def flush_buffer(buffer: list[ConnRecord], mac_cache: MacCache,
     if not buffer:
         return 0
     try:
-        n = insert_conn_records(buffer, mac_cache)
+        if telemetry:
+            n = insert_conn_records(buffer, mac_cache, on_unmapped=telemetry.missing_mac)
+        else:
+            n = insert_conn_records(buffer, mac_cache)
     except Exception:
         log.exception("เขียน conn_log ไม่สำเร็จ — เก็บ %d รายการไว้ลองใหม่รอบถัดไป", len(buffer))
+        if telemetry:
+            telemetry.error("เขียน conn_log ไม่สำเร็จ")
         if len(buffer) > max_pending:
             dropped = len(buffer) - max_pending
             del buffer[:dropped]
             log.error("DB ล่มนานจนคิวเกิน %d รายการ — ทิ้งรายการเก่าสุด %d รายการ "
                      "(หลักฐานช่วงนั้นจะไม่ครบ)", max_pending, dropped)
+            if telemetry:
+                telemetry.drop(dropped)
         return 0
     buffer.clear()
+    if telemetry:
+        telemetry.write(n)
     return n
 
 
@@ -246,6 +262,7 @@ def run_forever(batch_size: int = 100, flush_interval: float = 5.0) -> None:  # 
       3. ลูปหลัก          -> ดึงจากคิวมาเขียน DB เป็น batch
     """
     mac_cache = MacCache()
+    telemetry = CollectorTelemetry("conn")
     buffer: list[ConnRecord] = []
     events: queue.Queue = queue.Queue(maxsize=EVENT_QUEUE_MAX)
     overflow = [0]
@@ -278,6 +295,7 @@ def run_forever(batch_size: int = 100, flush_interval: float = 5.0) -> None:  # 
     try:
         reported_overflow = 0
         while proc.poll() is None:
+            telemetry.heartbeat()
             if not stdout_thread.is_alive() or not stderr_thread.is_alive():
                 raise RuntimeError("conntrack reader thread หยุดทำงาน")
             try:
@@ -285,23 +303,25 @@ def run_forever(batch_size: int = 100, flush_interval: float = 5.0) -> None:  # 
                 rec = parse_conntrack_line(events.get(timeout=flush_interval))
                 if rec:
                     buffer.append(rec)
+                    telemetry.event()
             except queue.Empty:
                 pass
             if overflow[0] != reported_overflow:
                 lost = overflow[0] - reported_overflow
                 reported_overflow = overflow[0]
                 log.error("log_gap conn_log: stdout queue เต็ม ทิ้ง %d เหตุการณ์", lost)
+                telemetry.drop(lost)
                 _record_event_loss(f"conntrack stdout queue full, dropped={lost}")
             now = time.time()
             if len(buffer) >= batch_size or (buffer and now - last_flush >= flush_interval):
-                n = flush_buffer(buffer, mac_cache)
+                n = flush_buffer(buffer, mac_cache, telemetry=telemetry)
                 log.debug("บันทึก conn_log %d แถว", n)
                 last_flush = now
         log.error("conntrack หยุดทำงาน (exit %s) — cafe-logger จะถูก systemd รีสตาร์ทให้",
                  proc.returncode)
         raise RuntimeError(f"conntrack หยุดทำงาน (exit {proc.returncode})")
     finally:
-        flush_buffer(buffer, mac_cache)
+        flush_buffer(buffer, mac_cache, telemetry=telemetry)
         proc.terminate()
 
 

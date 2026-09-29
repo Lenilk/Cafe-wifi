@@ -183,6 +183,11 @@ def verify_chain(store: ManifestStore, directory: Path) -> list[IntegrityIssue]:
     prev_hash: str | None = None
 
     for entry in entries:
+        if Path(entry.filename).name != entry.filename:
+            issues.append(IntegrityIssue(entry.filename, "invalid_filename",
+                                         "manifest อ้างไฟล์นอก archive"))
+            prev_hash = entry.sha256
+            continue
         if entry.prev_sha256 != prev_hash:
             issues.append(IntegrityIssue(
                 entry.filename, "chain_broken",
@@ -230,6 +235,9 @@ def prune_archives(store: ManifestStore, directory: Path, retention_days: int,
     cutoff = (now or datetime.now()).date() - timedelta(days=retention_days)
     count = 0
     for entry in store.all_entries():
+        if Path(entry.filename).name != entry.filename:
+            log.error("manifest filename ไม่ปลอดภัย: %r", entry.filename)
+            continue
         match = _ARCHIVE_DATE.search(entry.filename)
         if not match or entry.deletion_state != "active" or date.fromisoformat(match[1]) >= cutoff:
             continue

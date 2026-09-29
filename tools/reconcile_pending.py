@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from common import audit
 from common.db import get_conn
@@ -32,7 +32,7 @@ def confirmed_since(client: dict | None, ip: str, started_at: datetime) -> bool:
         gateway_start = datetime.fromtimestamp(int(client["session_start"]))
     except (KeyError, TypeError, ValueError, OverflowError, OSError):
         return False
-    return gateway_start >= started_at - timedelta(seconds=2)
+    return gateway_start >= started_at
 
 
 def run() -> tuple[int, int]:
@@ -48,6 +48,10 @@ def run() -> tuple[int, int]:
         pending = cur.fetchall()
         for row in pending:
             if row["pending_until"] <= datetime.now():
+                from tools.enforce_voucher_expiry import deauth_mac
+                if not deauth_mac(row["mac"]):
+                    log.error("pending %s หมดเวลาแต่ตัดสิทธิ์ที่ gateway ไม่สำเร็จ", row["id"])
+                    continue
                 cur.execute("UPDATE portal_session SET state='closed', ended_at=NOW(), "
                             "terminate_cause='auth_timeout' WHERE id=%s AND state='pending'",
                             (row["id"],))
@@ -60,7 +64,9 @@ def run() -> tuple[int, int]:
                 continue
             if row["status"] != "active" or row["valid_until"] <= datetime.now():
                 from tools.enforce_voucher_expiry import deauth_mac
-                deauth_mac(row["mac"])
+                if not deauth_mac(row["mac"]):
+                    log.error("voucher ไม่ active แต่ตัด MAC %s ไม่สำเร็จ", row["mac"])
+                    continue
                 cur.execute("UPDATE portal_session SET state='closed', ended_at=NOW(), "
                             "terminate_cause='voucher_invalid' WHERE id=%s", (row["id"],))
                 continue
