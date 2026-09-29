@@ -35,6 +35,21 @@ def confirmed_since(client: dict | None, ip: str, started_at: datetime) -> bool:
     return gateway_start >= started_at
 
 
+def purge_orphan_claims() -> int:
+    """R2-01: ลบ claim ที่ portal_session_id=NULL ซึ่งหลุด commit มาจาก /login รุ่นก่อนแก้
+
+    แถวแบบนี้ไม่มี session ให้ผูก ลูปหลักจึงไม่เคยลบ และทำให้ MAC นั้นได้ 409 ตลอดไป
+    แยก transaction จากลูปหลักและแตะแค่ตารางนี้ เพื่อไม่ให้ลำดับ lock ชนกับ /login
+    (claim ของ /login ที่ยังไม่ commit จะผูก portal_session_id ก่อน commit เสมอ จึงไม่ถูกลบ)
+    """
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM pending_mac_claim WHERE portal_session_id IS NULL")
+        purged = cur.rowcount
+    if purged:
+        log.warning("ลบ pending_mac_claim ที่ค้างอยู่ %d รายการ", purged)
+    return purged
+
+
 def run() -> tuple[int, int]:
     clients = gateway_clients()
     promoted = expired = 0
@@ -94,6 +109,7 @@ def run() -> tuple[int, int]:
             cur.execute("DELETE FROM pending_mac_claim WHERE mac=%s AND portal_session_id=%s",
                         (row["mac"], row["id"]))
             promoted += 1
+    purge_orphan_claims()
     if promoted:
         audit.log(audit.LOGIN_OK, detail=f"confirmed={promoted}")
     if expired:

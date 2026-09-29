@@ -232,50 +232,67 @@ def login():
                                message="กรุณาลองใหม่อีกครั้ง หรือแจ้งพนักงาน"), 500
 
     # จองโควตาและสร้าง pending ภายใต้ transaction เดียวกัน; ผูก device หลัง gateway ยืนยัน
+    # แก้บั๊ก R2-01 (รีวิวรอบ 2): get_conn() commit เมื่อออกจาก block แบบปกติ -- การ return กลาง block
+    # จึงเคย commit แถว pending_mac_claim ที่ portal_session_id=NULL ทิ้งไว้ ซึ่ง reconcile ไม่เคยลบ
+    # MAC นั้นจะได้ 409 ตลอดไปแม้ได้รหัสใหม่ -- ทุกทางที่ปฏิเสธต้อง rollback ก่อนออก
     with get_conn() as conn, conn.cursor() as cur:
-        cur.execute("SELECT id FROM voucher WHERE id=%s FOR UPDATE", (voucher["id"],))
-        cur.fetchone()
-        cur.execute("SELECT id FROM portal_session WHERE mac=%s AND state='pending' FOR UPDATE",
-                    (ctx.clientmac,))
-        if cur.fetchone():
-            return render_template("login.html", nonce=nonce,
-                                   error="อุปกรณ์นี้กำลังรอยืนยันสิทธิ์ กรุณารอสักครู่แล้วลองใหม่"), 409
-        cur.execute("INSERT IGNORE INTO pending_mac_claim (mac) VALUES (%s)", (ctx.clientmac,))
-        if cur.rowcount != 1:
-            return render_template("login.html", nonce=nonce,
-                                   error="อุปกรณ์นี้กำลังรอยืนยันสิทธิ์ กรุณารอสักครู่แล้วลองใหม่"), 409
-        cur.execute("SELECT COUNT(*) AS n FROM ("
-                    "SELECT mac FROM device WHERE voucher_id=%s UNION "
-                    "SELECT mac FROM portal_session WHERE voucher_id=%s AND state='pending' "
-                    "AND pending_until > NOW()) AS reserved",
-                    (voucher["id"], voucher["id"]))
-        reserved = int(cur.fetchone()["n"])
-        cur.execute("SELECT 1 FROM device WHERE voucher_id=%s AND mac=%s UNION "
-                    "SELECT 1 FROM portal_session WHERE voucher_id=%s AND mac=%s "
-                    "AND state='pending' AND pending_until > NOW() LIMIT 1",
-                    (voucher["id"], ctx.clientmac, voucher["id"], ctx.clientmac))
-        if not cur.fetchone() and reserved >= voucher["max_devices"]:
-                audit.log(audit.LOGIN_FAIL, target=code, client_ip=real_ip,
-                          detail=f"mac={ctx.clientmac} reason=device_limit_exceeded")
-                return render_template(
-                    "login.html", nonce=nonce,
-                    error=f"รหัสนี้ใช้ครบ {voucher['max_devices']} อุปกรณ์แล้ว "
-                    "กรุณาขอรหัสใหม่จากพนักงานหากต้องการเพิ่มอุปกรณ์"), 403
-        cur.execute("UPDATE fas_context SET consumed_at=NOW() WHERE nonce_hash=%s "
-                    "AND consumed_at IS NULL AND expires_at > NOW()", (_nonce_hash(nonce),))
-        if cur.rowcount != 1:
-            return render_template("error.html", title="หน้านี้หมดอายุแล้ว",
-                                   message="กรุณาเปิดหน้าเข้าใช้งานใหม่"), 400
-        cur.execute("INSERT INTO portal_session "
-                    "(voucher_id, mac, ip, started_at, pending_until, state) "
-                    "VALUES (%s,%s,%s,NOW(),DATE_ADD(NOW(), INTERVAL 180 SECOND),'pending')",
-                    (voucher["id"], ctx.clientmac, real_ip))
-        cur.execute("UPDATE pending_mac_claim SET portal_session_id=%s WHERE mac=%s",
-                    (cur.lastrowid, ctx.clientmac))
+        rejection = _reserve_pending_session(cur, voucher, ctx, real_ip, nonce, code)
+        if rejection is not None:
+            conn.rollback()
+            return rejection
 
     audit.log("login_pending", target=code, client_ip=real_ip, detail=f"mac={ctx.clientmac}")
 
     return redirect(redirect_url, code=302)
+
+
+def _reserve_pending_session(cur, voucher, ctx, real_ip, nonce, code):
+    """จอง MAC + โควตาอุปกรณ์ + nonce แล้วสร้าง portal_session แบบ pending
+
+    คืน None ถ้าสำเร็จ หรือ response ที่ต้องส่งกลับถ้าปฏิเสธ (ผู้เรียกต้อง rollback เอง)
+    """
+    def busy():
+        return render_template("login.html", nonce=nonce,
+                               error="อุปกรณ์นี้กำลังรอยืนยันสิทธิ์ กรุณารอสักครู่แล้วลองใหม่"), 409
+
+    cur.execute("SELECT id FROM voucher WHERE id=%s FOR UPDATE", (voucher["id"],))
+    cur.fetchone()
+    cur.execute("SELECT id FROM portal_session WHERE mac=%s AND state='pending' FOR UPDATE",
+                (ctx.clientmac,))
+    if cur.fetchone():
+        return busy()
+    cur.execute("INSERT IGNORE INTO pending_mac_claim (mac) VALUES (%s)", (ctx.clientmac,))
+    if cur.rowcount != 1:
+        return busy()
+    cur.execute("SELECT COUNT(*) AS n FROM ("
+                "SELECT mac FROM device WHERE voucher_id=%s UNION "
+                "SELECT mac FROM portal_session WHERE voucher_id=%s AND state='pending' "
+                "AND pending_until > NOW()) AS reserved",
+                (voucher["id"], voucher["id"]))
+    reserved = int(cur.fetchone()["n"])
+    cur.execute("SELECT 1 FROM device WHERE voucher_id=%s AND mac=%s UNION "
+                "SELECT 1 FROM portal_session WHERE voucher_id=%s AND mac=%s "
+                "AND state='pending' AND pending_until > NOW() LIMIT 1",
+                (voucher["id"], ctx.clientmac, voucher["id"], ctx.clientmac))
+    if not cur.fetchone() and reserved >= voucher["max_devices"]:
+        audit.log(audit.LOGIN_FAIL, target=code, client_ip=real_ip,
+                  detail=f"mac={ctx.clientmac} reason=device_limit_exceeded")
+        return render_template(
+            "login.html", nonce=nonce,
+            error=f"รหัสนี้ใช้ครบ {voucher['max_devices']} อุปกรณ์แล้ว "
+            "กรุณาขอรหัสใหม่จากพนักงานหากต้องการเพิ่มอุปกรณ์"), 403
+    cur.execute("UPDATE fas_context SET consumed_at=NOW() WHERE nonce_hash=%s "
+                "AND consumed_at IS NULL AND expires_at > NOW()", (_nonce_hash(nonce),))
+    if cur.rowcount != 1:
+        return render_template("error.html", title="หน้านี้หมดอายุแล้ว",
+                               message="กรุณาเปิดหน้าเข้าใช้งานใหม่"), 400
+    cur.execute("INSERT INTO portal_session "
+                "(voucher_id, mac, ip, started_at, pending_until, state) "
+                "VALUES (%s,%s,%s,NOW(),DATE_ADD(NOW(), INTERVAL 180 SECOND),'pending')",
+                (voucher["id"], ctx.clientmac, real_ip))
+    cur.execute("UPDATE pending_mac_claim SET portal_session_id=%s WHERE mac=%s",
+                (cur.lastrowid, ctx.clientmac))
+    return None
 
 
 @app.get("/policy")

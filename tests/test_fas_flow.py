@@ -5,6 +5,7 @@ T-FAS — Captive Portal end-to-end (mock openNDS gateway + DB จำลอง)
 openNDS binary จริงในสภาพแวดล้อมนี้ — ดูคำเตือนใน opennds_proto.py และ PROJECT_PLAN.md §17)
 """
 import contextlib
+import copy
 from datetime import datetime, timedelta
 
 import pytest
@@ -133,8 +134,20 @@ class FakeCursor:
 
 
 class FakeConn:
+    """snapshot ตารางที่ POST /login เขียนตอนเปิด connection เพื่อให้ rollback() ย้อนได้จริง
+    (R2-01: เดิมไม่มี rollback เทสต์จึงไม่เห็นว่า claim ค้างหลังถูกปฏิเสธ)"""
+
+    def __init__(self):
+        self._snapshot = copy.deepcopy((CLAIMS, SESSIONS, FAS_CONTEXTS))
+
     def cursor(self):
         return FakeCursor()
+
+    def rollback(self):
+        claims, sessions, contexts = copy.deepcopy(self._snapshot)
+        CLAIMS.clear(); CLAIMS.update(claims)
+        SESSIONS[:] = sessions
+        FAS_CONTEXTS.clear(); FAS_CONTEXTS.update(contexts)
 
 
 @pytest.fixture
@@ -327,6 +340,42 @@ def test_device_limit_enforced(client):
     r = _post_login(client, html, code, pw)
     assert r.status_code == 403
     assert "ครบ" in r.get_data(as_text=True)
+    assert "AA:BB:CC:DD:EE:03" not in CLAIMS, "ถูกปฏิเสธแล้วต้องไม่มี claim ค้าง"
+
+
+def test_device_rejected_at_limit_can_use_new_voucher(client):
+    """R2-01: เครื่องที่ชนเพดานของรหัสเดิม ต้องใช้รหัสใหม่ที่พนักงานออกให้ได้ทันที"""
+    code, pw = _make_voucher(code="CAFE-OLD01", max_devices=1)
+    html = client.get(_gw_url(mac="AA:BB:CC:DD:EE:01")).get_data(as_text=True)
+    assert _post_login(client, html, code, pw).status_code == 302
+
+    html = client.get(_gw_url(mac="AA:BB:CC:DD:EE:03")).get_data(as_text=True)
+    assert _post_login(client, html, code, pw).status_code == 403
+
+    code2, pw2 = _make_voucher(code="CAFE-NEW01", max_devices=2)
+    html = client.get(_gw_url(mac="AA:BB:CC:DD:EE:03")).get_data(as_text=True)
+    r = _post_login(client, html, code2, pw2)
+    assert r.status_code == 302
+    assert CLAIMS["AA:BB:CC:DD:EE:03"] == SESSIONS[-1]["id"]
+
+
+def test_consumed_nonce_rejection_leaves_no_claim(client, monkeypatch):
+    """R2-01: ทาง nonce ถูกใช้ไปแล้ว (400) ก็ต้อง rollback claim เช่นกัน -- จำลองกดส่งซ้อน
+    ที่อีก request ใช้ nonce ไปก่อนระหว่างผ่าน _load_context กับ UPDATE fas_context"""
+    code, pw = _make_voucher()
+    html = client.get(_gw_url()).get_data(as_text=True)
+    real_execute = FakeCursor.execute
+
+    def racing_execute(self, sql, args=()):
+        real_execute(self, sql, args)
+        if " ".join(sql.split()).lower().startswith("update fas_context set consumed_at"):
+            self.rowcount = 0
+
+    monkeypatch.setattr(FakeCursor, "execute", racing_execute)
+    r = _post_login(client, html, code, pw)
+    assert r.status_code == 400
+    assert "AA:BB:CC:DD:EE:01" not in CLAIMS
+    assert SESSIONS == []
 
 
 def test_same_device_can_relogin_even_at_limit(client):
