@@ -29,7 +29,8 @@
 | R2-04 | ✅ แก้แล้ว | `fd604a5` | — (มีเทสต์อัตโนมัติครอบแล้ว) |
 | R2-09 | ✅ แก้แล้ว | `bc7aaec` | ควรลองกดทุกปุ่มใน Admin บน Pi หนึ่งรอบ |
 | R2-05 | ✅ แก้แล้ว | `9969b02` | ควรลองระงับลูกค้าที่ออนไลน์อยู่แล้วรอ enforce รอบถัดไป (≤ 5 นาที) |
-| R2-06 ถึง R2-08, R2-10, R2-L01 ถึง R2-L06 | ⏳ ยังไม่ได้แก้ | — | — |
+| R2-08 | ✅ แก้แล้ว | `5c80836` | ควรดู `/logs` ว่า DNS query ชุดแรกหลัง login โยงหาลูกค้าได้ และเวลา `authenticated_at` ตรงกับ `session_start` ใน `ndsctl json` |
+| R2-06, R2-07, R2-10, R2-L01 ถึง R2-L06 | ⏳ ยังไม่ได้แก้ | — | — |
 
 ชุดทดสอบหลังแก้ R2-01: `PYTHONPATH=app pytest -q tests` → **297 passed**
 
@@ -237,6 +238,8 @@ return redirect(nxt if nxt.startswith("/") else url_for("dashboard"))
 2. ในลูป ตรวจ `pending_until <= now` (หมดเวลา → deauth) **ก่อน** ตรวจว่า openNDS ยืนยันแล้วหรือยัง ถ้าลูกค้ากดตาม redirect ใกล้วินาทีที่ 180 openNDS เปิดสิทธิ์แล้ว แต่รอบ reconcile ถัดไปเห็นว่าหมดเวลาก่อน จึงตัดสิทธิ์ลูกค้าที่ login ถูกต้อง
 
 **แก้:** ใช้ `datetime.fromtimestamp(session_start)` เป็น `authenticated_at` และสลับลำดับให้ตรวจการยืนยันก่อน แล้วค่อยตรวจ timeout เฉพาะรายการที่ยังไม่ยืนยัน
+
+> **สถานะ: ✅ แก้แล้ว (`5c80836`)** — `confirmed_since()` เปลี่ยนเป็น `confirmed_at()` คืนเวลา `session_start` ของ openNDS แล้วบันทึกค่านั้นเป็น `authenticated_at` ลูปตรวจการยืนยันก่อน timeout เสมอ (ถ้าอ่าน `ndsctl json` ไม่ได้ ยังใช้ timeout ตามเดิม) มีเทสต์ขับ `run()` ด้วย cursor ปลอม ซึ่ง fail กับโค้ดเก่า — ชุดทดสอบทั้งหมด **310 passed**
 
 ---
 
