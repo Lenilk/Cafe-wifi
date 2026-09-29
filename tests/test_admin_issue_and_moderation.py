@@ -20,6 +20,7 @@ STAFF = [{"id": 1, "username": "admin1", "password_hash": crypto.hash_password(G
 CUSTOMERS: dict[int, dict] = {}
 VOUCHERS: dict[int, dict] = {}
 AUDIT: list[tuple] = []
+REVEALS: dict[str, dict] = {}
 _ids = {"customer": 0, "voucher": 0}
 
 
@@ -27,6 +28,7 @@ def _reset():
     CUSTOMERS.clear()
     VOUCHERS.clear()
     AUDIT.clear()
+    REVEALS.clear()
     _ids.update(customer=0, voucher=0)
 
 
@@ -56,12 +58,22 @@ class FakeCursor:
                                   natid_masked=args[2], is_blocked=False,
                                   first_seen="now", last_seen="now", visit_count=1)
             self.lastrowid = cid
-        elif s.startswith("insert into voucher"):
+        elif s.startswith("insert into voucher ("):
             _ids["voucher"] += 1
             vid = _ids["voucher"]
             VOUCHERS[vid] = dict(id=vid, customer_id=args[0], username=args[1],
                                  status="active")
             self.lastrowid = vid
+        elif s.startswith("insert into voucher_reveal"):
+            token, staff_id, payload, expires_at = args
+            REVEALS[token] = dict(payload=payload, staff_id=staff_id,
+                                  expires_at=expires_at, consumed_at=None)
+            self.rowcount = 1
+        elif s.startswith("select payload, expires_at, consumed_at, staff_id from voucher_reveal"):
+            self._rows = [REVEALS[args[0]]] if args[0] in REVEALS else []
+        elif s.startswith("update voucher_reveal set consumed_at"):
+            REVEALS[args[0]]["consumed_at"] = datetime.now()
+            self.rowcount = 1
         elif s.startswith("update voucher set status='revoked'"):
             vid = args[0]
             v = VOUCHERS.get(vid)
@@ -165,6 +177,16 @@ def test_issue_then_result_shows_password_once_then_redirects(client):
     r2 = client.get("/issue/result")
     assert r2.status_code == 302 and "/issue" in r2.headers["Location"]
     assert len(VOUCHERS) == 1, "refresh ต้องไม่ออก voucher ใบที่สอง"
+
+
+def test_issue_cookie_contains_only_reveal_token(client):
+    client.post("/issue", data=dict(natid=NID, hours="4", devices="2", consent="on"))
+    with client.session_transaction() as sess:
+        assert "issue_token" in sess
+        assert "just_issued" not in sess
+        assert "password" not in str(dict(sess))
+    assert len(REVEALS) == 1
+    assert b"password" not in next(iter(REVEALS.values()))["payload"]
 
 
 def test_issue_rejects_non_numeric_hours_with_friendly_error(client):

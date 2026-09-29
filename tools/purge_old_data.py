@@ -129,6 +129,7 @@ def run(retention_days: int | None = None, customer_retention_days: int | None =
             lambda sql, args=(): (cur.execute(sql, args), cur.fetchall())[1],
             lambda sql, args=(): (cur.execute(sql, args), cur.fetchone())[1],
             _exec, cust_cutoff, max(retention_days, customer_retention_days))
+        _exec("DELETE FROM voucher_reveal WHERE expires_at < NOW()", ())
 
     summary = PurgeSummary(conn_log_deleted=n_conn, dns_log_deleted=n_dns,
                            customers_deleted=n_cust, cutoff_logs=log_cutoff,

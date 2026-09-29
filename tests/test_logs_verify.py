@@ -41,7 +41,7 @@ class FakeCursor:
             self._rows = [{"n": len(STAFF)}]
         elif s.startswith("select id, username, password_hash"):
             self._rows = [r for r in STAFF if r["username"] == args[0]]
-        elif s.startswith("select filename, sha256, prev_sha256, size_bytes from log_manifest order by id asc"):
+        elif s.startswith("select filename, sha256, prev_sha256, size_bytes, deletion_state, sealed_at from log_manifest order by id asc"):
             self._rows = list(MANIFEST)
         elif s.startswith("select (select count(*) from voucher"):  # dashboard stats
             self._rows = [{"active_vouchers": 0, "customers": 0, "issued_today": 0, "online_now": 0}]

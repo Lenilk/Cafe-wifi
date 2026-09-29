@@ -97,6 +97,18 @@ def natid_decrypt(blob: bytes) -> str:
     return AESGCM(_key("NATID_DEK")).decrypt(blob[:12], blob[12:], None).decode("utf-8")
 
 
+def encrypt_one_time(payload: bytes) -> bytes:
+    """เข้ารหัสข้อมูลชั่วคราวด้วยกุญแจที่แยก domain จากกุญแจเลขบัตร."""
+    key = hashlib.sha256(_key("NATID_DEK") + b":voucher-reveal:v1").digest()
+    nonce = secrets.token_bytes(12)
+    return nonce + AESGCM(key).encrypt(nonce, payload, b"voucher-reveal:v1")
+
+
+def decrypt_one_time(blob: bytes) -> bytes:
+    key = hashlib.sha256(_key("NATID_DEK") + b":voucher-reveal:v1").digest()
+    return AESGCM(key).decrypt(blob[:12], blob[12:], b"voucher-reveal:v1")
+
+
 # ---------------------------------------------------------------- รหัสผ่าน
 def hash_password(password: str) -> str:
     return _ph.hash(password)

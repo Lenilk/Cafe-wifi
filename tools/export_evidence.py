@@ -87,6 +87,10 @@ def export(mac: str | None, start: datetime, end: datetime, out_dir: Path,
     if end <= start:
         raise ValueError("วันที่สิ้นสุดต้องอยู่หลังวันที่เริ่มต้น")
 
+    from common import audit
+    audit.log_required(audit.EXPORT_LOG, staff_id=staff_id, target=mac or "ALL",
+                       detail=f"requested range={start}..{end}")
+
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     tag = (mac or "all").replace(":", "")
     conn_rows = query_conn_fn(mac, start, end)
@@ -99,10 +103,6 @@ def export(mac: str | None, start: datetime, end: datetime, out_dir: Path,
     manifest = build_manifest([conn_file, dns_file], criteria)
     manifest_path = out_dir / f"manifest_{tag}_{stamp}.json"
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    from common import audit
-    audit.log(audit.EXPORT_LOG, staff_id=staff_id, target=mac or "ALL",
-             detail=f"rows conn={len(conn_rows)} dns={len(dns_rows)} range={start}..{end}")
 
     return {"manifest_path": manifest_path, "conn_file": conn_file, "dns_file": dns_file}
 

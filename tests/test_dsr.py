@@ -248,6 +248,14 @@ def test_reveal_on_purged_customer_returns_410_not_crash(client):
     assert len(AUDIT) == 0, "ไม่ควรลง audit_log เปิดเผย เพราะไม่มีอะไรให้เปิดเผยจริง"
 
 
+def test_reveal_does_not_disclose_when_audit_write_fails(client, monkeypatch):
+    import common.db as db
+    _login_as(client, "admin")
+    monkeypatch.setattr(db, "execute", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("audit down")))
+    with pytest.raises(RuntimeError, match="audit down"):
+        client.post("/customers/1/reveal", data={"reason": "ทดสอบ audit ล้มเหลว"})
+
+
 # ============ N33: ม.26 บังคับเก็บข้อมูลผู้ใช้บริการ -- ลบตามคำขอก่อนครบกำหนดไม่ได้
 def test_retention_hold_blocks_while_inside_window():
     now = datetime(2026, 9, 20, 12, 0, 0)

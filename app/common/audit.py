@@ -40,3 +40,15 @@ def log(action: str, staff_id: int | None = None, target: str = "",
     except Exception as exc:  # noqa: BLE001
         import logging
         logging.getLogger(__name__).error("เขียน audit_log ไม่สำเร็จ: %s", exc)
+
+
+def log_required(action: str, staff_id: int | None = None, target: str = "",
+                 client_ip: str = "", detail: str = "", cursor=None) -> None:
+    """สำหรับงานที่ห้ามแสดงข้อมูล/commit หาก audit ล้มเหลว."""
+    sql = ("INSERT INTO audit_log (staff_id, action, target, client_ip, detail) "
+           "VALUES (%s,%s,%s,%s,%s)")
+    args = (staff_id, action[:64], target[:128], client_ip[:45], detail)
+    if cursor is not None:
+        cursor.execute(sql, args)
+    else:
+        db.execute(sql, args)

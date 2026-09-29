@@ -29,6 +29,7 @@ STAFF = [{"id": 1, "username": "admin1", "password_hash": crypto.hash_password(G
 CUSTOMERS: dict[int, dict] = {}
 VOUCHERS: dict[int, dict] = {}
 AUDIT: list[tuple] = []
+REVEALS: dict[str, dict] = {}
 _ids = {"customer": 0, "voucher": 0}
 
 
@@ -36,6 +37,7 @@ def _reset():
     CUSTOMERS.clear()
     VOUCHERS.clear()
     AUDIT.clear()
+    REVEALS.clear()
     _ids.update(customer=0, voucher=0)
 
 
@@ -58,7 +60,7 @@ class FakeCursor:
             cid = _ids["customer"]
             CUSTOMERS[cid] = dict(id=cid, natid_hash=args[0], natid_enc=args[1], natid_masked=args[2])
             self.lastrowid = cid
-        elif s.startswith("insert into voucher"):
+        elif s.startswith("insert into voucher ("):
             _ids["voucher"] += 1
             vid = _ids["voucher"]
             # ลำดับคอลัมน์: customer_id, username, password_hash, issued_by, valid_from,
@@ -66,6 +68,16 @@ class FakeCursor:
             VOUCHERS[vid] = dict(id=vid, customer_id=args[0], username=args[1],
                                  max_devices=args[6], quota_mb=args[7])
             self.lastrowid = vid
+        elif s.startswith("insert into voucher_reveal"):
+            token, staff_id, payload, expires_at = args
+            REVEALS[token] = dict(payload=payload, staff_id=staff_id,
+                                  expires_at=expires_at, consumed_at=None)
+            self.rowcount = 1
+        elif s.startswith("select payload, expires_at, consumed_at, staff_id from voucher_reveal"):
+            self._rows = [REVEALS[args[0]]] if args[0] in REVEALS else []
+        elif s.startswith("update voucher_reveal set consumed_at"):
+            REVEALS[args[0]]["consumed_at"] = datetime.now()
+            self.rowcount = 1
         elif s.startswith("insert into audit_log"):
             AUDIT.append(args)
             self.rowcount = 1

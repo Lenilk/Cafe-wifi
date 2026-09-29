@@ -9,7 +9,7 @@ from logger.conn_collector import ConnRecord, flush_buffer, parse_conntrack_line
 from logger.dns_collector import DnsCorrelator, parse_dnsmasq_line, parse_syslog_timestamp
 from logger import integrity
 from logger.integrity import (MemoryManifestStore, sha256_file, seal_directory,
-                              verify_chain)
+                              verify_chain, prune_archives, ManifestEntry)
 from logger.netutil import MacCache, resolve_mac
 
 # ---------------------------------------------------------------- conntrack
@@ -223,6 +223,28 @@ def test_verify_chain_detects_broken_link():
     issues = verify_chain(store, store and __import__("pathlib").Path("/nonexistent"))
     kinds = {i.kind for i in issues}
     assert "chain_broken" in kinds
+
+
+def test_retention_delete_is_recorded_without_false_missing_file(tmp_path, monkeypatch):
+    from common import audit
+    archive = tmp_path / "dnsmasq.log-2026-01-01"
+    archive.write_bytes(b"old raw log")
+    store = MemoryManifestStore()
+    store.add(ManifestEntry(filename=archive.name, sha256=sha256_file(archive),
+                            prev_sha256=None, size_bytes=archive.stat().st_size,
+                            sealed_at=datetime(2026, 1, 2)))
+    monkeypatch.setattr(audit, "log_required", lambda *a, **kw: None)
+    assert prune_archives(store, tmp_path, 90, now=datetime(2026, 9, 29)) == 1
+    assert not archive.exists()
+    assert verify_chain(store, tmp_path) == []
+
+
+def test_pending_retention_delete_is_an_issue(tmp_path):
+    store = MemoryManifestStore()
+    store.add(ManifestEntry(filename="dnsmasq.log-2026-01-01", sha256="a" * 64,
+                            prev_sha256=None, size_bytes=1))
+    store.set_deletion("dnsmasq.log-2026-01-01", "pending")
+    assert {i.kind for i in verify_chain(store, tmp_path)} == {"pending_delete", "missing_file"}
 
 
 # ---------------------------------------------------------------- netutil

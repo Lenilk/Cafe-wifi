@@ -10,7 +10,10 @@ admin/app.py — Admin Panel สำหรับพนักงาน
 from __future__ import annotations
 
 import ipaddress
+import hashlib
+import json
 import os
+import secrets
 import time
 from datetime import datetime, timedelta
 from functools import wraps
@@ -38,6 +41,13 @@ app.config.update(
     PERMANENT_SESSION_LIFETIME=timedelta(hours=8),
     MAX_CONTENT_LENGTH=1 * 1024 * 1024,
 )
+
+
+@app.after_request
+def no_cache_sensitive(response):
+    if request.path == "/issue/result" or request.path.endswith("/reveal"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
 if not os.environ.get("SECRET_KEY"):
     # แก้บั๊ก (พบตอนตรวจทานรอบ 2): เดิม fallback เป็นค่าสุ่มเงียบ ๆ ไม่มี log อะไรเลย --
     # ตรงข้ามกับ FAS_KEY ที่ตั้งใจ fail ดัง ๆ (503) ถ้าไม่มีค่า สองไฟล์นี้ทำคนละมาตรฐาน
@@ -333,6 +343,8 @@ def issue():
     code = crypto.gen_voucher_code()
     plain_pw = crypto.gen_voucher_password()
     now = datetime.now()
+    reveal_token = secrets.token_urlsafe(32)
+    reveal_hash = hashlib.sha256(reveal_token.encode("ascii")).hexdigest()
 
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute("SELECT id, is_blocked FROM customer WHERE natid_hash = %s", (nid_hash,))
@@ -357,18 +369,23 @@ def issue():
             "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'active')",
             (cust_id, code, crypto.hash_password(plain_pw), session["staff_id"],
              now, now + timedelta(hours=hours), devices, quota_mb))
-
-    audit.log(audit.ISSUE_VOUCHER, staff_id=session["staff_id"], target=code,
-              client_ip=g.client_ip,
-              detail=f"customer={masked} hours={hours} devices={devices} quota_mb={quota_mb or 'unlimited'}")
+        reveal_data = dict(code=code, password=plain_pw, masked=masked,
+                           valid_until=(now + timedelta(hours=hours)).isoformat(),
+                           devices=devices, quota_mb=quota_mb)
+        cur.execute("INSERT INTO voucher_reveal (token_hash, staff_id, payload, expires_at) "
+                    "VALUES (%s,%s,%s,%s)",
+                    (reveal_hash, session["staff_id"],
+                     crypto.encrypt_one_time(json.dumps(reveal_data).encode("utf-8")),
+                     now + timedelta(minutes=5)))
+        audit.log_required(audit.ISSUE_VOUCHER, staff_id=session["staff_id"], target=code,
+                           client_ip=g.client_ip,
+                           detail=f"customer={masked} hours={hours} devices={devices} "
+                                  f"quota_mb={quota_mb or 'unlimited'}", cursor=cur)
 
     # บั๊กเดิม (M6): เคย render ผลลัพธ์ตรง ๆ จาก POST -- กด F5 ที่หน้านั้นคือส่ง POST ซ้ำ
     # ได้ voucher ใบใหม่ให้ลูกค้าคนเดิมทันทีโดยไม่ตั้งใจ -- เปลี่ยนเป็น POST-Redirect-GET
     # เก็บรหัสผ่านไว้ใน session ชั่วคราว (เห็นได้ครั้งเดียว, pop ทิ้งทันทีที่อ่าน เหมือน flash)
-    session["just_issued"] = dict(
-        code=code, password=plain_pw, masked=masked,
-        valid_until=(now + timedelta(hours=hours)).isoformat(), devices=devices,
-        quota_mb=quota_mb)
+    session["issue_token"] = reveal_token
     return redirect(url_for("issue_result"))
 
 
@@ -378,9 +395,22 @@ def issue():
 @app.get("/issue/result")
 @login_required
 def issue_result():
-    data = session.pop("just_issued", None)
-    if not data:
+    token = session.get("issue_token")
+    if not token:
         return redirect(url_for("issue"))
+    token_hash = hashlib.sha256(token.encode("ascii")).hexdigest()
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT payload, expires_at, consumed_at, staff_id FROM voucher_reveal "
+                    "WHERE token_hash=%s FOR UPDATE", (token_hash,))
+        row = cur.fetchone()
+        if not row or row["staff_id"] != session["staff_id"] or row["consumed_at"] \
+                or row["expires_at"] <= datetime.now():
+            session.pop("issue_token", None)
+            return redirect(url_for("issue"))
+        data = json.loads(crypto.decrypt_one_time(row["payload"]).decode("utf-8"))
+        cur.execute("UPDATE voucher_reveal SET consumed_at=NOW() WHERE token_hash=%s",
+                    (token_hash,))
+    session.pop("issue_token", None)
     qr_text = (f"{os.environ.get('GATEWAY_NAME', 'Cafe-Guest')}\n"
               f"User: {data['code']}\nPass: {data['password']}")
     quota_mb = data.get("quota_mb")
@@ -434,8 +464,8 @@ def reveal(cid: int):
             message="ลูกค้ารายนี้ถูกลบข้อมูลระบุตัวตนไปแล้วตามคำขอ (DSR) — ไม่มีเลขบัตรให้เปิดเผยอีกต่อไป",
         ), 410
 
-    audit.log(audit.REVEAL_NATID, staff_id=session["staff_id"], target=f"customer:{cid}",
-              client_ip=g.client_ip, detail=reason)
+    audit.log_required(audit.REVEAL_NATID, staff_id=session["staff_id"],
+                       target=f"customer:{cid}", client_ip=g.client_ip, detail=reason)
     return render_template("reveal.html", natid=crypto.natid_decrypt(row["natid_enc"]),
                            masked=row["natid_masked"], cid=cid, reason=reason)
 
@@ -447,11 +477,12 @@ def reveal(cid: int):
 @login_required
 def revoke_voucher(vid: int):
     """ยกเลิก voucher ก่อนหมดอายุ (เช่น ออกผิด/ลูกค้าขอยกเลิก) -- ยกเลิกได้เฉพาะใบที่ยัง active"""
-    n = execute("UPDATE voucher SET status='revoked' WHERE id=%s AND status='active'", (vid,))
-    if not n:
-        abort(404, "ไม่พบ voucher นี้ หรือถูกยกเลิก/หมดอายุไปแล้ว")
-    audit.log(audit.REVOKE_VOUCHER, staff_id=session["staff_id"], target=f"voucher:{vid}",
-              client_ip=g.client_ip)
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE voucher SET status='revoked' WHERE id=%s AND status='active'", (vid,))
+        if not cur.rowcount:
+            abort(404, "ไม่พบ voucher นี้ หรือถูกยกเลิก/หมดอายุไปแล้ว")
+        audit.log_required(audit.REVOKE_VOUCHER, staff_id=session["staff_id"],
+                           target=f"voucher:{vid}", client_ip=g.client_ip, cursor=cur)
     flash("ยกเลิก voucher เรียบร้อย", "success")
     return redirect(url_for("dashboard"))
 
@@ -600,6 +631,9 @@ def search_logs():
         sql += " ORDER BY cl.ts DESC LIMIT %s OFFSET %s"
         params += [LOGS_PAGE_SIZE + 1, offset]
 
+    audit.log_required(audit.SEARCH_LOG, staff_id=session["staff_id"], client_ip=g.client_ip,
+                       detail=f"log_type={log_type} start={start.isoformat()} end={end.isoformat()} "
+                              f"mac={mac or '-'} domain={domain or '-'} ip={ip or '-'} page={page}")
     rows = query_all(sql, tuple(params))
     has_next = len(rows) > LOGS_PAGE_SIZE
     rows = rows[:LOGS_PAGE_SIZE]
@@ -608,10 +642,6 @@ def search_logs():
     # ลง audit_log ทุกครั้งที่ค้นสำเร็จ (PDPA + จุดขายตอนนำเสนอ) -- ไม่ลงตอนถูกปฏิเสธด้านบน
     # เพราะยังไม่มีการค้นข้อมูลอะไรเกิดขึ้นจริง (ตรงกับแบบแผนเดิมของ /customers/<id>/erase
     # ที่ไม่ลง audit ตอน validation ล้มเหลวเหมือนกัน)
-    audit.log(audit.SEARCH_LOG, staff_id=session["staff_id"], client_ip=g.client_ip,
-              detail=f"log_type={log_type} start={start.isoformat()} end={end.isoformat()} "
-                    f"mac={mac or '-'} domain={domain or '-'} ip={ip or '-'} page={page}")
-
     return render_template("logs_search.html", error=None, **ctx)
 
 

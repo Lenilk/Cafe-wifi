@@ -1816,7 +1816,8 @@ configure_logrotate() {
 # managed by ${APP_NAME} installer
 ${LOG_DIR}/*.log {
     daily
-    rotate ${LOG_RETENTION_DAYS}
+    # งาน logger.integrity ตรวจ hash และบันทึกการลบตามอายุเอง
+    rotate -1
     missingok
     notifempty
     compress
@@ -1994,10 +1995,8 @@ main() {
   # ย้ายมาไว้นอก wizard() ให้ทำงานเสมอไม่ว่าจะผ่าน wizard หรือไม่ก็ตาม
   # (confirm() คืนค่า true ทันทีถ้า ASSUME_YES แต่ warn บรรทัดก่อนหน้ายังพิมพ์ให้เห็นเสมอ
   # ไม่ได้ถูกกลืนไปเงียบ ๆ เหมือนเดิม)
-  if (( LOG_RETENTION_DAYS < 90 )); then
-    warn "พ.ร.บ.คอมพิวเตอร์ ม.26 กำหนดให้เก็บข้อมูลจราจรไม่น้อยกว่า 90 วัน"
-    confirm "ยืนยันใช้ ${LOG_RETENTION_DAYS} วันจริงหรือไม่" || die "ยกเลิก"
-  fi
+  [[ "$LOG_RETENTION_DAYS" =~ ^[0-9]+$ ]] || die "retention-days ต้องเป็นจำนวนวันเต็ม"
+  (( 10#$LOG_RETENTION_DAYS >= 90 )) || die "retention-days ต้องไม่น้อยกว่า 90 วัน"
 
   preflight
 

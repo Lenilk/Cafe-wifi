@@ -92,6 +92,8 @@ class _FakeCursor:
             self.rowcount = 5
         elif s.startswith("delete from dns_log"):
             self.rowcount = 8
+        elif s.startswith("delete from voucher_reveal"):
+            self.rowcount = 0
         elif s.startswith("select c.id from customer"):
             self._select_result = self._stale
         elif s.startswith("select greatest("):
@@ -207,6 +209,16 @@ def test_export_rejects_invalid_date_range(tmp_path):
     with pytest.raises(ValueError):
         export_evidence.export(None, datetime(2026, 8, 22), datetime(2026, 8, 1), tmp_path,
                                lambda *a: [], lambda *a: [])
+
+
+def test_export_writes_no_files_when_audit_fails(tmp_path, monkeypatch):
+    from common import audit
+    monkeypatch.setattr(audit, "log_required",
+                        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("audit down")))
+    with pytest.raises(RuntimeError, match="audit down"):
+        export_evidence.export(None, datetime(2026, 8, 1), datetime(2026, 8, 2), tmp_path,
+                               lambda *a: [], lambda *a: [])
+    assert list(tmp_path.iterdir()) == []
 
 
 # ============ N32: วันสิ้นสุดของช่วงส่งออกหลักฐานต้องหมายถึงสิ้นวัน ไม่ใช่เที่ยงคืนต้นวัน

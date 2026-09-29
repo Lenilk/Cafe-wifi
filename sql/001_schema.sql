@@ -92,6 +92,15 @@ CREATE TABLE IF NOT EXISTS fas_context (
   INDEX idx_expiry (expires_at)
 ) ENGINE=InnoDB;
 
+CREATE TABLE IF NOT EXISTS voucher_reveal (
+  token_hash CHAR(64) PRIMARY KEY,
+  staff_id INT NOT NULL,
+  payload BLOB NOT NULL,
+  expires_at DATETIME NOT NULL,
+  consumed_at DATETIME NULL,
+  INDEX idx_expiry (expires_at)
+) ENGINE=InnoDB;
+
 -- ---------------------------------------------------------------- ข้อมูลจราจร (ม.26)
 -- D5: เก็บเฉพาะ metadata ไม่เก็บ payload
 CREATE TABLE IF NOT EXISTS conn_log (
@@ -151,5 +160,7 @@ CREATE TABLE IF NOT EXISTS log_manifest (
   prev_sha256 CHAR(64) NULL,
   size_bytes BIGINT NOT NULL,
   sealed_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  deletion_state ENUM('active','pending','deleted') NOT NULL DEFAULT 'active',
+  deleted_at DATETIME NULL,
   UNIQUE KEY uq_date_file (log_date, filename)
 ) ENGINE=InnoDB;
