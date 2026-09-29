@@ -83,7 +83,7 @@ CREATE TABLE IF NOT EXISTS portal_session (
 CREATE TABLE IF NOT EXISTS conn_log (
   id        BIGINT AUTO_INCREMENT,
   ts        DATETIME(3) NOT NULL,
-  mac       CHAR(17) NOT NULL,
+  mac       CHAR(17) NULL,
   src_ip    VARCHAR(45) NOT NULL,
   src_port  SMALLINT UNSIGNED,
   dst_ip    VARCHAR(45) NOT NULL,
@@ -100,11 +100,12 @@ CREATE TABLE IF NOT EXISTS conn_log (
 CREATE TABLE IF NOT EXISTS dns_log (
   id        BIGINT AUTO_INCREMENT,
   ts        DATETIME(3) NOT NULL,
-  client_ip VARCHAR(45) NOT NULL,
+  client_ip VARCHAR(45) NULL,
   mac       CHAR(17),
   qname     VARCHAR(255) NOT NULL,
   qtype     VARCHAR(10),
   answer    VARCHAR(255),
+  event_kind ENUM('query','answer') NOT NULL DEFAULT 'query',
   PRIMARY KEY (id, ts),
   INDEX idx_ts (ts),
   INDEX idx_qname (qname),

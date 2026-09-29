@@ -115,24 +115,27 @@ def test_year_rollback_for_old_timestamps():
     assert ts.year == 2025, "31 ธ.ค. ที่ดูเหมือนอยู่ในอนาคตเมื่อเทียบกับ now ต้องถูกตีความเป็นปีก่อน"
 
 
-def test_correlator_matches_query_with_reply():
+def test_dns_query_and_reply_are_independent_events():
     c = DnsCorrelator()
-    assert c.feed_line("Aug 22 10:15:32 dnsmasq[1234]: query[A] example.com from 10.10.0.105", NOW) is None
-    row = c.feed_line("Aug 22 10:15:33 dnsmasq[1234]: reply example.com is 93.184.216.34", NOW)
-    assert row == dict(ts=NOW.replace(hour=10, minute=15, second=32), client_ip="10.10.0.105",
-                       qname="example.com", qtype="A", answer="93.184.216.34")
+    query = c.feed_line("Aug 22 10:15:32 dnsmasq[1234]: query[A] example.com from 10.10.0.105", NOW)
+    answer = c.feed_line("Aug 22 10:15:33 dnsmasq[1234]: reply example.com is 93.184.216.34", NOW)
+    assert query == dict(ts=NOW.replace(hour=10, minute=15, second=32), client_ip="10.10.0.105",
+                         qname="example.com", qtype="A", answer=None, event_kind="query")
+    assert answer == dict(ts=NOW.replace(hour=10, minute=15, second=33), client_ip=None,
+                          qname="example.com", qtype=None, answer="93.184.216.34", event_kind="answer")
 
 
-def test_correlator_ignores_orphan_reply():
+def test_dns_orphan_reply_is_retained_without_client():
     c = DnsCorrelator()
-    assert c.feed_line("Aug 22 10:15:50 dnsmasq[1234]: reply orphan.com is 1.2.3.4", NOW) is None
+    row = c.feed_line("Aug 22 10:15:50 dnsmasq[1234]: reply orphan.com is 1.2.3.4", NOW)
+    assert row["event_kind"] == "answer" and row["client_ip"] is None
 
 
-def test_correlator_memory_is_bounded():
-    c = DnsCorrelator(max_pending=3)
-    for i in range(10):
-        c.feed_line(f"Aug 22 10:15:{i:02d} dnsmasq[1]: query[A] q{i}.com from 10.0.0.1", NOW)
-    assert len(c._pending) <= 3
+def test_dns_same_name_from_two_clients_stays_separate():
+    c = DnsCorrelator()
+    a = c.feed_line("Aug 22 10:15:01 dnsmasq[1]: query[A] same.test from 10.0.0.1", NOW)
+    b = c.feed_line("Aug 22 10:15:02 dnsmasq[1]: query[A] same.test from 10.0.0.2", NOW)
+    assert a["client_ip"] == "10.0.0.1" and b["client_ip"] == "10.0.0.2"
 
 
 # ---------------------------------------------------------------- integrity / hash chain

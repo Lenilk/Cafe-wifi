@@ -13,6 +13,7 @@ import os
 import signal
 import sys
 import threading
+import time
 
 from . import conn_collector, dns_collector
 
@@ -46,7 +47,11 @@ def main() -> int:
         t.start()
         log.info("เริ่ม thread %s", t.name)
 
-    _stop.wait()
+    while not _stop.wait(1):
+        for t in threads:
+            if not t.is_alive():
+                log.error("collector %s หยุดทำงาน", t.name)
+                return 1
     log.info("ปิด cafe-logger เรียบร้อย")
     return 0
 

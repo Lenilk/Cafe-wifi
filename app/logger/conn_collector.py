@@ -152,7 +152,7 @@ def insert_conn_records(records: list[ConnRecord], mac_cache: MacCache) -> int:
     for r in records:
         mac = mac_cache.get(r.src_ip)
         if not mac:
-            continue  # หา MAC ไม่เจอ (หลุดจาก ARP cache แล้ว) -- ข้ามแทนที่จะเก็บ MAC ว่าง
+            log.warning("ไม่พบ MAC ของ %s — เก็บ conn_log โดยไม่ระบุตัวอุปกรณ์", r.src_ip)
         rows.append((datetime.fromtimestamp(r.ts), mac, r.src_ip, r.src_port,
                      r.dst_ip, r.dst_port, r.proto, r.bytes_out, r.bytes_in))
     if not rows:
@@ -248,6 +248,7 @@ def run_forever(batch_size: int = 100, flush_interval: float = 5.0) -> None:  # 
     mac_cache = MacCache()
     buffer: list[ConnRecord] = []
     events: queue.Queue = queue.Queue(maxsize=EVENT_QUEUE_MAX)
+    overflow = [0]
     last_flush = time.time()
 
     cmd = ["conntrack", "-E", "-o", "timestamp,extended", "-e", "DESTROY",
@@ -266,15 +267,19 @@ def run_forever(batch_size: int = 100, flush_interval: float = 5.0) -> None:  # 
             try:
                 events.put_nowait(line)
             except queue.Full:
-                log.error("คิวเหตุการณ์เต็ม (%d) — ทิ้งรายการนี้ conn_log ช่วงนี้จะไม่ครบ",
-                         EVENT_QUEUE_MAX)
+                overflow[0] += 1
 
-    threading.Thread(target=_read_stdout, daemon=True, name="conntrack-stdout").start()
-    threading.Thread(target=_drain_stderr, args=(proc.stderr, _record_event_loss),
-                    daemon=True, name="conntrack-stderr").start()
+    stdout_thread = threading.Thread(target=_read_stdout, daemon=True, name="conntrack-stdout")
+    stderr_thread = threading.Thread(target=_drain_stderr, args=(proc.stderr, _record_event_loss),
+                                     daemon=True, name="conntrack-stderr")
+    stdout_thread.start()
+    stderr_thread.start()
 
     try:
+        reported_overflow = 0
         while proc.poll() is None:
+            if not stdout_thread.is_alive() or not stderr_thread.is_alive():
+                raise RuntimeError("conntrack reader thread หยุดทำงาน")
             try:
                 # N39: แปลงบรรทัดเป็น record ตรงนี้ (ลูปหลัก) แทนที่จะทำในเธรดอ่าน
                 rec = parse_conntrack_line(events.get(timeout=flush_interval))
@@ -282,6 +287,11 @@ def run_forever(batch_size: int = 100, flush_interval: float = 5.0) -> None:  # 
                     buffer.append(rec)
             except queue.Empty:
                 pass
+            if overflow[0] != reported_overflow:
+                lost = overflow[0] - reported_overflow
+                reported_overflow = overflow[0]
+                log.error("log_gap conn_log: stdout queue เต็ม ทิ้ง %d เหตุการณ์", lost)
+                _record_event_loss(f"conntrack stdout queue full, dropped={lost}")
             now = time.time()
             if len(buffer) >= batch_size or (buffer and now - last_flush >= flush_interval):
                 n = flush_buffer(buffer, mac_cache)
@@ -289,6 +299,7 @@ def run_forever(batch_size: int = 100, flush_interval: float = 5.0) -> None:  # 
                 last_flush = now
         log.error("conntrack หยุดทำงาน (exit %s) — cafe-logger จะถูก systemd รีสตาร์ทให้",
                  proc.returncode)
+        raise RuntimeError(f"conntrack หยุดทำงาน (exit {proc.returncode})")
     finally:
         flush_buffer(buffer, mac_cache)
         proc.terminate()
