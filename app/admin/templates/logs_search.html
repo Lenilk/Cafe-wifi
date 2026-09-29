@@ -5,8 +5,8 @@
   <h1>ค้นหา log ย้อนหลัง</h1>
   <p class="hint">
     ค้นได้ทั้ง conn_log (การเชื่อมต่อ) และ dns_log (DNS query) — <strong>ต้องระบุช่วงเวลาเสมอ</strong>
-    (ห้ามค้นแบบไม่จำกัดช่วง) ผลลัพธ์แสดงย้อนกลับถึงลูกค้าเจ้าของ MAC ในช่วงเวลานั้น (แสดงเลขบัตร
-    แบบ masked เท่านั้นทุก role — ต้องกด "เปิดเผยเลขเต็ม" ในหน้าลูกค้าแยกต่างหากถ้าต้องการเลขเต็ม)
+    (ห้ามค้นแบบไม่จำกัดช่วง) แสดงตัวตนเฉพาะรายการที่ตรงกับ session ที่ยืนยันแล้วเพียงรายการเดียว
+    (เลขบัตรแสดงแบบ masked เท่านั้น)
   </p>
 
   {% if error %}<div class="msg err">{{ error }}</div>{% endif %}
@@ -56,18 +56,19 @@
   <div style="overflow-x:auto">
   <table>
     {% if log_type == 'dns' %}
-    <tr><th>เวลา</th><th>IP ลูกค้า</th><th>MAC</th><th>โดเมน</th><th>ประเภท</th><th>คำตอบ</th>
+    <tr><th>เวลา</th><th>ชนิด</th><th>IP ลูกค้า</th><th>MAC</th><th>โดเมน</th><th>ประเภท</th><th>คำตอบ</th>
         <th>รหัสวอเชอร์</th><th>ลูกค้า</th></tr>
     {% for r in rows %}
     <tr>
       <td>{{ r.ts.strftime('%d/%m/%Y %H:%M:%S') }}</td>
-      <td class="mono">{{ r.client_ip }}</td>
+      <td>{{ r.event_kind }}</td>
+      <td class="mono">{{ r.client_ip or '-' }}</td>
       <td class="mono">{{ r.mac or '-' }}</td>
       <td class="mono">{{ r.qname }}</td>
       <td>{{ r.qtype or '-' }}</td>
       <td class="mono">{{ r.answer or '-' }}</td>
-      <td class="mono">{{ r.voucher_username or '-' }}</td>
-      <td class="mono">{{ r.natid_masked or 'ไม่ทราบ' }}</td>
+      <td class="mono">{{ r.voucher_username or 'ระบุตัวไม่แน่นอน' }}</td>
+      <td class="mono">{{ r.natid_masked or 'ระบุตัวไม่แน่นอน' }}</td>
     </tr>
     {% endfor %}
     {% else %}
@@ -76,14 +77,14 @@
     {% for r in rows %}
     <tr>
       <td>{{ r.ts.strftime('%d/%m/%Y %H:%M:%S') }}</td>
-      <td class="mono">{{ r.mac }}</td>
+      <td class="mono">{{ r.mac or '-' }}</td>
       <td class="mono">{{ r.src_ip }}:{{ r.src_port or '-' }}</td>
       <td class="mono">{{ r.dst_ip }}:{{ r.dst_port or '-' }}</td>
       <td>{{ r.proto }}</td>
       <td>{{ r.bytes_out or 0 }}</td>
       <td>{{ r.bytes_in or 0 }}</td>
-      <td class="mono">{{ r.voucher_username or '-' }}</td>
-      <td class="mono">{{ r.natid_masked or 'ไม่ทราบ' }}</td>
+      <td class="mono">{{ r.voucher_username or 'ระบุตัวไม่แน่นอน' }}</td>
+      <td class="mono">{{ r.natid_masked or 'ระบุตัวไม่แน่นอน' }}</td>
     </tr>
     {% endfor %}
     {% endif %}

@@ -55,13 +55,24 @@ def retention_hold_until(query_one_fn, customer_id: int,
     voucher วันนี้อาจใช้งานต่ออีกหลายชั่วโมง/หลายวันหลังจากนั้น
     """
     if retention_days is None:
-        retention_days = int(os.environ.get("LOG_RETENTION_DAYS", "180"))
+        retention_days = max(int(os.environ.get("LOG_RETENTION_DAYS", "180")),
+                             int(os.environ.get("CUSTOMER_RETENTION_DAYS", "0")))
     row = query_one_fn(
         "SELECT GREATEST("
-        "   COALESCE(c.last_seen, c.first_seen),"
-        "   COALESCE((SELECT MAX(ps.started_at) FROM portal_session ps"
-        "             JOIN voucher v ON v.id = ps.voucher_id"
-        "             WHERE v.customer_id = c.id), c.first_seen)"
+        " COALESCE(c.last_seen, c.first_seen),"
+        " COALESCE((SELECT MAX(COALESCE(ps.ended_at,"
+        " CASE WHEN ps.state='authenticated' THEN NOW() ELSE ps.authenticated_at END,"
+        " ps.started_at))"
+        " FROM portal_session ps JOIN voucher v ON v.id=ps.voucher_id"
+        " WHERE v.customer_id=c.id), c.first_seen),"
+        " COALESCE((SELECT MAX(cl.ts) FROM conn_log cl"
+        " JOIN portal_session ps ON ps.mac=cl.mac AND ps.ip=cl.src_ip"
+        " AND ps.authenticated_at<=cl.ts AND (ps.ended_at IS NULL OR cl.ts<=ps.ended_at)"
+        " JOIN voucher v ON v.id=ps.voucher_id WHERE v.customer_id=c.id), c.first_seen),"
+        " COALESCE((SELECT MAX(dl.ts) FROM dns_log dl"
+        " JOIN portal_session ps ON ps.mac=dl.mac AND ps.ip=dl.client_ip"
+        " AND ps.authenticated_at<=dl.ts AND (ps.ended_at IS NULL OR dl.ts<=ps.ended_at)"
+        " JOIN voucher v ON v.id=ps.voucher_id WHERE v.customer_id=c.id), c.first_seen)"
         " ) AS last_activity FROM customer c WHERE c.id = %s", (customer_id,))
     if not row or not row.get("last_activity"):
         return None

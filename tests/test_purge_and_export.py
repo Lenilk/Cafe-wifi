@@ -64,13 +64,17 @@ def test_purge_stale_customers_anonymizes_only_those_without_active_voucher():
         anonymized.append(args[0])
         return 1
 
-    n = purge_old_data.purge_stale_customers(fake_query_all, fake_exec, datetime(2026, 1, 1))
+    n = purge_old_data.purge_stale_customers(
+        fake_query_all, lambda *a: {"last_activity": datetime(2025, 1, 1)},
+        fake_exec, datetime(2026, 1, 1), retention_days=180,
+        now=datetime(2026, 8, 1))
     assert n == 2
     assert anonymized == [7, 9]
 
 
 def test_purge_stale_customers_none_found():
-    n = purge_old_data.purge_stale_customers(lambda *a: [], lambda *a: 0, datetime.now())
+    n = purge_old_data.purge_stale_customers(
+        lambda *a: [], lambda *a: None, lambda *a: 0, datetime.now(), 180)
     assert n == 0
 
 
@@ -90,6 +94,8 @@ class _FakeCursor:
             self.rowcount = 8
         elif s.startswith("select c.id from customer"):
             self._select_result = self._stale
+        elif s.startswith("select greatest("):
+            self._select_result = {"last_activity": datetime.now() - timedelta(days=400)}
         elif s.startswith("update customer set natid_hash"):
             self._anonymized_log.append(args[0])
             self.rowcount = 1
@@ -99,6 +105,9 @@ class _FakeCursor:
             raise AssertionError(f"ไม่รู้จัก SQL: {s[:60]}")
 
     def fetchall(self):
+        return self._select_result
+
+    def fetchone(self):
         return self._select_result
 
     def __enter__(self): return self

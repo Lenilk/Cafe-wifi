@@ -25,7 +25,7 @@ from pathlib import Path
 log = logging.getLogger("cafe-wifi.export")
 
 CONN_FIELDS = ["ts", "mac", "src_ip", "src_port", "dst_ip", "dst_port", "proto", "bytes_out", "bytes_in"]
-DNS_FIELDS = ["ts", "client_ip", "mac", "qname", "qtype", "answer"]
+DNS_FIELDS = ["ts", "event_kind", "client_ip", "mac", "qname", "qtype", "answer"]
 
 
 @dataclass(frozen=True)
@@ -131,7 +131,7 @@ def _cli() -> int:  # pragma: no cover
         return query_all(sql + " ORDER BY ts", tuple(params))
 
     def q_dns(mac, s, e):
-        sql = "SELECT ts, client_ip, mac, qname, qtype, answer FROM dns_log WHERE ts BETWEEN %s AND %s"
+        sql = "SELECT ts, event_kind, client_ip, mac, qname, qtype, answer FROM dns_log WHERE ts BETWEEN %s AND %s"
         params = [s, e]
         if mac:
             sql += " AND mac = %s"; params.append(mac)

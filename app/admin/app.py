@@ -529,9 +529,13 @@ LOGS_PAGE_SIZE = 50
 # ใน DB (ไม่เคย SELECT natid_enc/natid_hash ในหน้านี้เลย) จึงไม่มีทางเห็นเลขเต็มไม่ว่า role ไหน
 # ตรงตาม §6.2 ข้อ 5 -- role staff จะเห็นแบบเดียวกับ admin ในหน้านี้เป๊ะ (เหมือนหน้า /customers เดิม)
 _MAPPING_JOIN = (
-    " LEFT JOIN device d ON d.mac = {alias}.mac"
-    " LEFT JOIN voucher v ON v.id = d.voucher_id AND {alias}.ts BETWEEN v.valid_from AND v.valid_until"
-    " LEFT JOIN customer c ON c.id = v.customer_id"
+    " LEFT JOIN portal_session ps ON ps.id = ("
+    " SELECT CASE WHEN COUNT(*)=1 THEN MAX(s.id) END FROM portal_session s"
+    " WHERE s.mac={alias}.mac AND s.ip={alias}.{ipfield}"
+    " AND s.authenticated_at <= {alias}.ts"
+    " AND (s.ended_at IS NULL OR {alias}.ts <= s.ended_at))"
+    " LEFT JOIN voucher v ON v.id=ps.voucher_id"
+    " LEFT JOIN customer c ON c.id=v.customer_id"
 )
 
 
@@ -572,9 +576,9 @@ def search_logs():
     # ดึงเกิน 1 แถวเพื่อรู้ว่า "มีหน้าถัดไปไหม" โดยไม่ต้องรัน COUNT(*) แยกอีกคิวรี่ (คิวรี่นับแถว
     # ทั้งชุดที่กรองแล้วก็หนักพอ ๆ กับคิวรี่ค้นเองบนตารางใหญ่ -- Pi 4B RAM จำกัด ไม่คุ้มที่จะรันซ้ำ)
     if log_type == "dns":
-        sql = ("SELECT dl.ts, dl.client_ip, dl.mac, dl.qname, dl.qtype, dl.answer, "
+        sql = ("SELECT dl.ts, dl.client_ip, dl.mac, dl.qname, dl.qtype, dl.answer, dl.event_kind, "
               "v.username AS voucher_username, c.natid_masked "
-              "FROM dns_log dl" + _MAPPING_JOIN.format(alias="dl") +
+              "FROM dns_log dl" + _MAPPING_JOIN.format(alias="dl", ipfield="client_ip") +
               " WHERE dl.ts BETWEEN %s AND %s")
         params: list = [start, end]
         if mac:
@@ -586,7 +590,7 @@ def search_logs():
     else:
         sql = ("SELECT cl.ts, cl.mac, cl.src_ip, cl.src_port, cl.dst_ip, cl.dst_port, cl.proto, "
               "cl.bytes_out, cl.bytes_in, v.username AS voucher_username, c.natid_masked "
-              "FROM conn_log cl" + _MAPPING_JOIN.format(alias="cl") +
+              "FROM conn_log cl" + _MAPPING_JOIN.format(alias="cl", ipfield="src_ip") +
               " WHERE cl.ts BETWEEN %s AND %s")
         params = [start, end]
         if mac:

@@ -58,7 +58,8 @@ def purge_conn_and_dns_logs(execute_fn, cutoff: datetime) -> tuple[int, int]:
     return n_conn, n_dns
 
 
-def purge_stale_customers(query_all_fn, execute_fn, cutoff: datetime) -> int:
+def purge_stale_customers(query_all_fn, query_one_fn, execute_fn, cutoff: datetime,
+                          retention_days: int, now: datetime | None = None) -> int:
     """
     ล้าง (anonymize) ข้อมูลระบุตัวตนของลูกค้าที่ไม่มี voucher ค้างอยู่ (active หรือยังไม่หมดอายุ)
     และไม่ได้มาร้านมานานแล้ว ทำเป็น 2 ขั้น (SELECT แล้วอัปเดตทีละราย) แทนคำสั่งเดียว
@@ -78,7 +79,7 @@ def purge_stale_customers(query_all_fn, execute_fn, cutoff: datetime) -> int:
     การล้าง 1 คนใช้ร่วมกับ DSR (N6, CODING_BRIEF.md) ผ่าน common.customer.anonymize_customer()
     เพื่อไม่ให้ 2 เส้นทางเขียนตรรกะเดียวกันซ้ำกันคนละที่ (ดู docstring ของฟังก์ชันนั้น)
     """
-    from common.customer import anonymize_customer
+    from common.customer import anonymize_customer, retention_hold_until
 
     # หมายเหตุ: 'PURGED' ในเงื่อนไข WHERE ข้างล่างต้องตรงกับ natid_masked ที่
     # anonymize_customer() เขียนจริง (common/customer.py) -- ถ้าจะเปลี่ยนค่านี้ต้องแก้ทั้งคู่พร้อมกัน
@@ -93,6 +94,9 @@ def purge_stale_customers(query_all_fn, execute_fn, cutoff: datetime) -> int:
     """, (cutoff,))
     count = 0
     for row in stale:
+        if retention_hold_until(query_one_fn, row["id"], retention_days=retention_days,
+                                now=now):
+            continue
         anonymize_customer(execute_fn, row["id"])
         count += 1
     return count
@@ -122,7 +126,9 @@ def run(retention_days: int | None = None, customer_retention_days: int | None =
 
         n_conn, n_dns = purge_conn_and_dns_logs(_exec, log_cutoff)
         n_cust = purge_stale_customers(
-            lambda sql, args=(): (cur.execute(sql, args), cur.fetchall())[1], _exec, cust_cutoff)
+            lambda sql, args=(): (cur.execute(sql, args), cur.fetchall())[1],
+            lambda sql, args=(): (cur.execute(sql, args), cur.fetchone())[1],
+            _exec, cust_cutoff, max(retention_days, customer_retention_days))
 
     summary = PurgeSummary(conn_log_deleted=n_conn, dns_log_deleted=n_dns,
                            customers_deleted=n_cust, cutoff_logs=log_cutoff,

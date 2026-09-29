@@ -39,6 +39,11 @@ VOUCHERS = [
 DEVICES = [
     {"mac": "AA:BB:CC:DD:EE:01", "voucher_id": 1},
 ]
+SESSIONS = [
+    {"mac": "AA:BB:CC:DD:EE:01", "ip": "10.10.0.105", "voucher_id": 1,
+     "authenticated_at": datetime(2026, 8, 1, 0, 0),
+     "ended_at": datetime(2026, 8, 3, 0, 0)},
+]
 CONN_LOGS: list[dict] = []
 DNS_LOGS: list[dict] = []
 AUDIT: list[tuple] = []
@@ -48,16 +53,17 @@ def _reset():
     CONN_LOGS.clear()
     DNS_LOGS.clear()
     AUDIT.clear()
+    del SESSIONS[1:]
 
 
-def _lookup_mapping(mac: str, ts: datetime) -> tuple[str | None, str | None]:
-    for d in DEVICES:
-        if d["mac"] != mac:
-            continue
-        v = next((v for v in VOUCHERS if v["id"] == d["voucher_id"]
-                 and v["valid_from"] <= ts <= v["valid_until"]), None)
-        if not v:
-            continue
+def _lookup_mapping(mac: str, ip: str, ts: datetime) -> tuple[str | None, str | None]:
+    candidates = [s for s in SESSIONS if s["mac"] == mac and s["ip"] == ip
+                  and s["authenticated_at"] <= ts
+                  and (s["ended_at"] is None or ts <= s["ended_at"])]
+    if len(candidates) != 1:
+        return None, None
+    v = next((v for v in VOUCHERS if v["id"] == candidates[0]["voucher_id"]), None)
+    if v:
         c = next((c for c in CUSTOMERS if c["id"] == v["customer_id"]), None)
         return v["username"], (c["natid_masked"] if c else None)
     return None, None
@@ -81,8 +87,10 @@ class FakeCursor:
             AUDIT.append(args)
             self.rowcount = 1
         elif "from conn_log cl" in s:
+            assert "portal_session" in s
             self._rows = self._search_conn(s, args)
         elif "from dns_log dl" in s:
+            assert "portal_session" in s
             self._rows = self._search_dns(s, args)
         else:
             raise AssertionError(f"FakeCursor ไม่รู้จัก SQL: {s[:120]}")
@@ -103,7 +111,7 @@ class FakeCursor:
         rows.sort(key=lambda r: r["ts"], reverse=True)
         out = []
         for r in rows[offset:offset + limit]:
-            vu, nm = _lookup_mapping(r["mac"], r["ts"])
+            vu, nm = _lookup_mapping(r["mac"], r["src_ip"], r["ts"])
             out.append(dict(r, voucher_username=vu, natid_masked=nm))
         return out
 
@@ -123,8 +131,9 @@ class FakeCursor:
         rows.sort(key=lambda r: r["ts"], reverse=True)
         out = []
         for r in rows[offset:offset + limit]:
-            vu, nm = _lookup_mapping(r["mac"], r["ts"])
-            out.append(dict(r, voucher_username=vu, natid_masked=nm))
+            vu, nm = _lookup_mapping(r["mac"], r["client_ip"], r["ts"])
+            out.append(dict(r, event_kind=r.get("event_kind", "query"),
+                            voucher_username=vu, natid_masked=nm))
         return out
 
     def fetchone(self):
@@ -224,6 +233,20 @@ def test_search_by_mac_finds_conn_log_rows_and_maps_customer(client):
     assert "11:22:33:44:55:66" not in html  # กรองตาม mac ถูกต้อง ไม่ปนแถวอื่น
     assert "1-2345-XXXXX-XX-3" in html  # mapping ย้อนกลับถึงลูกค้า (masked)
     assert "CAFE-8F3K2" in html
+
+
+def test_overlapping_sessions_do_not_claim_a_person_twice(client):
+    _login_as(client, "admin")
+    CONN_LOGS.append(dict(ts=datetime(2026, 8, 1, 10, 0), mac="AA:BB:CC:DD:EE:01",
+                          src_ip="10.10.0.105", src_port=51322, dst_ip="93.184.216.34",
+                          dst_port=443, proto="tcp", bytes_out=1400, bytes_in=8200))
+    SESSIONS.append(dict(mac="AA:BB:CC:DD:EE:01", ip="10.10.0.105", voucher_id=2,
+                         authenticated_at=datetime(2026, 8, 1, 9, 0), ended_at=None))
+    r = client.get("/logs", query_string={"start": "2026-08-01T00:00", "end": "2026-08-02T00:00"})
+    html = r.get_data(as_text=True)
+    assert html.count("93.184.216.34") == 1
+    assert "ระบุตัวไม่แน่นอน" in html
+    assert "1-2345-XXXXX-XX-3" not in html
 
 
 # ---------------------------------------------------------------- ค้นด้วยโดเมนเจอ (dns_log)
