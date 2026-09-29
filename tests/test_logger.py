@@ -248,6 +248,89 @@ def test_pending_retention_delete_is_an_issue(tmp_path):
     assert {i.kind for i in verify_chain(store, tmp_path)} == {"pending_delete", "missing_file"}
 
 
+# ============ R2-07: issue ของไฟล์หนึ่งต้องไม่บล็อกการลบทั้งหมด และ pending ต้องทำต่อได้
+def _old_archive(directory, name, content=b"old raw log"):
+    path = directory / name
+    path.write_bytes(content)
+    return path
+
+
+def _add_sealed(store, path, prev=None):
+    entry = ManifestEntry(filename=path.name, sha256=sha256_file(path), prev_sha256=prev,
+                          size_bytes=path.stat().st_size, sealed_at=datetime(2026, 1, 2))
+    store.add(entry)
+    return entry.sha256
+
+
+def test_prune_finishes_pending_whose_file_is_already_gone(tmp_path):
+    """unlink สำเร็จแต่ set_deletion('deleted') ล้ม -> รอบถัดไปต้องปิดรายการได้ ไม่ค้างถาวร"""
+    path = _old_archive(tmp_path, "dnsmasq.log-2026-01-01")
+    _add_sealed(store := MemoryManifestStore(), path)
+    store.set_deletion(path.name, "pending")
+    path.unlink()
+
+    assert prune_archives(store, tmp_path, 90, now=datetime(2026, 9, 29)) == 1
+    assert store.all_entries()[0].deletion_state == "deleted"
+    assert verify_chain(store, tmp_path) == []
+
+
+def test_prune_finishes_pending_whose_file_still_exists(tmp_path):
+    path = _old_archive(tmp_path, "dnsmasq.log-2026-01-01")
+    _add_sealed(store := MemoryManifestStore(), path)
+    store.set_deletion(path.name, "pending")   # unlink ล้มในรอบก่อน
+
+    assert prune_archives(store, tmp_path, 90, now=datetime(2026, 9, 29)) == 1
+    assert not path.exists()
+    assert store.all_entries()[0].deletion_state == "deleted"
+
+
+def test_prune_keeps_pending_file_whose_hash_changed(tmp_path):
+    path = _old_archive(tmp_path, "dnsmasq.log-2026-01-01")
+    _add_sealed(store := MemoryManifestStore(), path)
+    store.set_deletion(path.name, "pending")
+    path.write_bytes(b"TAMPERED")
+
+    assert prune_archives(store, tmp_path, 90, now=datetime(2026, 9, 29)) == 0
+    assert path.exists(), "ไฟล์ที่ถูกแก้ต้องเก็บไว้เป็นหลักฐาน"
+    assert store.all_entries()[0].deletion_state == "pending"
+
+
+def test_prune_skips_held_files_but_deletes_the_rest(tmp_path, monkeypatch):
+    from common import audit
+    monkeypatch.setattr(audit, "log_required", lambda *a, **kw: None)
+    a = _old_archive(tmp_path, "dnsmasq.log-2026-01-01", b"a")
+    b = _old_archive(tmp_path, "dnsmasq.log-2026-01-02", b"b")
+    store = MemoryManifestStore()
+    _add_sealed(store, b, _add_sealed(store, a))
+
+    assert prune_archives(store, tmp_path, 90, now=datetime(2026, 9, 29), hold={a.name}) == 1
+    assert a.exists() and not b.exists()
+
+
+def test_prune_continues_after_one_unlink_fails(tmp_path, monkeypatch):
+    from common import audit
+    monkeypatch.setattr(audit, "log_required", lambda *a, **kw: None)
+    a = _old_archive(tmp_path, "dnsmasq.log-2026-01-01", b"a")
+    b = _old_archive(tmp_path, "dnsmasq.log-2026-01-02", b"b")
+    store = MemoryManifestStore()
+    _add_sealed(store, b, _add_sealed(store, a))
+    real_unlink = type(a).unlink
+
+    def flaky_unlink(self, *args, **kw):
+        if self.name == a.name:
+            raise PermissionError("Operation not permitted")
+        return real_unlink(self, *args, **kw)
+    monkeypatch.setattr(type(a), "unlink", flaky_unlink)
+
+    assert prune_archives(store, tmp_path, 90, now=datetime(2026, 9, 29)) == 1
+    states = {e.filename: e.deletion_state for e in store.all_entries()}
+    assert states == {a.name: "pending", b.name: "deleted"}
+
+    monkeypatch.setattr(type(a), "unlink", real_unlink)
+    assert prune_archives(store, tmp_path, 90, now=datetime(2026, 9, 29)) == 1, "รอบถัดไปทำต่อได้"
+    assert verify_chain(store, tmp_path) == []
+
+
 # ---------------------------------------------------------------- netutil
 PROC_NET_ARP_SAMPLE = """IP address       HW type     Flags       HW address            Mask     Device
 10.10.0.105      0x1         0x2         aa:bb:cc:dd:ee:ff     *        eth1
@@ -345,6 +428,51 @@ def test_main_still_reports_when_audit_write_fails(sealed_archive, monkeypatch):
     monkeypatch.setattr(audit, "log", boom)
 
     assert integrity.main() == 1
+
+
+def test_main_still_prunes_other_files_when_one_file_was_tampered(tmp_path, monkeypatch):
+    """R2-07: เดิม return 1 ก่อนถึง prune -- ไฟล์เดียวที่ถูกแก้ทำให้ไม่มีอะไรถูกลบตามอายุอีกเลย"""
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    tampered = _old_archive(archive, "dnsmasq.log-2026-01-01", b"a")
+    expired = _old_archive(archive, "dnsmasq.log-2026-01-02", b"b")
+    store = MemoryManifestStore()
+    _add_sealed(store, expired, _add_sealed(store, tampered))
+    tampered.write_bytes(b"TAMPERED")
+
+    import common.audit as audit
+    logged = []
+    monkeypatch.setattr(audit, "log", lambda action, **kw: logged.append((action, kw)))
+    monkeypatch.setattr(audit, "log_required", lambda *a, **kw: None)
+    monkeypatch.setattr(integrity, "SqlManifestStore", lambda: store)
+    monkeypatch.setenv("LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("LOG_RETENTION_DAYS", "90")
+
+    assert integrity.main() == 1, "ยังต้องคืน 1 เพราะมีไฟล์ถูกแก้"
+    assert tampered.exists(), "ไฟล์ที่ถูกแก้ต้องเก็บไว้เป็นหลักฐาน"
+    assert not expired.exists(), "ไฟล์อื่นที่ครบอายุและ hash ตรงต้องถูกลบตามปกติ"
+    assert [kw["target"] for _, kw in logged] == [tampered.name]
+
+
+def test_main_resolves_stuck_pending_delete_and_exits_clean(tmp_path, monkeypatch):
+    """R2-07 deadlock: pending_delete เคยเป็น issue -> prune ไม่รัน -> ค้างถาวร"""
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    stuck = _old_archive(archive, "dnsmasq.log-2026-01-01")
+    store = MemoryManifestStore()
+    _add_sealed(store, stuck)
+    store.set_deletion(stuck.name, "pending")
+    stuck.unlink()
+
+    import common.audit as audit
+    logged = []
+    monkeypatch.setattr(audit, "log", lambda action, **kw: logged.append((action, kw)))
+    monkeypatch.setattr(integrity, "SqlManifestStore", lambda: store)
+    monkeypatch.setenv("LOG_DIR", str(tmp_path))
+
+    assert integrity.main() == 0
+    assert logged == [], "pending ที่ทำต่อจนเสร็จแล้วไม่ต้องฟ้องเป็น integrity_failed"
+    assert store.all_entries()[0].deletion_state == "deleted"
 
 
 # ===================== N25: logrotate (delaycompress) บีบอัดไฟล์ที่ผนึกแล้วเป็น .gz ในรอบถัดไป

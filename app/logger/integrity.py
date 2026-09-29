@@ -226,10 +226,48 @@ def verify_chain(store: ManifestStore, directory: Path) -> list[IntegrityIssue]:
 
 _ARCHIVE_DATE = re.compile(r"\.log-(\d{4}-\d{2}-\d{2})(?:\.gz)?$")
 
+# R2-07: issue ที่ prune แก้ต่อเองได้ ไม่ต้องกันไฟล์นั้นไว้ -- pending_delete คือการลบที่ค้างกลางทาง
+# (ตัดสินใจลบและบันทึก audit ไปแล้ว) และ missing_file ของรายการ pending ก็คือ unlink สำเร็จแต่
+# บันทึก 'deleted' ไม่ทัน ส่วน missing_file ของรายการ active นั้น prune ข้ามอยู่แล้วเพราะไม่มีไฟล์ให้ลบ
+_RESUMABLE_KINDS = frozenset({"pending_delete", "missing_file"})
+
+
+def _archive_path(directory: Path, filename: str) -> Path:
+    path = directory / filename
+    if not path.exists() and (directory / (filename + ".gz")).exists():
+        path = directory / (filename + ".gz")
+    return path
+
+
+def _unlink_archive(path: Path) -> None:
+    try:
+        subprocess.run(["chattr", "-a", str(path)], capture_output=True, check=False)
+    except OSError:
+        log.warning("ไม่พบ chattr — ลองลบไฟล์ตามสิทธิ์ของ filesystem")
+    path.unlink()
+
+
+def _finish_pending(store: ManifestStore, entry: ManifestEntry, path: Path) -> bool:
+    """R2-07: ทำการลบที่ค้าง (pending) ให้เสร็จ — เดิมไม่มีทางกลับมาทำต่อ เพราะ prune ข้ามรายการ
+    ที่ไม่ใช่ active และ main() ไม่เรียก prune เลยเมื่อ verify เจอ pending_delete (deadlock)"""
+    if path.exists():
+        if sha256_file(path) != entry.sha256:
+            log.error("ไม่ลบ %s ต่อ: hash ไม่ตรงกับที่ผนึกไว้ เก็บไว้เป็นหลักฐาน", entry.filename)
+            return False
+        _unlink_archive(path)
+    store.set_deletion(entry.filename, "deleted")
+    log.info("ลบ %s ที่ค้างจากรอบก่อนเสร็จแล้ว", entry.filename)
+    return True
+
 
 def prune_archives(store: ManifestStore, directory: Path, retention_days: int,
-                   now: datetime | None = None) -> int:
-    """ลบเฉพาะไฟล์ที่ผนึกแล้ว ครบอายุ และ hash ยังตรง; ทิ้ง pending หากลบค้าง."""
+                   now: datetime | None = None, hold: frozenset[str] | set[str] = frozenset()) -> int:
+    """ลบเฉพาะไฟล์ที่ผนึกแล้ว ครบอายุ และ hash ยังตรง; ทำรายการ pending ที่ลบค้างจากรอบก่อนให้เสร็จ
+
+    hold = ชื่อไฟล์ที่ verify_chain ฟ้องปัญหาที่ต้องเก็บไว้เป็นหลักฐาน (เช่น chain_broken) — ข้ามเฉพาะ
+    ไฟล์เหล่านั้น ไฟล์อื่นที่ครบอายุยังลบได้ตามปกติ (R2-07) ถ้าไฟล์หนึ่งลบไม่สำเร็จจะไม่หยุดทั้งรอบ
+    รายการนั้นจะค้างเป็น pending ให้รอบถัดไปทำต่อ
+    """
     if retention_days < 90:
         raise ValueError("LOG_RETENTION_DAYS ต้องไม่น้อยกว่า 90")
     cutoff = (now or datetime.now()).date() - timedelta(days=retention_days)
@@ -238,32 +276,50 @@ def prune_archives(store: ManifestStore, directory: Path, retention_days: int,
         if Path(entry.filename).name != entry.filename:
             log.error("manifest filename ไม่ปลอดภัย: %r", entry.filename)
             continue
-        match = _ARCHIVE_DATE.search(entry.filename)
-        if not match or entry.deletion_state != "active" or date.fromisoformat(match[1]) >= cutoff:
+        if entry.filename in hold:
+            log.warning("ไม่ลบ %s: มีปัญหา integrity ค้างอยู่ เก็บไว้เป็นหลักฐาน", entry.filename)
             continue
-        if entry.sealed_at and entry.sealed_at.date() >= cutoff:
-            continue
-        path = directory / entry.filename
-        if not path.exists() and (directory / (entry.filename + ".gz")).exists():
-            path = directory / (entry.filename + ".gz")
-        if not path.exists() or sha256_file(path) != entry.sha256:
-            log.error("ไม่ลบ %s: ไฟล์หายหรือ hash ไม่ตรง", entry.filename)
-            continue
-        from common import audit
-        audit.log_required("raw_log_delete", target=entry.filename,
-                           detail=f"sha256={entry.sha256} retention_days={retention_days}")
-        store.set_deletion(entry.filename, "pending")
+        path = _archive_path(directory, entry.filename)
         try:
-            subprocess.run(["chattr", "-a", str(path)], capture_output=True, check=False)
-        except OSError:
-            log.warning("ไม่พบ chattr — ลองลบไฟล์ตามสิทธิ์ของ filesystem")
-        path.unlink()
-        store.set_deletion(entry.filename, "deleted")
-        count += 1
+            if entry.deletion_state == "pending":
+                count += _finish_pending(store, entry, path)
+                continue
+            match = _ARCHIVE_DATE.search(entry.filename)
+            if not match or entry.deletion_state != "active" or date.fromisoformat(match[1]) >= cutoff:
+                continue
+            if entry.sealed_at and entry.sealed_at.date() >= cutoff:
+                continue
+            if not path.exists() or sha256_file(path) != entry.sha256:
+                log.error("ไม่ลบ %s: ไฟล์หายหรือ hash ไม่ตรง", entry.filename)
+                continue
+            from common import audit
+            audit.log_required("raw_log_delete", target=entry.filename,
+                               detail=f"sha256={entry.sha256} retention_days={retention_days}")
+            store.set_deletion(entry.filename, "pending")
+            _unlink_archive(path)
+            store.set_deletion(entry.filename, "deleted")
+            count += 1
+        except Exception:
+            log.exception("ลบ %s ไม่สำเร็จ — รอบถัดไปจะลองใหม่", entry.filename)
     return count
 
 
-def main() -> int:  # pragma: no cover
+def _report_issues(issues: list[IntegrityIssue]) -> None:
+    # N21: ต้องบันทึกลง audit_log ในฐานข้อมูลด้วย ไม่ใช่แค่ log ไฟล์ -- ถ้าคนร้ายแก้ไฟล์
+    # log ได้ ก็ย่อมลบบรรทัด ERROR ในไฟล์ log ทิ้งได้เหมือนกัน หลักฐานว่า "ตรวจพบการแก้ไข"
+    # จึงต้องอยู่คนละที่กับสิ่งที่ถูกแก้ และ ExecStart= ของ cafe-maintenance ใช้ `-` นำหน้า
+    # (ยอมให้ fail ได้) exit code 1 จึงถูกกลืน ไม่มีใครรู้เรื่องเลยถ้าไม่บันทึกตรงนี้
+    for i in issues:
+        log.error("[%s] %s: %s", i.kind, i.filename, i.detail)
+        try:
+            from common import audit
+            audit.log(audit.INTEGRITY_FAILED, target=i.filename,
+                     detail=f"kind={i.kind} {i.detail}")
+        except Exception:  # DB ล่มก็ยังต้องรายงานผ่าน log ไฟล์ให้ได้ ห้าม crash ทิ้ง
+            log.exception("บันทึก audit_log ไม่สำเร็จ — ยังเหลือร่องรอยแค่ใน log ไฟล์เท่านั้น")
+
+
+def main() -> int:
     logging.basicConfig(level=logging.INFO)
     log_dir = Path(os.environ.get("LOG_DIR", "/var/log/cafe-wifi"))
     archive_dir = log_dir / "archive"
@@ -273,22 +329,28 @@ def main() -> int:  # pragma: no cover
     log.info("ผนึกไฟล์ใหม่ %d ไฟล์", len(sealed))
 
     issues = verify_chain(store, archive_dir)
+    # R2-07: เดิม return 1 ก่อนถึง prune เมื่อเจอ issue ใดก็ได้ -- ไฟล์เดียวที่ hash ไม่ตรง (ต้องเก็บไว้
+    # เป็นหลักฐาน) ทำให้ไม่มีไฟล์ไหนถูกลบตามอายุอีกเลยจนดิสก์เต็ม ตอนนี้กันไว้เฉพาะไฟล์ที่มีปัญหา
+    hold = {i.filename for i in issues if i.kind not in _RESUMABLE_KINDS}
+    prune_failed = False
+    try:
+        deleted = prune_archives(store, archive_dir,
+                                 int(os.environ.get("LOG_RETENTION_DAYS", "180")), hold=hold)
+        log.info("ลบ raw log ที่ครบอายุและตรวจ hash แล้ว %d ไฟล์", deleted)
+    except Exception:
+        log.exception("ลบ raw log ตามอายุไม่สำเร็จ")
+        deleted, prune_failed = 0, True
+    if deleted:
+        # pending ที่ prune ทำต่อจนเสร็จรอบนี้ ไม่ต้องฟ้องซ้ำ
+        state = {e.filename: e.deletion_state for e in store.all_entries()}
+        issues = [i for i in issues
+                  if not (i.kind in _RESUMABLE_KINDS and state.get(i.filename) == "deleted")]
+
     if issues:
-        # N21: ต้องบันทึกลง audit_log ในฐานข้อมูลด้วย ไม่ใช่แค่ log ไฟล์ -- ถ้าคนร้ายแก้ไฟล์
-        # log ได้ ก็ย่อมลบบรรทัด ERROR ในไฟล์ log ทิ้งได้เหมือนกัน หลักฐานว่า "ตรวจพบการแก้ไข"
-        # จึงต้องอยู่คนละที่กับสิ่งที่ถูกแก้ และ ExecStart= ของ cafe-maintenance ใช้ `-` นำหน้า
-        # (ยอมให้ fail ได้) exit code 1 จึงถูกกลืน ไม่มีใครรู้เรื่องเลยถ้าไม่บันทึกตรงนี้
-        for i in issues:
-            log.error("[%s] %s: %s", i.kind, i.filename, i.detail)
-            try:
-                from common import audit
-                audit.log(audit.INTEGRITY_FAILED, target=i.filename,
-                         detail=f"kind={i.kind} {i.detail}")
-            except Exception:  # DB ล่มก็ยังต้องรายงานผ่าน log ไฟล์ให้ได้ ห้าม crash ทิ้ง
-                log.exception("บันทึก audit_log ไม่สำเร็จ — ยังเหลือร่องรอยแค่ใน log ไฟล์เท่านั้น")
+        _report_issues(issues)
         return 1
-    deleted = prune_archives(store, archive_dir, int(os.environ.get("LOG_RETENTION_DAYS", "180")))
-    log.info("ลบ raw log ที่ครบอายุและตรวจ hash แล้ว %d ไฟล์", deleted)
+    if prune_failed:
+        return 1
     log.info("ตรวจสาย hash chain ผ่านทั้งหมด (%d ไฟล์)", len(store.all_entries()))
     return 0
 
