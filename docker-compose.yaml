@@ -1,0 +1,125 @@
+name: cafe-wifi-docker-test
+
+x-python-runtime: &python-runtime
+  image: cafe-wifi:docker-test
+  build:
+    context: .
+    target: runtime
+  env_file:
+    - docker/test.env
+  depends_on:
+    db:
+      condition: service_healthy
+
+services:
+  db:
+    image: mariadb:11.4
+    env_file:
+      - docker/test.env
+    volumes:
+      - db-data:/var/lib/mysql
+      - ./sql/001_schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
+      - ./sql/005_bypass_alert.sql:/docker-entrypoint-initdb.d/005_bypass_alert.sql:ro
+      - ./sql/006_drop_totp.sql:/docker-entrypoint-initdb.d/006_drop_totp.sql:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  admin:
+    <<: *python-runtime
+    command:
+      - sh
+      - -ec
+      - |
+        mkdir -p "$$ETC_DIR"
+        if [ ! -e "$$ETC_DIR/.initialized" ]; then
+          printf '%s\n' "$$DOCKER_SETUP_TOKEN" > "$$ETC_DIR/setup.token"
+          touch "$$ETC_DIR/.initialized"
+        fi
+        exec gunicorn --bind 0.0.0.0:8000 --workers 2 admin.app:app
+    volumes:
+      - test-logs:/var/log/cafe-wifi
+      - test-etc:/tmp/cafe-wifi
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  fas:
+    <<: *python-runtime
+    command: ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "2", "fas.app:app"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  proxy:
+    image: caddy:2-alpine
+    depends_on:
+      admin:
+        condition: service_healthy
+      fas:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8443:8443"
+    volumes:
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+  tests:
+    <<: *python-runtime
+    profiles: ["test"]
+    image: cafe-wifi:docker-test-pytest
+    build:
+      context: .
+      target: test
+    command: ["pytest", "tests/", "-v"]
+    restart: "no"
+
+  jobs:
+    <<: *python-runtime
+    profiles: ["jobs"]
+    command: ["python", "-m", "tools.purge_old_data"]
+    restart: "no"
+    volumes:
+      - test-logs:/var/log/cafe-wifi
+      - test-backups:/var/backups/cafe-wifi
+
+  dns-collector:
+    <<: *python-runtime
+    profiles: ["dns"]
+    command:
+      - sh
+      - -ec
+      - |
+        touch /var/log/cafe-wifi/dnsmasq.log
+        exec python -m logger.dns_collector
+    volumes:
+      - test-logs:/var/log/cafe-wifi
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os; p='/var/log/cafe-wifi/dnsmasq.log'; assert any(os.path.realpath('/proc/1/fd/'+f)==p for f in os.listdir('/proc/1/fd'))"
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 5s
+
+volumes:
+  db-data:
+  test-logs:
+  test-etc:
+  test-backups:
+  caddy-data:
+  caddy-config:

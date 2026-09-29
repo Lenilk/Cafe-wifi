@@ -1,0 +1,18 @@
+{
+    skip_install_trust
+}
+
+http://:8080 {
+    reverse_proxy fas:8000 {
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+    }
+}
+
+https://localhost:8443 {
+    tls internal
+    reverse_proxy admin:8000 {
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+    }
+}

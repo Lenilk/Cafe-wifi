@@ -50,6 +50,8 @@ pip install pytest
 PYTHONPATH=app pytest tests/ -v
 ```
 
+สำหรับชุดทดสอบ Docker ที่มี MariaDB, Admin/FAS ผ่าน proxy, งาน CLI และ DNS collector ดู [วิธีใช้ Docker Compose](docs/docker-test.md)
+
 ## ถอนการติดตั้ง
 
 ```bash
