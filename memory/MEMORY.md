@@ -9,3 +9,4 @@
 - [Pi macvlan/bcmgenet issue (closed)](pi-macvlan-bcmgenet-open-issue.md) — CLOSED: broadcast UDP was never broken; the real cause was our own nftables input policy dropping DHCPDISCOVER from 0.0.0.0. Keeps the ruled-out theories and the tcpdump-pairing lesson
 - [Aruba lab switch](aruba-lab-switch.md) — 2026-09-19 moved to Aruba CX 6100 + AP-515 for PoE; console/login facts, SSID must be Network-assigned (never VC-assigned/NAT)
 - [Two-machine workflow](two-machine-workflow.md) — โน้ตบุ๊ก = ทดลองกับของจริง, เดสก์ท็อป = ทำเอกสารอย่างเดียว; หลักฐานไหลทางเดียวผ่าน git (memory/, docs/, ข้อมูลทดสอบ/) ส่วนไฟล์เล่มต้องหิ้วเอง
+- [Single Pi, single cable](single-pi-single-cable-constraint.md) — design constraint: one Pi plugged into the café router by one LAN cable; never propose separate mgmt interface/VLAN; secure SSH/Admin via auth (SSH keys planned), IPv6 drop, WireGuard
