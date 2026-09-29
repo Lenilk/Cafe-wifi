@@ -26,6 +26,7 @@ from flask import (Flask, abort, flash, g, redirect, render_template,
 from common import audit, crypto
 from common.customer import PURGED_MARK, anonymize_customer, retention_hold_until
 from common.db import execute, get_conn, query_all, query_one
+from common.log_mapping import conn_mapping_join, dns_mapping_join
 from common.qr import voucher_qr_svg
 from logger.integrity import SqlManifestStore, verify_chain
 
@@ -595,24 +596,8 @@ def erase_customer(cid: int):
 # ใน tools/export_evidence.py) -- หน้านี้ค้น conn_log/dns_log ผ่านเว็บได้จริง
 LOGS_PAGE_SIZE = 50
 
-# mapping ย้อนกลับ conn_log.mac / dns_log.mac -> device -> voucher -> customer -- join ตาม mac
-# แล้วจับคู่ voucher ที่ valid_from..valid_until ครอบคลุม ts ของแถว log นั้น ๆ (ไม่ใช่แค่ join
-# ตาม mac เฉย ๆ) เพราะ MAC เดียวกันใช้กับ voucher คนละใบคนละช่วงเวลาได้จริง (device.mac ไม่ได้
-# unique ทั้งตาราง มีแค่ unique (voucher_id, mac)) -- ถ้า join แค่ mac เฉย ๆ จะได้ผลลัพธ์ผิดคน
-# เมื่อ MAC ถูกนำกลับมาใช้ซ้ำข้ามช่วงเวลา ส่วน c.natid_masked มาจากคอลัมน์ที่เก็บค่า mask ไว้แล้ว
-# ใน DB (ไม่เคย SELECT natid_enc/natid_hash ในหน้านี้เลย) จึงไม่มีทางเห็นเลขเต็มไม่ว่า role ไหน
-# ตรงตาม §6.2 ข้อ 5 -- role staff จะเห็นแบบเดียวกับ admin ในหน้านี้เป๊ะ (เหมือนหน้า /customers เดิม)
-# R2-02: conn_log.ts คือเวลาจบ connection (DESTROY) ซึ่งอาจเลยช่วง session ของเจ้าของไปแล้ว
-# จึงจับคู่ด้วยเวลาเริ่ม ({tsexpr} = COALESCE(cl.started_at, cl.ts)) ส่วน dns_log ใช้ ts ตรง ๆ
-_MAPPING_JOIN = (
-    " LEFT JOIN portal_session ps ON ps.id = ("
-    " SELECT CASE WHEN COUNT(*)=1 THEN MAX(s.id) END FROM portal_session s"
-    " WHERE s.mac={alias}.mac AND s.ip={alias}.{ipfield}"
-    " AND s.authenticated_at <= {tsexpr}"
-    " AND (s.ended_at IS NULL OR {tsexpr} <= s.ended_at))"
-    " LEFT JOIN voucher v ON v.id=ps.voucher_id"
-    " LEFT JOIN customer c ON c.id=v.customer_id"
-)
+# JOIN ย้อนกลับ log -> voucher/customer อยู่ใน common/log_mapping.py (R2-10: ใช้ร่วมกับ
+# tools/export_evidence.py เพื่อให้หน้าเว็บกับไฟล์หลักฐานจับคู่ตัวบุคคลแบบเดียวกันเป๊ะ)
 
 
 @app.get("/logs")
@@ -654,8 +639,7 @@ def search_logs():
     if log_type == "dns":
         sql = ("SELECT dl.ts, dl.client_ip, dl.mac, dl.qname, dl.qtype, dl.answer, dl.event_kind, "
               "v.username AS voucher_username, c.natid_masked "
-              "FROM dns_log dl" + _MAPPING_JOIN.format(alias="dl", ipfield="client_ip",
-                                                        tsexpr="dl.ts") +
+              "FROM dns_log dl" + dns_mapping_join() +
               " WHERE dl.ts BETWEEN %s AND %s")
         params: list = [start, end]
         if mac:
@@ -667,8 +651,7 @@ def search_logs():
     else:
         sql = ("SELECT cl.ts, cl.started_at, cl.mac, cl.src_ip, cl.src_port, cl.dst_ip, cl.dst_port, cl.proto, "
               "cl.bytes_out, cl.bytes_in, v.username AS voucher_username, c.natid_masked "
-              "FROM conn_log cl" + _MAPPING_JOIN.format(alias="cl", ipfield="src_ip",
-                                                         tsexpr="COALESCE(cl.started_at, cl.ts)") +
+              "FROM conn_log cl" + conn_mapping_join() +
               " WHERE cl.ts BETWEEN %s AND %s")
         params = [start, end]
         if mac:

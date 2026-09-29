@@ -2,6 +2,8 @@
 import contextlib
 import hashlib
 import json
+import os
+import stat
 from datetime import datetime, timedelta
 
 import pytest
@@ -239,3 +241,118 @@ def test_single_day_export_range_is_valid():
     from datetime import datetime as _dt
     start = _dt.fromisoformat("2026-09-20")
     assert export_evidence.parse_range_end("2026-09-20") > start
+
+
+# ============ R2-10: ไฟล์ส่งออกหลักฐานต้องโยงถึงตัวบุคคลได้ และ --natid ต้องใช้ได้จริง
+def test_cli_accepts_natid_documented_in_docstring():
+    """docstring บอกว่าใช้ --natid ได้ แต่ argparse เดิมไม่มีตัวเลือกนี้ (รันแล้ว error)"""
+    args = export_evidence.build_parser().parse_args(
+        ["--natid", "1234567890121", "--from", "2026-08-01", "--to", "2026-08-22"])
+    assert args.natid == "1234567890121" and args.mac is None
+
+
+def test_cli_rejects_mac_and_natid_together():
+    with pytest.raises(SystemExit):
+        export_evidence.build_parser().parse_args(
+            ["--mac", "AA:BB:CC:DD:EE:01", "--natid", "1234567890121",
+             "--from", "2026-08-01", "--to", "2026-08-22"])
+
+
+def test_csv_fields_include_identity_columns():
+    for fields in (export_evidence.CONN_FIELDS, export_evidence.DNS_FIELDS):
+        assert "voucher_username" in fields and "natid_masked" in fields
+
+
+def test_queries_use_same_mapping_join_as_logs_page():
+    from common.log_mapping import conn_mapping_join, dns_mapping_join
+    conn_sql, _ = export_evidence.build_conn_query(datetime(2026, 8, 1), datetime(2026, 8, 2))
+    dns_sql, _ = export_evidence.build_dns_query(datetime(2026, 8, 1), datetime(2026, 8, 2))
+    assert conn_mapping_join() in conn_sql
+    assert dns_mapping_join() in dns_sql
+    for sql in (conn_sql, dns_sql):
+        assert "natid_enc" not in sql and "natid_hash" not in sql, "ห้ามดึงเลขบัตรเต็มหรือ hash"
+
+
+def test_customer_query_filters_by_session_mac_ip_and_customer():
+    s, e = datetime(2026, 8, 1), datetime(2026, 8, 2)
+    sql, params = export_evidence.build_conn_query(s, e, mac="AA:BB:CC:DD:EE:01",
+                                                   ip="10.10.0.105", customer_id=7)
+    assert "cl.mac = %s" in sql and "cl.src_ip = %s" in sql and "c.id = %s" in sql
+    assert params == (s, e, "AA:BB:CC:DD:EE:01", "10.10.0.105", 7)
+
+
+def test_query_customer_rows_merges_every_session_pair_sorted():
+    calls = []
+    pairs = [{"mac": "AA:BB:CC:DD:EE:01", "ip": "10.10.0.105"},
+             {"mac": "AA:BB:CC:DD:EE:02", "ip": "10.10.0.77"}]
+    per_pair = {
+        "AA:BB:CC:DD:EE:01": [{"ts": datetime(2026, 8, 1, 12)}],
+        "AA:BB:CC:DD:EE:02": [{"ts": datetime(2026, 8, 1, 9)}],
+    }
+
+    def fake_query_all(sql, params):
+        calls.append((sql, params))
+        if "DISTINCT ps.mac" in sql:
+            assert params[0] == 7
+            return pairs
+        return per_pair[params[2]]
+
+    rows = export_evidence.query_customer_rows(export_evidence.build_dns_query, 7,
+                                               datetime(2026, 8, 1), datetime(2026, 8, 2),
+                                               fake_query_all)
+    assert [r["ts"].hour for r in rows] == [9, 12]
+    assert all(p[-1] == 7 for _, p in calls[1:]), "ทุกคิวรี่ต้องกรอง c.id ของลูกค้ารายนี้"
+
+
+def test_find_customer_uses_hash_and_rejects_bad_checksum():
+    from common import crypto
+    seen = []
+    row = export_evidence.find_customer(
+        "0-0000-00000-00-1", lambda sql, p: seen.append(p) or {"id": 3, "natid_masked": "x"})
+    assert row["id"] == 3
+    assert seen == [(crypto.natid_hash("0000000000001"),)]
+    with pytest.raises(ValueError):
+        export_evidence.find_customer("1234567890123", lambda *a: None)
+
+
+def test_mac_is_normalized_to_uppercase():
+    """DB เก็บ MAC ตัวใหญ่ -- เดิมใส่ aa:bb:… แล้วได้ 0 แถวเงียบ ๆ"""
+    assert export_evidence.normalize_mac(" aa-bb-cc-dd-ee-01 ") == "AA:BB:CC:DD:EE:01"
+    assert export_evidence.normalize_mac(None) is None
+    with pytest.raises(ValueError):
+        export_evidence.normalize_mac("not-a-mac")
+
+
+def test_export_passes_normalized_mac_and_records_customer(tmp_path, monkeypatch):
+    from common import audit
+    audit_targets = []
+    monkeypatch.setattr(audit, "log_required", lambda *a, **kw: audit_targets.append(kw["target"]))
+    seen_mac = []
+    result = export_evidence.export(
+        "aa:bb:cc:dd:ee:01", datetime(2026, 8, 1), datetime(2026, 8, 2), tmp_path,
+        lambda mac, s, e: seen_mac.append(mac) or [], lambda *a: [])
+    assert seen_mac == ["AA:BB:CC:DD:EE:01"]
+
+    result = export_evidence.export(
+        None, datetime(2026, 8, 1), datetime(2026, 8, 2), tmp_path, lambda *a: [], lambda *a: [],
+        customer={"id": 7, "natid_masked": "1-2345-XXXXX-XX-3"})
+    manifest = json.loads(result["manifest_path"].read_text(encoding="utf-8"))
+    assert manifest["criteria"]["customer_id"] == 7
+    assert manifest["criteria"]["natid_masked"] == "1-2345-XXXXX-XX-3"
+    assert audit_targets == ["AA:BB:CC:DD:EE:01", "customer:7"]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="สิทธิ์ไฟล์แบบ POSIX")
+def test_exported_files_are_private(tmp_path, monkeypatch):
+    from common import audit
+    monkeypatch.setattr(audit, "log_required", lambda *a, **kw: None)
+    old = os.umask(0o022)
+    try:
+        result = export_evidence.export(None, datetime(2026, 8, 1), datetime(2026, 8, 2),
+                                        tmp_path / "exports", lambda *a: SAMPLE_CONN,
+                                        lambda *a: SAMPLE_DNS)
+    finally:
+        os.umask(old)
+    for path in (result["conn_file"].path, result["dns_file"].path, result["manifest_path"]):
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600, path.name
+    assert stat.S_IMODE((tmp_path / "exports").stat().st_mode) == 0o700
