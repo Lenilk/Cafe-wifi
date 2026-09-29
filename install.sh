@@ -1121,6 +1121,11 @@ table inet filter {
     ct state invalid drop
     iif lo accept
 
+    # R2-03: ระบบใช้ IPv4 อย่างเดียว กฎกัน SSH/Admin ด้านล่างเทียบด้วย ip saddr ซึ่งไม่ match
+    # แพ็กเก็ต IPv6 เลย ถ้าไม่ drop ตรงนี้ ลูกค้าบน L2 เดียวกันจะเข้าถึงพอร์ตที่ฟังบน :: (เช่น
+    # sshd) ผ่าน link-local fe80:: ได้ -- วางหลัง iif lo เพื่อให้ ::1 ภายในเครื่องยังใช้ได้
+    meta nfproto ipv6 drop
+
     ip protocol icmp icmp type { echo-request, destination-unreachable, time-exceeded } limit rate 10/second accept
 
     # N41: echo-reply จากวง uplink ถูกทำเป็น notrack (ดูหมายเหตุที่ table ip raw ด้านล่าง)
