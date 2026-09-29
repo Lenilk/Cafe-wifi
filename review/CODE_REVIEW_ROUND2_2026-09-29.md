@@ -32,9 +32,10 @@
 | R2-08 | ✅ แก้แล้ว | `5c80836` | ควรดู `/logs` ว่า DNS query ชุดแรกหลัง login โยงหาลูกค้าได้ และเวลา `authenticated_at` ตรงกับ `session_start` ใน `ndsctl json` |
 | R2-10 | ✅ แก้แล้ว | `93f8ef1` | ควรลอง `--natid` กับลูกค้าที่มี session จริง และ `ls -l` ว่าไฟล์เป็น `-rw-------` |
 | R2-06 | ✅ แก้แล้ว | `17b2641` | ต้องรัน `install.sh` ใหม่ (unit เปลี่ยน) แล้ว `systemctl restart cafe-logger` ระหว่างมีทราฟฟิก และดูว่ามีไฟล์ `collector-*.json` กับ `collector-dns.offset.json` ใน `/var/log/cafe-wifi` |
-| R2-07, R2-L01 ถึง R2-L06 | ⏳ ยังไม่ได้แก้ | — | — |
+| R2-07 | ✅ แก้แล้ว | `47ba1d5` | ควรดู `journalctl -u cafe-maintenance` หลังรอบ 03:30 ว่ามีบรรทัด "ลบ raw log ที่ครบอายุ…" แม้มี issue อื่นค้าง |
+| R2-L01 ถึง R2-L06 | ⏳ ยังไม่ได้แก้ | — | — |
 
-ชุดทดสอบหลังแก้ R2-01: `PYTHONPATH=app pytest -q tests` → **297 passed** · หลังแก้ R2-10 → **320 passed** · หลังแก้ R2-06 → **332 passed**
+ชุดทดสอบหลังแก้ R2-01: `PYTHONPATH=app pytest -q tests` → **297 passed** · หลังแก้ R2-10 → **320 passed** · หลังแก้ R2-06 → **332 passed** · หลังแก้ R2-07 → **339 passed**
 
 ### ระดับความสำคัญ
 
@@ -237,6 +238,14 @@ return redirect(nxt if nxt.startswith("/") else url_for("dashboard"))
 - เกิด deadlock ได้: ถ้าการลบค้างกลางทาง (`set_deletion('pending')` สำเร็จ แต่ `unlink` หรือ `set_deletion('deleted')` ล้ม) รายการนั้นเป็น `pending_delete` ซึ่งนับเป็น issue → prune ไม่รัน และ prune เองก็ข้ามรายการที่ไม่ใช่ `active` → ไม่มีทางกลับไปทำให้เสร็จ
 
 **แก้:** แยกประเภท issue — `pending_delete` ให้ prune รอบถัดไปทำต่อได้ (ถ้าไฟล์หายแล้วให้ตั้ง `deleted`, ถ้ายังอยู่และ hash ตรงให้ลบต่อ) ส่วน issue ของไฟล์หนึ่งไม่ควรบล็อกการลบไฟล์อื่นที่ hash ตรงและครบอายุ แค่รายงาน/audit และให้ exit code ไม่ใช่ 0 ต่อไป ร่วมกับ `check_disk` ที่มีอยู่แล้ว
+
+> **สถานะ: ✅ แก้แล้ว (`47ba1d5`)**
+>
+> - `main()` ไม่ return ก่อนถึง prune แล้ว — ไฟล์ที่มี issue ซึ่งต้องเก็บเป็นหลักฐาน (`hash_mismatch`, `chain_broken`, `unexpected_file`, `invalid_filename`) ถูกส่งเป็น `hold` ให้ prune ข้ามเฉพาะไฟล์นั้น ไฟล์อื่นที่ครบอายุและ hash ตรงยังลบตามปกติ · exit code ยังเป็น 1 และบันทึก `integrity_failed` ลง audit_log ตามเดิม
+> - `prune_archives` ทำรายการ `pending` ที่ค้างให้เสร็จ: ไฟล์หายแล้ว → ตั้ง `deleted` · ไฟล์ยังอยู่และ hash ตรง → ลบต่อ · hash ไม่ตรง → ไม่ลบ ค้าง `pending` ไว้ให้ตรวจ (ไม่บันทึก `raw_log_delete` ซ้ำ เพราะบันทึกไปแล้วก่อนตั้ง `pending`)
+> - ไฟล์หนึ่งลบไม่สำเร็จ (เช่น `chattr -a` ใช้ไม่ได้, DB ล่มกลางทาง) ไม่หยุดทั้งรอบแล้ว รายการนั้นค้างเป็น `pending` ให้รอบถัดไปทำต่อ
+> - `pending_delete`/`missing_file` ของรายการที่ prune ปิดได้ในรอบเดียวกันไม่ถูกฟ้องเป็น `integrity_failed` — deadlock เดิมจึงหายเองในรอบ 03:30 ถัดไปโดยไม่ต้องแก้ DB มือ
+> - เทสต์ใหม่ 7 เคสใน `tests/test_logger.py` (6 เคสล้มกับโค้ดเดิม) — ชุดทดสอบทั้งหมด **339 passed**
 
 ---
 
