@@ -24,11 +24,12 @@ DEVICES: list[dict] = []
 SESSIONS: list[dict] = []
 AUDIT: list[tuple] = []
 FAS_CONTEXTS: dict[str, dict] = {}
+CLAIMS: dict[str, int | None] = {}
 _ids = {"customer": 0, "device": 0, "session": 0}
 
 
 def _reset():
-    VOUCHERS.clear(); CUSTOMERS.clear(); DEVICES.clear(); SESSIONS.clear(); AUDIT.clear(); FAS_CONTEXTS.clear()
+    VOUCHERS.clear(); CUSTOMERS.clear(); DEVICES.clear(); SESSIONS.clear(); AUDIT.clear(); FAS_CONTEXTS.clear(); CLAIMS.clear()
     _ids.update(customer=0, device=0, session=0)
 
 
@@ -72,6 +73,16 @@ class FakeCursor:
             self._rows = [row] if row else []
         elif s.startswith("select id from voucher where id=%s for update"):
             self._rows = [{"id": args[0]}]
+        elif s.startswith("select id from portal_session where mac=%s and state='pending' for update"):
+            self._rows = [{"id": sess["id"]} for sess in SESSIONS
+                          if sess["mac"] == args[0] and sess["state"] == "pending"]
+        elif s.startswith("insert ignore into pending_mac_claim"):
+            self.rowcount = int(args[0] not in CLAIMS)
+            if self.rowcount:
+                CLAIMS[args[0]] = None
+        elif s.startswith("update pending_mac_claim set portal_session_id"):
+            CLAIMS[args[1]] = args[0]
+            self.rowcount = 1
         elif s.startswith("select count(*) as n from ("):
             vid = args[0]
             macs = {d["mac"] for d in DEVICES if d["voucher_id"] == vid}
@@ -228,17 +239,18 @@ def test_username_is_case_insensitive(client):
     assert r.status_code == 302
 
 
-def test_reauth_closes_previous_open_session(client):
+def test_second_login_waits_for_pending_confirmation(client):
     code, pw = _make_voucher()
     html = client.get(_gw_url()).get_data(as_text=True)
     _post_login(client, html, code, pw)
     html = client.get(_gw_url()).get_data(as_text=True)
-    _post_login(client, html, code, pw)  # login ซ้ำด้วยเครื่องเดิม (mac เดิม)
+    r = _post_login(client, html, code, pw)
+    assert r.status_code == 409
     open_sessions = [s for s in SESSIONS if s["ended_at"] is None]
     assert len(open_sessions) == 1, "ต้องมี session เปิดอยู่แค่ 1 อันต่อ mac เท่านั้น"
 
 
-def test_reauth_closes_every_stale_session_of_the_mac_individually(client):
+def test_existing_pending_session_cannot_be_replaced(client):
     """
     บั๊กเดิม (พบตอนตรวจทานรอบ 4): ถ้าบังเอิญมี session ค้างเปิดพร้อมกันมากกว่า 1 อันของ mac
     เดียวกัน (เช่น เกิดจาก race condition) เดิม fetchone() ดึง started_at มาแค่แถวเดียวแล้วเอา
@@ -259,10 +271,10 @@ def test_reauth_closes_every_stale_session_of_the_mac_individually(client):
                          state="pending", bytes_out=0, bytes_in=0))
 
     r = _post_login(client, html, code, pw)
-    assert r.status_code == 302
+    assert r.status_code == 409
 
     still_open = [s for s in SESSIONS if s["mac"] == "AA:BB:CC:DD:EE:01" and s["ended_at"] is None]
-    assert len(still_open) == 1, "ทั้งสอง session ค้างเก่าต้องถูกปิดหมด เหลือแค่อันใหม่ที่เพิ่ง insert"
+    assert len(still_open) == 2
 
 
 # ---------------------------------------------------------------- ปฏิเสธ
@@ -323,7 +335,7 @@ def test_same_device_can_relogin_even_at_limit(client):
     assert _post_login(client, html, code, pw).status_code == 302
     # เครื่องเดิม login ซ้ำ ต้องไม่โดนนับว่าเกินโควตา
     html2 = client.get(_gw_url(mac="AA:BB:CC:DD:EE:01")).get_data(as_text=True)
-    assert _post_login(client, html2, code, pw).status_code == 302
+    assert _post_login(client, html2, code, pw).status_code == 409
     assert len(DEVICES) == 0
 
 

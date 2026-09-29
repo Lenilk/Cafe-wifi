@@ -55,6 +55,8 @@ def run() -> tuple[int, int]:
                 cur.execute("UPDATE portal_session SET state='closed', ended_at=NOW(), "
                             "terminate_cause='auth_timeout' WHERE id=%s AND state='pending'",
                             (row["id"],))
+                cur.execute("DELETE FROM pending_mac_claim WHERE mac=%s AND portal_session_id=%s",
+                            (row["mac"], row["id"]))
                 expired += 1
                 continue
             if clients is None:
@@ -69,6 +71,8 @@ def run() -> tuple[int, int]:
                     continue
                 cur.execute("UPDATE portal_session SET state='closed', ended_at=NOW(), "
                             "terminate_cause='voucher_invalid' WHERE id=%s", (row["id"],))
+                cur.execute("DELETE FROM pending_mac_claim WHERE mac=%s AND portal_session_id=%s",
+                            (row["mac"], row["id"]))
                 continue
             cur.execute("SELECT id, started_at FROM portal_session WHERE mac=%s "
                         "AND state='authenticated' AND ended_at IS NULL FOR UPDATE",
@@ -87,6 +91,8 @@ def run() -> tuple[int, int]:
                         (row["voucher_id"], row["mac"], row["ip"]))
             cur.execute("UPDATE portal_session SET state='authenticated', authenticated_at=NOW() "
                         "WHERE id=%s AND state='pending'", (row["id"],))
+            cur.execute("DELETE FROM pending_mac_claim WHERE mac=%s AND portal_session_id=%s",
+                        (row["mac"], row["id"]))
             promoted += 1
     if promoted:
         audit.log(audit.LOGIN_OK, detail=f"confirmed={promoted}")

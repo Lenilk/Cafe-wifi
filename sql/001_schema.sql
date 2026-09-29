@@ -82,6 +82,13 @@ CREATE TABLE IF NOT EXISTS portal_session (
   CONSTRAINT fk_session_voucher FOREIGN KEY (voucher_id) REFERENCES voucher(id)
 ) ENGINE=InnoDB;
 
+-- MAC หนึ่งตัวมี pending ได้ครั้งเดียว แม้คำขอพร้อมกันใช้ voucher คนละใบ
+CREATE TABLE IF NOT EXISTS pending_mac_claim (
+  mac CHAR(17) PRIMARY KEY,
+  portal_session_id BIGINT NULL UNIQUE,
+  CONSTRAINT fk_pending_session FOREIGN KEY (portal_session_id) REFERENCES portal_session(id)
+) ENGINE=InnoDB;
+
 -- FAS context ถูกส่งจาก gateway เพียงครั้งเดียว; browser ส่งกลับแค่ nonce
 CREATE TABLE IF NOT EXISTS fas_context (
   nonce_hash CHAR(64) PRIMARY KEY,

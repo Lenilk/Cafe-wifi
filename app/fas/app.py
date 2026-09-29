@@ -235,6 +235,15 @@ def login():
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute("SELECT id FROM voucher WHERE id=%s FOR UPDATE", (voucher["id"],))
         cur.fetchone()
+        cur.execute("SELECT id FROM portal_session WHERE mac=%s AND state='pending' FOR UPDATE",
+                    (ctx.clientmac,))
+        if cur.fetchone():
+            return render_template("login.html", nonce=nonce,
+                                   error="อุปกรณ์นี้กำลังรอยืนยันสิทธิ์ กรุณารอสักครู่แล้วลองใหม่"), 409
+        cur.execute("INSERT IGNORE INTO pending_mac_claim (mac) VALUES (%s)", (ctx.clientmac,))
+        if cur.rowcount != 1:
+            return render_template("login.html", nonce=nonce,
+                                   error="อุปกรณ์นี้กำลังรอยืนยันสิทธิ์ กรุณารอสักครู่แล้วลองใหม่"), 409
         cur.execute("SELECT COUNT(*) AS n FROM ("
                     "SELECT mac FROM device WHERE voucher_id=%s UNION "
                     "SELECT mac FROM portal_session WHERE voucher_id=%s AND state='pending' "
@@ -257,13 +266,12 @@ def login():
         if cur.rowcount != 1:
             return render_template("error.html", title="หน้านี้หมดอายุแล้ว",
                                    message="กรุณาเปิดหน้าเข้าใช้งานใหม่"), 400
-        cur.execute("UPDATE portal_session SET state='closed', ended_at=NOW(), "
-                    "terminate_cause='replaced_pending' WHERE mac=%s AND state='pending'",
-                    (ctx.clientmac,))
         cur.execute("INSERT INTO portal_session "
                     "(voucher_id, mac, ip, started_at, pending_until, state) "
                     "VALUES (%s,%s,%s,NOW(),DATE_ADD(NOW(), INTERVAL 180 SECOND),'pending')",
                     (voucher["id"], ctx.clientmac, real_ip))
+        cur.execute("UPDATE pending_mac_claim SET portal_session_id=%s WHERE mac=%s",
+                    (cur.lastrowid, ctx.clientmac))
 
     audit.log("login_pending", target=code, client_ip=real_ip, detail=f"mac={ctx.clientmac}")
 
