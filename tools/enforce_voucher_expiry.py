@@ -46,6 +46,7 @@ import os
 import shutil
 import subprocess
 from dataclasses import dataclass
+from datetime import datetime
 
 # แก้บั๊ก (พบตอนตรวจทานรอบ 4): ฟังก์ชันนี้เคยนิยามซ้ำอยู่ในไฟล์นี้ด้วย แล้ว app/fas/app.py
 # (service หน้าบ้าน) import ข้ามชั้นมาจาก tools/ (ชั้น CLI งานบำรุงรักษา) ตรง ๆ -- ผิดทิศทาง
@@ -90,6 +91,7 @@ TERMINATE_CAUSE_BY_STATUS = {
     # N30: ไม่ใช่สถานะของ voucher แต่ใช้เส้นทาง close_session() เดียวกัน -- ลูกค้าไม่ได้อยู่ใน
     # openNDS แล้ว (เดินออกจากร้าน, idle timeout, หรือ login ไม่สำเร็จจริงตั้งแต่แรก)
     "gone": "disconnected",
+    "reauth": "reauth",
     # R2-05: ไม่ใช่สถานะของ voucher เช่นกัน -- แอดมินระงับลูกค้า (customer.is_blocked) ขณะที่
     # voucher ยัง active อยู่
     "blocked": "customer_blocked",
@@ -113,15 +115,18 @@ def find_quota_exceeded_vouchers(query_all_fn, query_one_fn) -> list[dict]:
     รวมทุกอุปกรณ์ของ voucher เดียวกัน เพราะโควตาผูกกับ voucher ไม่ใช่ผูกกับเครื่อง
     """
     rows = query_all_fn("""
-        SELECT v.id AS voucher_id, v.quota_mb, v.used_mb, ps.mac, ps.started_at
+        SELECT v.id AS voucher_id, v.quota_mb, v.used_mb, ps.mac,
+               ps.started_at, ps.authenticated_at
         FROM portal_session ps
         JOIN voucher v ON v.id = ps.voucher_id
-        WHERE ps.ended_at IS NULL AND v.status = 'active' AND v.quota_mb IS NOT NULL
+        WHERE ps.state = 'authenticated' AND ps.ended_at IS NULL
+          AND v.status = 'active' AND v.quota_mb IS NOT NULL
     """)
     live_bytes: dict[int, int] = {}
     info: dict[int, dict] = {}
     for r in rows:
-        bo, bi = sum_session_traffic_bytes(query_one_fn, r["mac"], r["started_at"])
+        bo, bi = sum_session_traffic_bytes(
+            query_one_fn, r["mac"], r["authenticated_at"] or r["started_at"])
         live_bytes[r["voucher_id"]] = live_bytes.get(r["voucher_id"], 0) + bo + bi
         info[r["voucher_id"]] = r
 
@@ -158,7 +163,7 @@ def find_sessions_to_close(query_all_fn) -> list[dict]:
     ถ้า voucher ไม่ active อยู่แล้ว ให้สาเหตุจาก voucher มาก่อน (เป็นเหตุที่เกิดก่อน/เป็นกลไกปกติ)
     """
     return query_all_fn("""
-        SELECT ps.id, ps.mac, ps.voucher_id, ps.started_at,
+        SELECT ps.id, ps.mac, ps.voucher_id, ps.started_at, ps.authenticated_at,
                CASE WHEN v.status != 'active' THEN v.status ELSE 'blocked' END
                    AS voucher_status
         FROM portal_session ps
@@ -216,7 +221,7 @@ def find_sessions_gone(query_all_fn, macs: set[str],
       "กำลังใช้งานอยู่ตอนนี้" มีแต่เพิ่มไม่มีลด
     """
     rows = query_all_fn(
-        "SELECT id, mac, voucher_id, started_at FROM portal_session "
+        "SELECT id, mac, voucher_id, started_at, authenticated_at FROM portal_session "
         "WHERE state='authenticated' AND ended_at IS NULL "
         "AND started_at < (NOW() - INTERVAL %s SECOND)",
         (grace_seconds,))
@@ -268,16 +273,23 @@ def deauth_mac(mac: str, ndsctl_bin: str = "ndsctl") -> bool:
 
 
 def close_session(execute_fn, session_id: int, voucher_id: int,
-                  bytes_out: int, bytes_in: int, voucher_status: str = "expired") -> None:
+                  bytes_out: int, bytes_in: int, voucher_status: str = "expired",
+                  ended_at=None) -> bool:
     cause = TERMINATE_CAUSE_BY_STATUS.get(voucher_status, "voucher_expired")
-    execute_fn(
-        "UPDATE portal_session SET state='closed', ended_at=NOW(), terminate_cause=%s, "
-        "bytes_out=%s, bytes_in=%s WHERE id=%s",
-        (cause, bytes_out, bytes_in, session_id))
+    end_expr = "%s" if ended_at is not None else "NOW()"
+    args = (ended_at, cause, bytes_out, bytes_in, session_id) if ended_at is not None else (
+        cause, bytes_out, bytes_in, session_id)
+    updated = execute_fn(
+        f"UPDATE portal_session SET state='closed', ended_at={end_expr}, terminate_cause=%s, "
+        "bytes_out=%s, bytes_in=%s WHERE id=%s AND state='authenticated' AND ended_at IS NULL",
+        args)
+    if not updated:
+        return False
     used_mb_delta = (bytes_out + bytes_in) // BYTES_PER_MB
     if used_mb_delta:
         execute_fn("UPDATE voucher SET used_mb = used_mb + %s WHERE id=%s",
                   (used_mb_delta, voucher_id))
+    return True
 
 
 def run(deauth: bool = True) -> EnforceSummary:
@@ -316,9 +328,11 @@ def run(deauth: bool = True) -> EnforceSummary:
                     # ลองตัดซ้ำ -- พบจากการทดสอบบน Pi จริง 2026-09-16 การปล่อยให้แถวเปิดค้าง
                     # ไว้ยังตรงความจริงมากกว่าด้วย เพราะเขา "ออนไลน์อยู่" จริง ๆ
                     continue
-            bo, bi = sum_session_traffic_bytes(_query_one, row["mac"], row["started_at"])
-            close_session(_exec, row["id"], row["voucher_id"], bo, bi, row["voucher_status"])
-            closed += 1
+            ended_at = datetime.now().replace(microsecond=0)
+            bo, bi = sum_session_traffic_bytes(
+                _query_one, row["mac"], row["authenticated_at"] or row["started_at"], ended_at)
+            closed += int(close_session(_exec, row["id"], row["voucher_id"], bo, bi,
+                                        row["voucher_status"], ended_at=ended_at))
 
         n_used_up = n_quota + mark_used_up_vouchers(_exec)
 
@@ -327,10 +341,13 @@ def run(deauth: bool = True) -> EnforceSummary:
         macs = authenticated_macs() if deauth else None
         if macs is not None:
             for row in find_sessions_gone(_query_all, macs):
-                bo, bi = sum_session_traffic_bytes(_query_one, row["mac"], row["started_at"])
-                close_session(_exec, row["id"], row["voucher_id"], bo, bi, "gone")
-                n_gone += 1
-                log.info("ปิด session %s (%s) -- ไม่อยู่ใน openNDS แล้ว", row["id"], row["mac"])
+                ended_at = datetime.now().replace(microsecond=0)
+                bo, bi = sum_session_traffic_bytes(
+                    _query_one, row["mac"], row["authenticated_at"] or row["started_at"], ended_at)
+                if close_session(_exec, row["id"], row["voucher_id"], bo, bi, "gone",
+                                 ended_at=ended_at):
+                    n_gone += 1
+                    log.info("ปิด session %s (%s) -- ไม่อยู่ใน openNDS แล้ว", row["id"], row["mac"])
 
     summary = EnforceSummary(expired_vouchers=n_expired, used_up_vouchers=n_used_up,
                              sessions_gone=n_gone,

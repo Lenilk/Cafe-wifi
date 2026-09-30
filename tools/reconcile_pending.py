@@ -95,18 +95,25 @@ def run() -> tuple[int, int]:
                 cur.execute("DELETE FROM pending_mac_claim WHERE mac=%s AND portal_session_id=%s",
                             (row["mac"], row["id"]))
                 continue
-            cur.execute("SELECT id, started_at FROM portal_session WHERE mac=%s "
+            cur.execute("SELECT id, voucher_id, started_at, authenticated_at FROM portal_session WHERE mac=%s "
                         "AND state='authenticated' AND ended_at IS NULL FOR UPDATE",
                         (row["mac"],))
             for old in cur.fetchall():
                 from common.traffic import sum_session_traffic_bytes
+                from tools.enforce_voucher_expiry import close_session
+
                 def lookup(sql, args=()):
                     cur.execute(sql, args)
                     return cur.fetchone()
-                bo, bi = sum_session_traffic_bytes(lookup, row["mac"], old["started_at"])
-                cur.execute("UPDATE portal_session SET state='closed', ended_at=NOW(), "
-                            "terminate_cause='reauth', bytes_out=%s, bytes_in=%s WHERE id=%s",
-                            (bo, bi, old["id"]))
+
+                def execute(sql, args=()):
+                    cur.execute(sql, args)
+                    return cur.rowcount
+
+                bo, bi = sum_session_traffic_bytes(
+                    lookup, row["mac"], old["authenticated_at"] or old["started_at"], gateway_start)
+                close_session(execute, old["id"], old["voucher_id"], bo, bi,
+                              "reauth", ended_at=gateway_start)
             cur.execute("INSERT INTO device (voucher_id, mac, last_ip) VALUES (%s,%s,%s) "
                         "ON DUPLICATE KEY UPDATE last_ip=VALUES(last_ip)",
                         (row["voucher_id"], row["mac"], row["ip"]))

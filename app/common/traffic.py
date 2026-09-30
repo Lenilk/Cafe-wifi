@@ -12,11 +12,18 @@ from __future__ import annotations
 BYTES_PER_MB = 1_000_000
 
 
-def sum_session_traffic_bytes(query_one_fn, mac: str, started_at) -> tuple[int, int]:
-    """รวม bytes_out/bytes_in จาก conn_log ของ mac นี้นับตั้งแต่ session เริ่ม"""
+def sum_session_traffic_bytes(query_one_fn, mac: str, authenticated_at,
+                              ended_at=None) -> tuple[int, int]:
+    """รวมทราฟฟิกหลังเปิดสิทธิ์ถึงเวลาปิด session (ถ้ามี)
+
+    ขอบล่างเป็นแบบไม่รวม เพื่อให้ event ที่ตรงกับเวลา reauth พอดีเป็นของ session เก่า
+    ซึ่งใช้ขอบบนแบบรวม และไม่ถูกนับซ้ำใน session ใหม่
+    """
+    upper_bound = " AND ts <= %s" if ended_at is not None else ""
+    args = (mac, authenticated_at, ended_at) if ended_at is not None else (mac, authenticated_at)
     row = query_one_fn(
         "SELECT COALESCE(SUM(bytes_out),0) AS bo, COALESCE(SUM(bytes_in),0) AS bi "
-        "FROM conn_log WHERE mac=%s AND ts >= %s", (mac, started_at))
+        "FROM conn_log WHERE mac=%s AND ts > %s" + upper_bound, args)
     if not row:
         return 0, 0
     return int(row["bo"]), int(row["bi"])

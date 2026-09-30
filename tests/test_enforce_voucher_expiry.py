@@ -95,11 +95,14 @@ def _sessions_to_close_on_sqlite(customers, vouchers, sessions):
         CREATE TABLE customer (id INTEGER PRIMARY KEY, is_blocked BOOLEAN NOT NULL);
         CREATE TABLE voucher (id INTEGER PRIMARY KEY, customer_id INTEGER, status TEXT);
         CREATE TABLE portal_session (id INTEGER PRIMARY KEY, mac TEXT, voucher_id INTEGER,
-                                     started_at TEXT, state TEXT, ended_at TEXT);
+                                     started_at TEXT, authenticated_at TEXT,
+                                     state TEXT, ended_at TEXT);
     """)
     db.executemany("INSERT INTO customer VALUES (?,?)", customers)
     db.executemany("INSERT INTO voucher VALUES (?,?,?)", vouchers)
-    db.executemany("INSERT INTO portal_session VALUES (?,?,?,?,?,?)", sessions)
+    db.executemany("INSERT INTO portal_session VALUES (?,?,?,?,?,?,?)",
+                   [(sid, mac, voucher_id, started_at, started_at, state, ended_at)
+                    for sid, mac, voucher_id, started_at, state, ended_at in sessions])
 
     def q(sql, args=()):
         return [dict(r) for r in db.execute(sql, args).fetchall()]
@@ -154,6 +157,31 @@ def test_close_session_skips_voucher_update_when_zero_bytes():
 
     ev.close_session(fake_exec, session_id=1, voucher_id=1, bytes_out=0, bytes_in=0)
     assert len(calls) == 1, "ไม่ต้องยิง UPDATE voucher ถ้าไม่มีทราฟฟิกเพิ่ม (delta=0)"
+
+
+def test_close_session_reauth_bumps_old_voucher_once():
+    calls = []
+    ended = datetime(2026, 9, 30, 12, 0)
+    updated = [1, 0]
+
+    def fake_exec(sql, args=()):
+        calls.append((" ".join(sql.split()), args))
+        if sql.startswith("UPDATE portal_session"):
+            return updated.pop(0)
+        return 1
+
+    results = [ev.close_session(fake_exec, session_id=42, voucher_id=7,
+                                bytes_out=3_000_000, bytes_in=2_000_000,
+                                voucher_status="reauth", ended_at=ended)
+               for _ in range(2)]
+
+    closes = [(sql, args) for sql, args in calls if sql.startswith("UPDATE portal_session")]
+    bumps = [(sql, args) for sql, args in calls if sql.startswith("UPDATE voucher SET used_mb")]
+    assert len(closes) == 2
+    assert closes[0][1] == (ended, "reauth", 3_000_000, 2_000_000, 42)
+    assert "state='authenticated' AND ended_at IS NULL" in closes[0][0]
+    assert len(bumps) == 1 and bumps[0][1] == (5, 7)
+    assert results == [True, False]
 
 
 def test_deauth_mac_returns_false_when_ndsctl_missing(monkeypatch):
@@ -231,6 +259,7 @@ def test_run_end_to_end_closes_expired_sessions_and_skips_deauth_when_disabled(m
         expire_count=2,
         to_close=[{"id": 1, "mac": "AA:BB:CC:DD:EE:01", "voucher_id": 10,
                   "started_at": datetime.now() - timedelta(hours=1),
+                  "authenticated_at": datetime.now() - timedelta(hours=1),
                   "voucher_status": "expired"}],
         closed=[], used_mb_bumped=[], used_up_count=0,
     )
@@ -307,6 +336,7 @@ def _run_with_fake_db(monkeypatch, deauth_succeeds: bool):
         expire_count=0,
         to_close=[{"id": 1, "mac": "AA:BB:CC:DD:EE:01", "voucher_id": 10,
                   "started_at": datetime.now() - timedelta(hours=1),
+                  "authenticated_at": datetime.now() - timedelta(hours=1),
                   "voucher_status": "revoked"}],
         closed=[], used_mb_bumped=[], used_up_count=0,
     )
@@ -374,7 +404,9 @@ def test_deauth_other_failures_still_count_as_failure(monkeypatch):
 def _quota_rows(*rows):
     def query_all(sql, args=()):
         assert "quota_mb IS NOT NULL" in sql
-        return list(rows)
+        assert "ps.state = 'authenticated'" in sql
+        return [{**r, "authenticated_at": r.get("authenticated_at") or r["started_at"]}
+                for r in rows]
     return query_all
 
 
@@ -417,6 +449,36 @@ def test_quota_adds_usage_recorded_from_previous_sessions():
     hits = ev.find_quota_exceeded_vouchers(rows, _traffic(20 * ev.BYTES_PER_MB, 0))
 
     assert len(hits) == 1 and hits[0]["total_mb"] == 500
+
+
+def test_quota_ignores_pending_session_rows():
+    import sqlite3
+
+    db = sqlite3.connect(":memory:")
+    db.row_factory = sqlite3.Row
+    db.executescript("""
+        CREATE TABLE voucher (id INTEGER, quota_mb INTEGER, used_mb INTEGER, status TEXT);
+        CREATE TABLE portal_session (voucher_id INTEGER, mac TEXT, started_at TEXT,
+                                     authenticated_at TEXT, state TEXT, ended_at TEXT);
+    """)
+    db.execute("INSERT INTO voucher VALUES (3, 500, 0, 'active')")
+    db.executemany("INSERT INTO portal_session VALUES (3, ?, ?, ?, ?, NULL)", [
+        ("AA", "2026-09-30 12:00:00", "2026-09-30 12:01:00", "authenticated"),
+        ("BB", "2026-09-30 12:02:00", None, "pending"),
+    ])
+
+    def query_all(sql, args=()):
+        return [dict(row) for row in db.execute(sql, args).fetchall()]
+
+    queried_macs = []
+
+    def query_one(sql, args=()):
+        queried_macs.append(args[0])
+        return {"bo": 100 * ev.BYTES_PER_MB, "bi": 0}
+
+    assert ev.find_quota_exceeded_vouchers(query_all, query_one) == []
+    assert queried_macs == ["AA"]
+    db.close()
 
 
 def test_mark_quota_exceeded_only_touches_active_vouchers():

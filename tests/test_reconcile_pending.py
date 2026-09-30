@@ -96,3 +96,43 @@ def test_unconfirmed_past_deadline_still_times_out(monkeypatch):
     assert (promoted, expired) == (0, 1)
     assert deauthed == [row["mac"]]
     assert any("auth_timeout" in sql for sql, _ in executed)
+
+
+def test_reauth_closes_old_session_and_charges_its_voucher(monkeypatch):
+    now = datetime.now().replace(microsecond=0)
+    opened = now - timedelta(seconds=2)
+    row = _pending_row(now, pending_until=now + timedelta(minutes=1))
+    old = dict(id=4, voucher_id=99, started_at=now - timedelta(hours=1),
+               authenticated_at=now - timedelta(hours=1))
+    clients = {row["mac"]: dict(state="Authenticated", ip=row["ip"],
+                                session_start=str(int(opened.timestamp())))}
+
+    class ReauthCursor(_FakeCursor):
+        rowcount = 1
+
+        def fetchall(self):
+            if "AND state='authenticated' AND ended_at IS NULL FOR UPDATE" in self._last:
+                return [old]
+            return super().fetchall()
+
+        def fetchone(self):
+            if "FROM conn_log" in self._last:
+                return {"bo": 3_000_000, "bi": 2_000_000}
+            return None
+
+    cur = ReauthCursor([row])
+    monkeypatch.setattr(rp, "gateway_clients", lambda: clients)
+    monkeypatch.setattr(rp, "get_conn", lambda: _FakeConn(cur))
+    monkeypatch.setattr(rp, "purge_orphan_claims", lambda: 0)
+    monkeypatch.setattr(rp.audit, "log", lambda *a, **k: None)
+
+    assert rp.run() == (1, 0)
+    traffic = [(sql, args) for sql, args in cur.executed if "FROM conn_log" in sql]
+    closes = [(sql, args) for sql, args in cur.executed
+              if sql.startswith("UPDATE portal_session SET state='closed'")]
+    bumps = [(sql, args) for sql, args in cur.executed
+             if sql.startswith("UPDATE voucher SET used_mb")]
+    assert len(traffic) == 1 and traffic[0][1] == (row["mac"], old["authenticated_at"], opened)
+    assert len(closes) == 1 and closes[0][1] == (opened, "reauth", 3_000_000, 2_000_000, old["id"])
+    assert len(bumps) == 1 and bumps[0][1] == (5, old["voucher_id"])
+    assert row["voucher_id"] != old["voucher_id"]
