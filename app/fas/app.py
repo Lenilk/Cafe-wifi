@@ -20,7 +20,9 @@ import json
 import os
 import re
 import secrets
+import subprocess
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta
 
 from flask import Flask, abort, redirect, render_template, request
@@ -177,16 +179,26 @@ def login():
         return render_template("error.html", title="ข้อมูลเครือข่ายไม่ตรงกัน",
                                message="กรุณาต่อ Wi-Fi ใหม่อีกครั้ง"), 400
 
-    # แก้บั๊ก H2: ctx.clientmac ก็มาจาก hidden field เหมือนกัน (ปลอมได้เช่นเดียวกับ clientip
-    # เดิม) แต่ MAC คือกุญแจเดียวที่เชื่อม "ตัวตนลูกค้า" เข้ากับ conn_log/dns_log (ซึ่งได้ MAC
-    # จริงจากตาราง ARP ของเคอร์เนล ไม่ใช่จากฟอร์ม) -- เทียบกับ ARP entry ของ real_ip ปัจจุบัน
-    # ก่อนผูก MAC ลง device/portal_session ถ้าไม่ตรงกันปฏิเสธทันที (ไม่พบใน ARP เลย เช่น
-    # entry เพิ่งหลุด cache ไม่ถือเป็นการปลอม -- ปล่อยผ่านแทนที่จะบล็อกลูกค้าจริงโดยไม่มีเหตุ)
+    # R2-L01: ต้องยืนยัน MAC จาก ARP ของ real_ip ก่อนผูกกับ session; ถ้า cache ว่าง
+    # ให้กระตุ้น ARP หนึ่งครั้งแล้วอ่านใหม่ แม้ ping ไม่ได้รับ ICMP reply ก็อาจได้ ARP reply
     arp_mac = resolve_mac(real_ip)
-    if arp_mac and arp_mac != ctx.clientmac:
+    if not arp_mac:
+        try:
+            subprocess.run(["ping", "-4", "-n", "-c", "1", "-W", "1", real_ip],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=2, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            app.logger.warning("กระตุ้น ARP ไม่สำเร็จ: ip=%s error=%s", real_ip, exc)
+        arp_mac = resolve_mac(real_ip)
+    if not arp_mac:
+        app.logger.warning("ไม่พบ MAC ใน ARP หลังลองอีกครั้ง: ip=%s", real_ip)
+        return render_template("error.html", title="ยืนยันอุปกรณ์ไม่สำเร็จ",
+                               message="ไม่พบอุปกรณ์บนเครือข่าย กรุณาเปิดหน้าเข้าใช้งานแล้วลองอีกครั้ง"), 400
+    if normalize_mac(arp_mac) != normalize_mac(ctx.clientmac):
         app.logger.warning("MAC ไม่ตรงกับ ARP: form=%s arp=%s ip=%s", ctx.clientmac, arp_mac, real_ip)
         return render_template("error.html", title="ข้อมูลอุปกรณ์ไม่ตรงกัน",
                                message="กรุณาต่อ Wi-Fi ใหม่อีกครั้ง"), 400
+    ctx = replace(ctx, clientmac=normalize_mac(arp_mac))
 
     bucket = f"login:{ctx.clientmac}"
     if rate_limited(bucket):

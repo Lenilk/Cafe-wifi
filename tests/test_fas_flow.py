@@ -26,11 +26,13 @@ SESSIONS: list[dict] = []
 AUDIT: list[tuple] = []
 FAS_CONTEXTS: dict[str, dict] = {}
 CLAIMS: dict[str, int | None] = {}
+ARP = {"mac": GW_PARAMS["clientmac"]}
 _ids = {"customer": 0, "device": 0, "session": 0}
 
 
 def _reset():
     VOUCHERS.clear(); CUSTOMERS.clear(); DEVICES.clear(); SESSIONS.clear(); AUDIT.clear(); FAS_CONTEXTS.clear(); CLAIMS.clear()
+    ARP["mac"] = GW_PARAMS["clientmac"]
     _ids.update(customer=0, device=0, session=0)
 
 
@@ -172,6 +174,7 @@ def client(monkeypatch):
     fas_app.FAS_KEY = FASKEY
     fas_app.GATEWAY_NAME = "Cafe-Guest-Test"
     fas_app.client_ip = lambda: GW_PARAMS["clientip"]
+    fas_app.resolve_mac = lambda ip: ARP["mac"] if ip == GW_PARAMS["clientip"] else None
     fas_app.app.config.update(TESTING=True)
     fas_app._attempts.clear()
     c = fas_app.app.test_client()
@@ -185,6 +188,7 @@ def _gw_url(mac="AA:BB:CC:DD:EE:01"):
     เพราะ base64 มี '+' '/' '=' ซึ่งมีความหมายพิเศษใน query string (เช่น '+' = เว้นวรรค)
     """
     from urllib.parse import quote
+    ARP["mac"] = mac
     p = dict(GW_PARAMS, clientmac=mac)
     fas_b64, iv = encrypt_fas_payload(p, FASKEY)
     return f"/login?fas={quote(fas_b64, safe='')}&iv={quote(iv, safe='')}"
@@ -243,6 +247,50 @@ def test_successful_login_redirects_to_gateway_auth_url(client):
     assert len(DEVICES) == 0
     assert SESSIONS[0]["state"] == "pending"
     assert any("login_pending" in str(a) for a in AUDIT)
+
+
+def test_arp_missing_after_ping_rejects_without_session(client, monkeypatch):
+    code, pw = _make_voucher()
+    html = client.get(_gw_url()).get_data(as_text=True)
+    ARP["mac"] = None
+    pings = []
+    monkeypatch.setattr(client.module.subprocess, "run", lambda *args, **kwargs: pings.append((args, kwargs)))
+
+    r = _post_login(client, html, code, pw)
+
+    assert r.status_code == 400
+    assert "ลองอีกครั้ง" in r.get_data(as_text=True)
+    assert len(pings) == 1
+    assert pings[0][0][0][-1] == GW_PARAMS["clientip"]
+    assert SESSIONS == [] and CLAIMS == {}
+    assert all(row["consumed_at"] is None for row in FAS_CONTEXTS.values())
+
+
+def test_arp_found_after_ping_allows_login(client, monkeypatch):
+    code, pw = _make_voucher()
+    html = client.get(_gw_url()).get_data(as_text=True)
+    macs = iter((None, GW_PARAMS["clientmac"].lower()))
+    monkeypatch.setattr(client.module, "resolve_mac", lambda ip: next(macs))
+    pings = []
+    monkeypatch.setattr(client.module.subprocess, "run", lambda *args, **kwargs: pings.append((args, kwargs)))
+
+    r = _post_login(client, html, code, pw)
+
+    assert r.status_code == 302
+    assert len(pings) == 1
+    assert SESSIONS[0]["mac"] == GW_PARAMS["clientmac"]
+
+
+def test_arp_mac_mismatch_rejects_without_ping_or_session(client, monkeypatch):
+    code, pw = _make_voucher()
+    html = client.get(_gw_url()).get_data(as_text=True)
+    ARP["mac"] = "AA:BB:CC:DD:EE:99"
+    monkeypatch.setattr(client.module.subprocess, "run", lambda *args, **kwargs: pytest.fail("ไม่ควร ping เมื่อมี ARP"))
+
+    r = _post_login(client, html, code, pw)
+
+    assert r.status_code == 400
+    assert SESSIONS == [] and CLAIMS == {}
 
 
 def test_username_is_case_insensitive(client):
