@@ -35,9 +35,10 @@
 | R2-07 | ✅ แก้แล้ว | `47ba1d5` | ควรดู `journalctl -u cafe-maintenance` หลังรอบ 03:30 ว่ามีบรรทัด "ลบ raw log ที่ครบอายุ…" แม้มี issue อื่นค้าง |
 | หัวข้อ 4 (DoT/ข้อความในเล่ม) | ✅ แก้โค้ดและข้อความส่งต่อ | commit นี้ | ยังไม่ได้ติดตั้งหรือทดสอบ DoT บน Pi |
 | R2-L02 | ✅ แก้แล้ว | commit นี้ | — (เทสต์อัตโนมัติผ่าน) |
-| R2-L01, R2-L03 ถึง R2-L06 | ⏳ ยังไม่ได้แก้ | — | — |
+| R2-L05 | ✅ แก้โค้ดแล้ว | commit นี้ | ยังไม่ได้ทดสอบบน Pi |
+| R2-L01, R2-L03, R2-L04, R2-L06 | ⏳ ยังไม่ได้แก้ | — | — |
 
-ชุดทดสอบหลังแก้ R2-01: `PYTHONPATH=app pytest -q tests` → **297 passed** · หลังแก้ R2-10 → **320 passed** · หลังแก้ R2-06 → **332 passed** · หลังแก้ R2-07 → **339 passed** · หลังแก้ R2-L02 → **344 passed**
+ชุดทดสอบหลังแก้ R2-01: `PYTHONPATH=app pytest -q tests` → **297 passed** · หลังแก้ R2-10 → **320 passed** · หลังแก้ R2-06 → **332 passed** · หลังแก้ R2-07 → **339 passed** · หลังแก้ R2-L02 → **344 passed** · หลังแก้ R2-L05 → **347 passed**
 
 ### ระดับความสำคัญ
 
@@ -337,6 +338,8 @@ backup มี `natid_enc` ที่ถอดได้ด้วย `NATID_DEK` �
 **ตำแหน่ง:** `app/logger/conn_collector.py:271`
 
 คำสั่ง `conntrack -E` ไม่ได้กรอง source จึงเก็บทราฟฟิกของ Pi เอง (NTP, apt, DNS upstream ของ dnsmasq, การเชื่อมต่อ SSH/Admin) ปนกับของลูกค้า ทำให้ตารางโตโดยไม่จำเป็นและเพิ่มโอกาสเกิด ENOBUFS ควรกรองเฉพาะ `src` ที่อยู่ใน `CLIENT_NET` ใน `parse_conntrack_line` (วิธีที่แน่นอนที่สุด) หรือใช้ตัวกรองของ conntrack เอง (`--orig-src` ร่วมกับ `--mask-src`) ถ้าเวอร์ชันบน Pi รองรับในโหมด `-E` ซึ่งต้องตรวจก่อน
+
+> **✅ แก้โค้ดแล้ว — commit นี้ / รอทดสอบบน Pi**: logger กรอง original source ก่อนส่งทั้ง `NEW` และ `DESTROY` เข้า tracker รวมถึงช่วงระบายคิวตอนหยุด โดยใช้ `CLIENT_CIDR` จาก `secrets.env` และตัด IP gateway ของ Pi ออกด้วย การกรองใน Python ลดงานของ tracker และแถว DB แต่ไม่ได้ลด event ที่ส่งผ่าน netlink จึงยังต้องเฝ้า ENOBUFS และตรวจความเข้ากันได้ของตัวกรองฝั่ง `conntrack -E` บน Pi
 
 ### R2-L06 — ต้องตรวจบน Pi: `compress/delaycompress` ชนกับ `chattr +a` หรือไม่ [ต่ำ · ยังไม่ยืนยัน]
 

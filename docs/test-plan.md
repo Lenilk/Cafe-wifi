@@ -42,6 +42,7 @@ PYTHONPATH=app pytest tests/ -v
 | T7 | จำลอง ARP spoof | ไม่สามารถดักข้อมูลเครื่องอื่นได้ | ⬜ |
 | T8 | Admin Panel เข้าจากฝั่งลูกค้าไม่ได้ | connection refused/timeout | ⬜ |
 | T-DOT | บล็อก DNS-over-TLS จากวงลูกค้า | หลังติดตั้งกฎใหม่ ตัวนับของกฎ drop TCP/UDP 853 เพิ่มเมื่อส่งจากลูกค้าที่ login แล้วผ่าน Pi; DNS ปกติยังเข้า dnsmasq และมีแถวใน DNS log | ⬜ รอ Pi |
+| T-CONN-SRC | `conn_log` รับเฉพาะต้นทางลูกค้า (R2-L05) | หลังติดตั้งใหม่ ให้ลูกค้าและ Pi สร้าง connection แยกกัน ตรวจว่าแถวใหม่มีเฉพาะ IP ลูกค้า ไม่มี IP gateway ของ Pi หรือ IP วง uplink; ตรวจ `journalctl -u cafe-logger` ว่าไม่มี ENOBUFS เพิ่ม | ⬜ รอ Pi |
 | T13 | ความแม่นยำนาฬิกา (chrony) | offset < 10 ms | ⬜ |
 | T14 | Load test 20 client พร้อมกัน | ไม่มี log drop, response < 2 วิ | ⬜ |
 | T15 | Recovery หลังไฟดับ | ทุก service กลับมาเองภายใน 90 วิ | ⬜ |

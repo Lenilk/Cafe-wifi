@@ -1,5 +1,6 @@
 """T-Logger — conn_collector / dns_collector / integrity (เฉพาะส่วนที่ทดสอบได้โดยไม่ต้องมีฮาร์ดแวร์จริง)"""
 import gzip
+import ipaddress
 from datetime import datetime
 
 import pytest
@@ -680,6 +681,36 @@ def test_parse_event_reads_id_and_kernel_delta_time():
 def test_parse_line_still_returns_only_destroy():
     assert parse_conntrack_line(NEW_WITH_ID) is None
     assert parse_conntrack_line(DESTROY_WITH_ID).ct_id == "3141592"
+
+
+def test_client_filter_keeps_both_events_for_original_client_source():
+    client_iface = ipaddress.IPv4Interface("10.10.0.1/24")
+    tracker = conn_collector.ConnTracker(_SwitchableArp("AA:AA:AA:AA:AA:01"))
+    new = conn_collector.parse_client_conntrack_event(NEW_WITH_ID, client_iface)
+    destroy = conn_collector.parse_client_conntrack_event(DESTROY_WITH_ID, client_iface)
+
+    assert new[0] == "NEW" and destroy[0] == "DESTROY"
+    assert tracker.feed(*new) is None
+    assert len(tracker) == 1
+    assert tracker.feed(*destroy).mac == "AA:AA:AA:AA:AA:01"
+    assert len(tracker) == 0
+
+
+def test_client_filter_excludes_pi_gateway_uplink_and_outside_sources():
+    client_iface = ipaddress.IPv4Interface("10.10.0.1/24")
+    for src in ("10.10.0.1", "192.168.1.2", "192.168.1.20", "10.10.1.50", "2001:db8::1"):
+        for original in (NEW_WITH_ID, DESTROY_WITH_ID):
+            line = original.replace("src=10.10.0.50", f"src={src}", 1)
+            assert conn_collector.parse_client_conntrack_event(line, client_iface) is None
+
+
+def test_conn_collector_requires_client_cidr(monkeypatch):
+    monkeypatch.delenv("CLIENT_CIDR", raising=False)
+    with pytest.raises(RuntimeError, match="CLIENT_CIDR"):
+        conn_collector.run_forever()
+    monkeypatch.setenv("CLIENT_CIDR", "not-a-network")
+    with pytest.raises(RuntimeError, match="CLIENT_CIDR"):
+        conn_collector.run_forever()
 
 
 def test_ip_reassigned_between_new_and_destroy_keeps_original_mac():

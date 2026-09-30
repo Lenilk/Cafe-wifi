@@ -13,7 +13,9 @@ logger/conn_collector.py — เก็บข้อมูลจราจร (meta
 """
 from __future__ import annotations
 
+import ipaddress
 import logging
+import os
 import queue
 import re
 import subprocess
@@ -179,6 +181,23 @@ def parse_conntrack_line(line: str, now: float | None = None) -> ConnRecord | No
     if parsed and parsed[0] == "DESTROY":
         return parsed[1]
     return None
+
+
+def parse_client_conntrack_event(
+    line: str, client_iface: ipaddress.IPv4Interface,
+) -> tuple[str, ConnRecord] | None:
+    """รับเฉพาะ original source ของลูกค้า; gateway ของ Pi อยู่ใน subnet เดียวกัน."""
+    parsed = parse_conntrack_event(line)
+    if parsed is None:
+        return None
+    try:
+        src = ipaddress.IPv4Address(parsed[1].src_ip)
+    except ipaddress.AddressValueError:
+        log.warning("conntrack original src ไม่ใช่ IPv4: %r", parsed[1].src_ip)
+        return None
+    if src == client_iface.ip or src not in client_iface.network:
+        return None
+    return parsed
 
 
 class ConnTracker:
@@ -379,6 +398,11 @@ def run_forever(batch_size: int = 100, flush_interval: float = 5.0,
     finally ไม่ได้ทำงาน record ใน buffer และคิวหายทุกครั้งที่ restart/reboot
     """
     stop_event = stop_event or threading.Event()
+    client_cidr = os.environ.get("CLIENT_CIDR", "")
+    try:
+        client_iface = ipaddress.IPv4Interface(client_cidr)
+    except (ipaddress.AddressValueError, ipaddress.NetmaskValueError) as exc:
+        raise RuntimeError("CLIENT_CIDR ต้องเป็น IPv4/prefix ของ gateway ฝั่งลูกค้าใน secrets.env") from exc
     mac_cache = MacCache()
     tracker = ConnTracker(mac_cache)
     reported_evicted = 0
@@ -424,7 +448,8 @@ def run_forever(batch_size: int = 100, flush_interval: float = 5.0,
                 raise RuntimeError("conntrack reader thread หยุดทำงาน")
             try:
                 # N39: แปลงบรรทัดเป็น record ตรงนี้ (ลูปหลัก) แทนที่จะทำในเธรดอ่าน
-                parsed = parse_conntrack_event(events.get(timeout=min(flush_interval, 1.0)))
+                parsed = parse_client_conntrack_event(
+                    events.get(timeout=min(flush_interval, 1.0)), client_iface)
                 rec = tracker.feed(*parsed) if parsed else None
                 if rec:
                     buffer.append(rec)
@@ -457,7 +482,7 @@ def run_forever(batch_size: int = 100, flush_interval: float = 5.0,
             drained = 0
             while True:
                 try:
-                    parsed = parse_conntrack_event(events.get_nowait())
+                    parsed = parse_client_conntrack_event(events.get_nowait(), client_iface)
                 except queue.Empty:
                     break
                 rec = tracker.feed(*parsed) if parsed else None

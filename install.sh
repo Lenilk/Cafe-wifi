@@ -532,13 +532,14 @@ gen_secrets() {
   local secrets="${ETC_DIR}/secrets.env"
   if [[ -f "$secrets" ]] && (( ! DRY_RUN )); then
     warn "พบ ${secrets} อยู่แล้ว — ใช้ของเดิม (สร้างใหม่จะทำให้ข้อมูลเดิมถอดรหัสไม่ได้)"
-    # N27: กุญแจเข้ารหัสต้องคงเดิม แต่ค่าเครือข่ายฝั่งเราเตอร์ต้องตามพารามิเตอร์ของรอบนี้เสมอ --
+    # N27: กุญแจเข้ารหัสต้องคงเดิม แต่ค่าเครือข่ายต้องตามพารามิเตอร์ของรอบนี้เสมอ --
     # เดิมไฟล์นี้ถูกเขียนครั้งเดียวตอนติดตั้งครั้งแรก พอย้าย Pi ไปเครือข่ายใหม่ (แล็บ <-> บ้าน) แล้ว
     # รันซ้ำด้วย --uplink-cidr/--uplink-gw ใหม่ ไฟร์วอลล์กับ IP ถูกอัปเดตแต่ค่าในนี้ไม่ถูก
     # bypass_detector.py (ตัวเดียวที่อ่านค่าเหล่านี้) จึงไปเฝ้าวงเก่าต่อแล้วเงียบไปโดยไม่มีใครรู้
     local kv key
     for kv in "UPLINK_IP=${UPLINK_CIDR%%/*}" "UPLINK_GW=${UPLINK_GW}" \
-              "UPLINK_NETWORK=$(cidr_to_network "$UPLINK_CIDR")"; do
+              "UPLINK_NETWORK=$(cidr_to_network "$UPLINK_CIDR")" \
+              "GATEWAY_IP=${CLIENT_CIDR%%/*}" "CLIENT_CIDR=${CLIENT_CIDR}"; do
       key="${kv%%=*}"
       if grep -q "^${key}=" "$secrets"; then
         sed -i "s|^${key}=.*|${kv}|" "$secrets"
@@ -546,7 +547,7 @@ gen_secrets() {
         printf '%s\n' "$kv" >> "$secrets"
       fi
     done
-    ok "อัปเดตค่าเครือข่ายฝั่งเราเตอร์ใน ${secrets} ให้ตรงกับรอบนี้แล้ว (${UPLINK_CIDR} ผ่าน ${UPLINK_GW})"
+    ok "อัปเดตค่าเครือข่ายใน ${secrets} ให้ตรงกับรอบนี้แล้ว (uplink ${UPLINK_CIDR}, client ${CLIENT_CIDR})"
     return 0
   fi
   [[ -z "$DB_PASS" ]] && DB_PASS="$(openssl rand -base64 32 | tr -dc 'A-Za-z0-9' | head -c 28)"
@@ -585,6 +586,7 @@ ADMIN_PORT=${ADMIN_BACKEND}
 NDS_PORT=${NDS_PORT}
 GATEWAY_NAME=${GATEWAY_NAME}
 GATEWAY_IP=${CLIENT_CIDR%%/*}
+CLIENT_CIDR=${CLIENT_CIDR}
 GATEWAY_AUTHDIR=opennds_auth
 
 # N10 (CODING_BRIEF.md) -- bypass_detector.py (T17) ใช้ 3 ค่านี้เฝ้าวง uplink หา IP/MAC
