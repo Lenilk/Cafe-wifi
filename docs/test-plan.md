@@ -41,6 +41,7 @@ PYTHONPATH=app pytest tests/ -v
 | T6 | Client isolation (กัน sniffing ระหว่างลูกค้า) | เครื่อง A ping/nmap เครื่อง B ไม่สำเร็จ | ⬜ |
 | T7 | จำลอง ARP spoof | ไม่สามารถดักข้อมูลเครื่องอื่นได้ | ⬜ |
 | T8 | Admin Panel เข้าจากฝั่งลูกค้าไม่ได้ | connection refused/timeout | ⬜ |
+| T-DOT | บล็อก DNS-over-TLS จากวงลูกค้า | หลังติดตั้งกฎใหม่ ตัวนับของกฎ drop TCP/UDP 853 เพิ่มเมื่อส่งจากลูกค้าที่ login แล้วผ่าน Pi; DNS ปกติยังเข้า dnsmasq และมีแถวใน DNS log | ⬜ รอ Pi |
 | T13 | ความแม่นยำนาฬิกา (chrony) | offset < 10 ms | ⬜ |
 | T14 | Load test 20 client พร้อมกัน | ไม่มี log drop, response < 2 วิ | ⬜ |
 | T15 | Recovery หลังไฟดับ | ทุก service กลับมาเองภายใน 90 วิ | ⬜ |
@@ -50,6 +51,7 @@ PYTHONPATH=app pytest tests/ -v
 - [ ] เดินผ่านขั้นตอน `install.sh` เต็มรูปแบบบน Raspberry Pi จริง 1 รอบ ไม่ใช้ `--skip-*` ใด ๆ
 - [ ] เปิด `/setup` จากเครื่องอื่นในวง LAN ยืนยันว่าใช้งานได้จริงผ่าน HTTPS self-signed
 - [ ] ออก voucher จริง 1 ใบ แล้วลองต่อ Wi-Fi ด้วยมือถือจริง
+- [ ] บน Pi ที่ติดตั้งกฎใหม่ ให้เครื่องลูกค้า login ก่อน แล้วตรวจ `sudo nft list chain inet filter forward` ก่อน/หลังส่ง TCP และ UDP 853 เพื่อยืนยันว่าตัวนับของกฎ drop ทั้งสองเพิ่ม; ตั้ง Android Private DNS แบบอัตโนมัติแล้ว query โดเมนใหม่ ตรวจว่า query ปรากฏใน DNS log (การเห็น query อย่างเดียวไม่พิสูจน์ว่าพอร์ต 853 ถูกบล็อก)
 - [ ] ปิด-เปิดเครื่อง Pi ระหว่างมีการเชื่อมต่อค้างอยู่ ดูว่า session/log สอดคล้องกันหรือไม่
 - [ ] รัน `python -m logger.integrity` แล้วลองแก้ไฟล์ log เก่าด้วยมือ ตรวจว่า `verify_chain` จับได้จริง
 

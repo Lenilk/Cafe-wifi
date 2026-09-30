@@ -1171,10 +1171,16 @@ table inet filter {
   chain forward {
     type filter hook forward priority filter; policy drop;
 
+    # DoT จากวงลูกค้าไม่ผ่าน dnsmasq: ปิด TCP/UDP 853 ก่อน accept ของ connection ที่มีอยู่
+    # กฎนี้ครอบคลุมเฉพาะทราฟฟิกที่ส่งผ่าน Pi (D17)
+    ip saddr \$CLIENT_NET tcp dport 853 counter drop
+    ip saddr \$CLIENT_NET udp dport 853 counter drop
+
     ct state established,related accept
     ct state invalid drop
 
-    # D9: กันลูกค้าคุยกันเอง (ป้องกัน sniffing / ARP spoof ภายในวงเดียวกัน)
+    # D9: กันเฉพาะทราฟฟิกลูกค้า↔ลูกค้าที่ถูกส่งผ่าน Pi; การคุยกันตรงบน L2
+    # (รวมถึง ARP spoof/sniffing ระหว่างลูกค้า) ต้องแยกที่ AP ด้วย client isolation
     ip saddr \$CLIENT_NET ip daddr \$CLIENT_NET drop
 
     # กันลูกค้าเข้าถึงเครือข่ายส่วนตัวฝั่งอัพลิงก์ของร้าน (ปลายทางอินเทอร์เน็ตสาธารณะไม่ติดกฎนี้)

@@ -630,10 +630,10 @@ def valid_thai_id(nid: str) -> bool:
 
 | ภัยคุกคาม | มาตรการ | ที่ตั้งค่า |
 |---|---|---|
-| Packet sniffing ระหว่างลูกค้า | **AP Client Isolation** + nftables drop LAN↔LAN | AP + Pi |
-| ARP spoofing | `arp_ignore=1`, static ARP สำหรับ gateway, ตรวจจับ MAC-IP ไม่ตรงแล้ว alert | Pi |
+| Packet sniffing ระหว่างลูกค้า | **Client isolation ที่ AP เป็นมาตรการหลัก**; nftables กันได้เฉพาะทราฟฟิกที่ส่งผ่าน Pi | AP (หลัก) + Pi |
+| ARP spoofing ระหว่างลูกค้า | ใช้ client isolation ที่ AP แยกลูกค้าบน L2; `arp_ignore=1` ของ Pi ไม่ป้องกันการปลอม ARP ระหว่างลูกค้า | AP |
 | DHCP rogue server | dnsmasq เป็น authoritative; nftables drop DHCP server จากฝั่ง LAN (udp sport 67) | Pi |
-| DNS hijacking / bypass | บังคับ redirect UDP/TCP 53 มาที่ dnsmasq; block DoH endpoints ที่รู้จัก (optional) | nftables |
+| DNS hijacking / bypass | redirect UDP/TCP 53 ไป dnsmasq และ drop TCP/UDP 853 (DoT) สำหรับทราฟฟิกที่ผ่าน Pi; DoH ผ่าน HTTPS ยังไม่ถูกบล็อก | Pi / nftables |
 | เข้าถึง Admin Panel จากฝั่งลูกค้า | nftables drop dst 10.10.0.1:8081 จาก LAN; เปิดให้เฉพาะ MAC/IP ของเครื่องพนักงาน | nftables |
 | Brute-force รหัส voucher | rate-limit 5 ครั้ง/MAC/10 นาที + exponential backoff | FAS |
 | MAC spoofing เพื่อขโมย session | ผูก MAC+IP, ตรวจ session ทุก 60 วิ, บังคับ re-auth เมื่อ IP เปลี่ยน | openNDS + FAS |
@@ -643,7 +643,7 @@ def valid_thai_id(nid: str) -> bool:
 ### 6.5 ข้อจำกัดที่ต้องรู้ (อธิบายในเล่มรายงาน)
 
 - **HTTPS/HSTS ทำให้ redirect หน้า portal ไม่ขึ้นเสมอ** — สมัยนี้ต้องพึ่ง OS captive-portal detection (`captive.apple.com`, `connectivitycheck.gstatic.com/generate_204`, `msftconnecttest.com`) openNDS จัดการให้แล้ว แต่ต้องทดสอบทุก OS
-- **DNS log จับได้ไม่หมด** — ถ้าลูกค้าใช้ DoH/DoT ในเบราว์เซอร์ จะไม่เห็น query ต้อง block DoH หรือยอมรับเป็นข้อจำกัดในรายงาน
+- **DNS log จับได้ไม่หมด** — Pi บล็อก DoT (TCP/UDP 853) ที่ส่งผ่าน Pi เพื่อให้อุปกรณ์ที่รองรับการถอยกลับใช้ DNS ปกติได้ แต่ DoH ผ่าน HTTPS ยังไม่ถูกบล็อกและ query นั้นไม่เข้า dnsmasq; ลูกค้าที่ส่งทราฟฟิกข้าม Pi ก็ไม่อยู่ภายใต้กฎนี้ (กฎ DoT ยังรอทดสอบบน Pi)
 - **Random MAC address** — iOS/Android สุ่ม MAC ต่อ SSID ทำให้ MAC ไม่ใช่ตัวระบุถาวร แต่ยังใช้ได้ภายใน session เดียว (mapping ผ่าน voucher จึงสำคัญกว่า MAC)
 - ⚠️ **ช่องโหว่ bypass ของโหมดสายเส้นเดียว (D17/D19)** — ผู้ใช้ที่ตั้งค่า IP เองให้อยู่วงเดียวกับเราเตอร์ สามารถออกเน็ตโดยไม่ผ่าน Pi และ**ไม่ถูกบันทึก log** · ป้องกันได้ด้วย Access Control ที่เราเตอร์เป็นหลัก แต่**ปิดไม่ได้ 100% ด้วยซอฟต์แวร์บน Pi ฝ่ายเดียว** เพราะ Pi ไม่ได้อยู่บนเส้นทางบังคับ (ไม่ใช่ inline) — **นี่เป็นข้อจำกัดสำคัญที่สุดของสถาปัตยกรรมนี้ ต้องเขียนในบทที่ 5 พร้อมข้อเสนอแนะว่าการใช้งานจริงต้องใช้ 2 อินเทอร์เฟซหรือ managed switch + VLAN** · วิเคราะห์เต็มใน §3.1.4
 
