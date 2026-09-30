@@ -42,6 +42,8 @@ class FakeCursor:
         s = " ".join(sql.split()).lower()
         if s.startswith("select count(*) as n from staff"):
             self._rows = [{"n": len(STAFF)}]
+        elif s.startswith("select role, is_active from staff where id"):
+            self._rows = [r for r in STAFF if r["id"] == args[0]]
         elif s.startswith("select id, username, password_hash"):
             self._rows = [r for r in STAFF if r["username"] == args[0]]
         elif s.startswith("select id, role from staff"):
@@ -245,9 +247,10 @@ def test_customers_page_renders_block_button_for_admin(client):
     assert "ระงับ" in html
 
 
-def test_toggle_block_customer_rejected_for_non_admin_staff(client):
+def test_toggle_block_customer_rejected_for_non_admin_staff(client, monkeypatch):
+    monkeypatch.setitem(STAFF[0], "role", "staff")
     with client.session_transaction() as sess:
-        sess["role"] = "staff"  # ไม่ใช่ admin
+        sess["role"] = "staff"
     client.post("/issue", data=dict(natid=NID, hours="4", devices="2", consent="on"))
     cid = next(iter(CUSTOMERS))
     r = client.post(f"/customers/{cid}/block")

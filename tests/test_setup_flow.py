@@ -25,6 +25,8 @@ class FakeCursor:
         s = " ".join(sql.split()).lower()
         if s.startswith("select count(*) as n from staff"):
             self._rows = [{"n": len(STAFF)}]
+        elif s.startswith("select role, is_active from staff where id"):
+            self._rows = [r for r in STAFF if r["id"] == args[0]]
         elif s.startswith("insert into staff"):
             STAFF.append({"id": len(STAFF) + 1, "username": args[0],
                           "password_hash": args[1], "display_name": args[2],
@@ -153,6 +155,66 @@ def test_login_with_new_account(client):
     assert client.post("/login", data=dict(username="admin", password="wrong-pass-123")).status_code == 401
 
 
+def _login_admin(client):
+    _post(client)
+    response = client.post("/login", data=dict(username="admin", password=GOOD_PW))
+    assert response.status_code == 302
+
+
+def test_active_staff_session_stays_valid(client):
+    _login_admin(client)
+    assert client.get("/setup").status_code == 410
+    with client.session_transaction() as sess:
+        assert sess["staff_id"] == STAFF[0]["id"]
+        assert sess["role"] == "admin"
+
+
+def test_deactivated_staff_is_logged_out_on_next_request(client):
+    _login_admin(client)
+    STAFF[0]["is_active"] = 0
+    response = client.get("/setup")
+    assert response.status_code == 302
+    assert "/login" in response.headers["Location"]
+    with client.session_transaction() as sess:
+        assert "staff_id" not in sess
+        assert "role" not in sess
+
+
+def test_deactivated_staff_post_is_stopped_before_route(client):
+    _login_admin(client)
+    STAFF[0]["is_active"] = 0
+    prior_audit_count = len(AUDIT)
+    response = client.post("/setup", data={"token": TOKEN})
+    assert response.status_code == 302
+    assert "/login" in response.headers["Location"]
+    assert len(AUDIT) == prior_audit_count
+
+
+def test_demoted_admin_must_log_in_again_as_staff(client):
+    _login_admin(client)
+    STAFF[0]["role"] = "staff"
+    response = client.get("/setup")
+    assert response.status_code == 302
+    assert "/login" in response.headers["Location"]
+    with client.session_transaction() as sess:
+        assert "staff_id" not in sess
+
+    assert client.post("/login", data=dict(username="admin", password=GOOD_PW)).status_code == 302
+    with client.session_transaction() as sess:
+        assert sess["role"] == "staff"
+    assert client.post("/customers/1/block").status_code == 403
+
+
+def test_deleted_staff_is_logged_out_on_next_request(client):
+    _login_admin(client)
+    STAFF.clear()
+    response = client.get("/setup")
+    assert response.status_code == 302
+    assert "/login" in response.headers["Location"]
+    with client.session_transaction() as sess:
+        assert "staff_id" not in sess
+
+
 def _login_next(client, nxt):
     _post(client)
     r = client.post("/login", query_string={"next": nxt},
@@ -220,6 +282,16 @@ def test_csrf_login_without_token_rejected(csrf_client):
     _post(csrf_client, csrf_token=_form_token(csrf_client, "/setup"))
     r = csrf_client.post("/login", data=dict(username="admin", password=GOOD_PW))
     assert r.status_code == 400
+    with csrf_client.session_transaction() as sess:
+        assert "staff_id" not in sess
+
+
+def test_deactivated_staff_post_redirects_before_csrf_check(csrf_client):
+    _setup_and_login(csrf_client)
+    STAFF[0]["is_active"] = 0
+    response = csrf_client.post("/setup", data={"token": TOKEN})
+    assert response.status_code == 302
+    assert "/login" in response.headers["Location"]
     with csrf_client.session_transaction() as sess:
         assert "staff_id" not in sess
 

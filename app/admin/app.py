@@ -163,6 +163,13 @@ def gate():
     g.client_ip = client_ip()
     if request.path.startswith("/static"):
         return None
+    # R2-L03: session เก็บ role ไว้ใน cookie แต่สิทธิ์จริงอาจเปลี่ยนระหว่างที่ login ค้างอยู่
+    if "staff_id" in session:
+        staff = query_one("SELECT role, is_active FROM staff WHERE id = %s",
+                          (session["staff_id"],))
+        if not staff or not staff["is_active"] or staff["role"] != session.get("role"):
+            session.clear()
+            return redirect(url_for("login"))
     # R2-09: SameSite=Lax อย่างเดียวไม่กันคำขอจากหน้าอื่นใน "site" เดียวกัน (host/IP เดียวกันคนละ port)
     # ตรวจ token ทุก POST รวม /login และ /setup ด้วย (กัน login CSRF -- ถูกจับ login เป็นบัญชีคนอื่น)
     if request.method == "POST" and app.config["CSRF_ENABLED"] and not csrf_ok():

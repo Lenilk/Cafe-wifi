@@ -39,6 +39,8 @@ class FakeCursor:
         s = " ".join(sql.split()).lower()
         if s.startswith("select count(*) as n from staff"):
             self._rows = [{"n": len(STAFF)}]
+        elif s.startswith("select role, is_active from staff where id"):
+            self._rows = [r for r in STAFF if r["id"] == args[0]]
         elif s.startswith("select id, username, password_hash"):
             self._rows = [r for r in STAFF if r["username"] == args[0]]
         elif s.startswith("select filename, sha256, prev_sha256, size_bytes, deletion_state, sealed_at from log_manifest order by id asc"):
