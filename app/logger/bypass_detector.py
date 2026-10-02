@@ -83,7 +83,7 @@ def run(uplink_network: str | None = None, known_ips: set[str] | None = None,
     from common import audit
     from common.db import execute as db_execute
     from common.db import query_one as db_query_one
-    from logger.netutil import active_arp_refresh, read_arp_table
+    from logger.netutil import MAX_ARP_SCAN_ADDRESSES, active_arp_refresh, read_arp_table
 
     uplink_network = uplink_network or os.environ.get("UPLINK_NETWORK", "")
     if not uplink_network:
@@ -91,6 +91,11 @@ def run(uplink_network: str | None = None, known_ips: set[str] | None = None,
             "UPLINK_NETWORK ไม่ได้ตั้งค่า -- ต้องรัน install.sh ให้เขียน secrets.env ก่อน "
             "หรือระบุพารามิเตอร์ uplink_network เอง"
         )
+    net = ipaddress.ip_network(uplink_network, strict=False)
+    if net.version != 4 or net.num_addresses > MAX_ARP_SCAN_ADDRESSES:
+        log.warning("ปิดการตรวจจับ bypass รอบนี้: วง uplink %s ใหญ่กว่า /23 หรือไม่ใช่ IPv4; "
+                    "ระบบหลักยังทำงานได้ แต่ไม่มีผลตรวจจับ bypass", uplink_network)
+        return []
     if cooldown_minutes is None:
         cooldown_minutes = int(os.environ.get("BYPASS_ALERT_COOLDOWN_MIN", "60"))
     if known_ips is None:

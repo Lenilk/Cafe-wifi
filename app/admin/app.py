@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import secrets
+import threading
 import time
 from datetime import datetime, timedelta
 from functools import wraps
@@ -65,6 +66,8 @@ if not os.environ.get("SECRET_KEY"):
 
 # rate limit แบบง่ายในหน่วยความจำ (พอสำหรับ 1 เครื่อง; ถ้าขยายหลาย worker ให้ย้ายไป DB)
 _attempts: dict[str, list[float]] = {}
+_attempts_lock = threading.Lock()
+_last_attempt_cleanup = 0.0
 MAX_ATTEMPTS = 5
 WINDOW_SEC = 600
 
@@ -88,14 +91,28 @@ def client_ip() -> str:
 
 
 def rate_limited(bucket: str) -> bool:
+    global _last_attempt_cleanup
     now = time.time()
-    hits = [t for t in _attempts.get(bucket, []) if now - t < WINDOW_SEC]
-    _attempts[bucket] = hits
-    return len(hits) >= MAX_ATTEMPTS
+    with _attempts_lock:
+        if now - _last_attempt_cleanup >= WINDOW_SEC:
+            for key, times in list(_attempts.items()):
+                hits = [t for t in times if now - t < WINDOW_SEC]
+                if hits:
+                    _attempts[key] = hits
+                else:
+                    del _attempts[key]
+            _last_attempt_cleanup = now
+        hits = [t for t in _attempts.get(bucket, []) if now - t < WINDOW_SEC]
+        if hits:
+            _attempts[bucket] = hits
+        else:
+            _attempts.pop(bucket, None)
+        return len(hits) >= MAX_ATTEMPTS
 
 
 def record_attempt(bucket: str) -> None:
-    _attempts.setdefault(bucket, []).append(time.time())
+    with _attempts_lock:
+        _attempts.setdefault(bucket, []).append(time.time())
 
 
 def staff_count() -> int:

@@ -40,7 +40,7 @@ services:
           printf '%s\n' "$$DOCKER_SETUP_TOKEN" > "$$ETC_DIR/setup.token"
           touch "$$ETC_DIR/.initialized"
         fi
-        exec gunicorn --bind 0.0.0.0:8000 --workers 2 admin.app:app
+        exec gunicorn --bind 0.0.0.0:8000 --workers 1 --threads 4 admin.app:app
     volumes:
       - test-logs:/var/log/cafe-wifi
       - test-etc:/tmp/cafe-wifi
@@ -53,7 +53,7 @@ services:
 
   fas:
     <<: *python-runtime
-    command: ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "2", "fas.app:app"]
+    command: ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "1", "--threads", "4", "fas.app:app"]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
       interval: 5s

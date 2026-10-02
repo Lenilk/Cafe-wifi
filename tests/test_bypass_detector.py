@@ -12,7 +12,7 @@ import pytest
 
 from logger import bypass_detector
 from logger.bypass_detector import BypassEvent, find_bypass_devices
-from logger.netutil import read_arp_table
+from logger.netutil import active_arp_refresh, read_arp_table
 
 PROC_NET_ARP_SAMPLE = """IP address       HW type     Flags       HW address            Mask     Device
 192.168.1.2      0x1         0x2         aa:bb:cc:dd:ee:01     *        eth0
@@ -21,6 +21,41 @@ PROC_NET_ARP_SAMPLE = """IP address       HW type     Flags       HW address    
 192.168.1.199    0x1         0x0         00:00:00:00:00:00     *        eth0
 10.10.0.105      0x1         0x2         cc:dd:ee:ff:00:11     *        eth0
 """
+
+
+@pytest.fixture(autouse=True)
+def no_real_ping_sweep(monkeypatch):
+    """การทดสอบ run() ใช้ ARP fixture จึงไม่ควรยิง ping ไปเครือข่ายจริง"""
+    monkeypatch.setattr("logger.netutil.active_arp_refresh", lambda network: None)
+
+
+def test_active_arp_refresh_rejects_network_larger_than_23(monkeypatch):
+    import subprocess
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: pytest.fail("ห้ามยิง ping"))
+    with pytest.raises(ValueError, match="/23"):
+        active_arp_refresh("192.168.0.0/22")
+
+
+def test_active_arp_refresh_accepts_23_boundary(monkeypatch):
+    import subprocess
+
+    class FakeProcess:
+        def wait(self, timeout):
+            return 0
+
+    calls = []
+    monkeypatch.setattr(subprocess, "Popen", lambda args, **kwargs: calls.append(args) or FakeProcess())
+    active_arp_refresh("192.168.0.0/23", batch_gap=0)
+    assert len(calls) == 510
+
+
+def test_run_disables_bypass_scan_for_large_uplink(monkeypatch, caplog):
+    import logger.netutil as netutil
+
+    monkeypatch.setattr(netutil, "active_arp_refresh", lambda network: pytest.fail("ห้ามสแกน"))
+    assert bypass_detector.run(uplink_network="192.168.0.0/22") == []
+    assert "ไม่มีผลตรวจจับ bypass" in caplog.text
 
 
 # ================================================================== ส่วนที่ 1: netutil.read_arp_table()

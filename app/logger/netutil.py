@@ -15,6 +15,7 @@ _ARP_LINE = re.compile(
 
 BURST_BATCH_SIZE = 16   # N40 -- ยิง ping ทีละกี่ตัวก่อนหยุดพัก
 BURST_BATCH_GAP = 0.5   # N40 -- หยุดพักกี่วินาทีระหว่างชุด (254 ตัว ≈ 8 วินาที)
+MAX_ARP_SCAN_ADDRESSES = 512  # /23; วงใหญ่กว่านี้สแกนไม่ทันรอบ timer 1 นาที
 
 
 def _iter_arp_entries(arp_path: str | Path):
@@ -98,6 +99,8 @@ def active_arp_refresh(network: str, timeout: float = 1.0,
     import time as _time
 
     net = ipaddress.ip_network(network, strict=False)
+    if net.version != 4 or net.num_addresses > MAX_ARP_SCAN_ADDRESSES:
+        raise ValueError(f"active ARP refresh รองรับเฉพาะวง IPv4 ขนาดไม่เกิน /23: {network}")
     procs = []
     batch = 0
     for host in net.hosts():

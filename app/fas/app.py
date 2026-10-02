@@ -21,6 +21,7 @@ import os
 import re
 import secrets
 import subprocess
+import threading
 import time
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -54,19 +55,35 @@ GATEWAY_AUTHDIR = os.environ.get("GATEWAY_AUTHDIR", "opennds_auth")
 MAC_RE = re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
 
 _attempts: dict[str, list[float]] = {}
+_attempts_lock = threading.Lock()
+_last_attempt_cleanup = 0.0
 MAX_ATTEMPTS = 5
 WINDOW_SEC = 600
 
 
 def rate_limited(bucket: str) -> bool:
+    global _last_attempt_cleanup
     now = time.time()
-    hits = [t for t in _attempts.get(bucket, []) if now - t < WINDOW_SEC]
-    _attempts[bucket] = hits
-    return len(hits) >= MAX_ATTEMPTS
+    with _attempts_lock:
+        if now - _last_attempt_cleanup >= WINDOW_SEC:
+            for key, times in list(_attempts.items()):
+                hits = [t for t in times if now - t < WINDOW_SEC]
+                if hits:
+                    _attempts[key] = hits
+                else:
+                    del _attempts[key]
+            _last_attempt_cleanup = now
+        hits = [t for t in _attempts.get(bucket, []) if now - t < WINDOW_SEC]
+        if hits:
+            _attempts[bucket] = hits
+        else:
+            _attempts.pop(bucket, None)
+        return len(hits) >= MAX_ATTEMPTS
 
 
 def record_attempt(bucket: str) -> None:
-    _attempts.setdefault(bucket, []).append(time.time())
+    with _attempts_lock:
+        _attempts.setdefault(bucket, []).append(time.time())
 
 
 def client_ip() -> str:

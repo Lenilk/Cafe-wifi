@@ -2025,6 +2025,11 @@ main() {
   [[ "$LOG_RETENTION_DAYS" =~ ^[0-9]+$ ]] || die "retention-days ต้องเป็นจำนวนวันเต็ม"
   (( 10#$LOG_RETENTION_DAYS >= 90 )) || die "retention-days ต้องไม่น้อยกว่า 90 วัน"
 
+  local uplink_prefix="${UPLINK_CIDR##*/}"
+  if [[ "$uplink_prefix" =~ ^[0-9]+$ ]] && (( 10#$uplink_prefix < 23 )); then
+    warn "วง uplink ${UPLINK_CIDR} ใหญ่กว่า /23 — ติดตั้งต่อได้ แต่จะปิดการสแกน bypass และไม่มีผลตรวจจับจากตัวตรวจจับนี้"
+  fi
+
   if (( ! DRY_RUN )); then
     install -d -m 0750 "$LOG_DIR"
     exec > >(tee -a "${LOG_DIR}/install.log") 2>&1
